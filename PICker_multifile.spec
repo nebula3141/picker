@@ -1,26 +1,34 @@
 # -*- mode: python ; coding: utf-8 -*-
-# Onedir (multi-file) variant of PICker.spec.
-# Same excludes/binary-filter logic; emits dist/PICker-<ver>/ folder
-# with the EXE alongside DLLs and Python runtime.
+# Onedir (multi-file) variant — emits dist/PICker-<ver>/ folder
+# with EXE + DLLs + Python runtime + ffmpeg.
 
 import os, sys
-sys.path.insert(0, os.path.abspath(os.path.dirname(SPEC if 'SPEC' in dir() else '.')))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(SPEC if 'SPEC' in dir() else '.'), 'src')))
 from picker import __version__ as APP_VERSION
 
+_root = os.path.abspath(os.path.dirname(SPEC if 'SPEC' in dir() else '.'))
+_extra_binaries = []
+for _name in ('ffmpeg.exe', 'ffprobe.exe'):
+    _p = os.path.join(_root, _name)
+    if os.path.isfile(_p):
+        _extra_binaries.append((_p, '.'))
+
 a = Analysis(
-    ['main.py'],
-    pathex=[],
-    binaries=[],
+    [os.path.join(_root, 'src', 'main.py')],
+    pathex=[os.path.join(_root, 'src')],
+    binaries=_extra_binaries,
     datas=[],
-    hiddenimports=[],
+    hiddenimports=[
+        'PyQt6.QtMultimedia',
+        'PyQt6.QtMultimediaWidgets',
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
     excludes=[
-        # QtNetwork kept for single-instance IPC.
         'PyQt6.QtQml', 'PyQt6.QtQuick', 'PyQt6.QtQuickWidgets',
         'PyQt6.QtWebEngineCore', 'PyQt6.QtWebEngineWidgets', 'PyQt6.QtWebChannel',
-        'PyQt6.QtWebSockets', 'PyQt6.QtMultimedia', 'PyQt6.QtMultimediaWidgets',
+        'PyQt6.QtWebSockets',
         'PyQt6.QtPdf', 'PyQt6.QtPdfWidgets', 'PyQt6.QtSql', 'PyQt6.QtTest',
         'PyQt6.QtBluetooth', 'PyQt6.QtSerialPort', 'PyQt6.QtPositioning',
         'PyQt6.QtSensors', 'PyQt6.QtNfc', 'PyQt6.QtDesigner', 'PyQt6.QtCharts',
@@ -47,8 +55,7 @@ def _keep_binary(entry):
     name = entry[0].lower().replace('\\', '/')
     drop = (
         'opengl32sw.dll', 'd3dcompiler_', 'qt6quick', 'qt6qml',
-        # qt6network kept for single-instance IPC.
-        'qt6webengine', 'qt6multimedia', 'qt6pdf', 'qt6sql', 'qt6bluetooth',
+        'qt6webengine', 'qt6pdf', 'qt6sql', 'qt6bluetooth',
         'qt6sensors', 'qt6nfc', 'qt6charts', 'qt6datavisualization',
         'qt63d', 'qt6remoteobjects', 'qt6help', 'qt6opengl', 'qt6designer',
         'qt6test', 'qt6dbus', 'qt6serialport', 'qt6positioning',
@@ -75,13 +82,12 @@ a.datas = [d for d in a.datas if _keep_data(d)]
 
 pyz = PYZ(a.pure)
 
-# Onedir: EXE bundles the bootstrapper only; COLLECT lays out the runtime tree.
 exe = EXE(
     pyz,
     a.scripts,
     [],
     exclude_binaries=True,
-    name=f'PICker-{APP_VERSION}',
+    name='PICker',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -93,8 +99,8 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['E:\\Proj\\Self\\Picker\\icon.ico'],
-    version='version_info.txt',
+    icon=[os.path.join(_root, 'icon.ico')],
+    version=os.path.join(_root, 'src', 'version_info.txt'),
 )
 
 coll = COLLECT(
