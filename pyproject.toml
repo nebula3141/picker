@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "PICker"
+dynamic = ["version"]
+description = "Keyboard-first desktop photo/video culler and sorter"
+license = "GPL-3.0-only"
+readme = "src/README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "PyQt6>=6.5,<7",
+    "Pillow>=10.0",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+raw = ["rawpy>=0.18"]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.4",
+    "pyinstaller>=6.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/nebula3141/PICker"
+Repository = "https://github.com/nebula3141/PICker"
+Issues = "https://github.com/nebula3141/PICker/issues"
+
+[project.scripts]
+picker = "main:main"
+
+[tool.setuptools.dynamic]
+version = {attr = "picker.__version__"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["src/tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]

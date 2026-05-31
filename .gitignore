@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.spec.bak
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.claude/
+
+# PyInstaller
+*.exe
+*.dll
+
+# Pytest
+.pytest_cache/
+
+# Thumbnail caches
+.picker_cache/
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Env
+.env
+*.env
+venv/
+.venv/
+
+# PICker data
+*.corrupt
+*.bak
+*.tmp
+
+# Reg files (local dev only)
+*.reg

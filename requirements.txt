@@ -1,0 +1,12 @@
+# Hard requirements — without these the app won't start.
+PyQt6>=6.5,<7
+Pillow>=10.0
+numpy>=1.24
+
+# Soft requirement — RAW decode is disabled gracefully if missing.
+rawpy>=0.18
+
+# Optional runtime dependencies (no pip package — bundle the binaries):
+# ffmpeg.exe + ffprobe.exe alongside main.py / PICker.exe.
+#   Without them: video thumbnails + ffprobe metadata are skipped.
+#   Playback still works through Qt's bundled multimedia backend.
