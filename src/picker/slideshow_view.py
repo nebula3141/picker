@@ -11,7 +11,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import (
     Qt, QSize, QRect, QRectF, QPointF, QPoint, QObject, QRunnable, QThreadPool,
-    pyqtSignal, pyqtSlot, QTimer, QPropertyAnimation, QEasingCurve
+    pyqtSignal, pyqtSlot, QTimer, QPropertyAnimation, QEasingCurve, QVariantAnimation
 )
 from PyQt6.QtGui import (
     QPixmap, QImageReader, QKeyEvent, QWheelEvent, QImage, QColor, QFont,
@@ -45,6 +45,50 @@ def _pixmap_bytes(pm) -> int:
     if pm is None or pm.isNull():
         return 0
     return pm.width() * pm.height() * pm.depth() // 8
+
+
+# ── Smart decode scaling ───────────────────────────────────────────────────────
+# The resolution_pct knob exists to keep memory/decode time sane on huge files
+# (60MP RAW). Blindly applying it to a 100×100 thumbnail just throws away detail
+# for no gain. So we (1) never downscale an image whose long edge already fits the
+# display, and (2) never scale a large image *below* the display floor — the
+# requested pct is treated as a hint, clamped to keep the result crisp on screen.
+
+_MIN_DECODE_EDGE: int | None = None
+
+
+def _min_decode_edge() -> int:
+    """Longest edge (px) we'll ever decode down to — the primary screen's long
+    side in physical pixels, so a fit-to-window view stays pixel-sharp. Cached."""
+    global _MIN_DECODE_EDGE
+    if _MIN_DECODE_EDGE is None:
+        edge = 1920
+        try:
+            scr = QApplication.primaryScreen()
+            if scr is not None:
+                g = scr.geometry()
+                dpr = scr.devicePixelRatio() or 1.0
+                edge = int(round(max(g.width(), g.height()) * dpr))
+        except Exception:
+            pass
+        _MIN_DECODE_EDGE = max(1280, edge)
+    return _MIN_DECODE_EDGE
+
+
+def _smart_scaled_size(src_w: int, src_h: int, pct: int) -> tuple[int, int] | None:
+    """Decode size for (src_w, src_h) at the requested pct, or None to decode at
+    native size. Small images are left alone; large ones never drop below the
+    display floor."""
+    if pct >= 100 or src_w <= 0 or src_h <= 0:
+        return None
+    long_edge = max(src_w, src_h)
+    floor = _min_decode_edge()
+    if long_edge <= floor:
+        return None  # already small enough — full native detail
+    eff = max(pct / 100.0, floor / long_edge)
+    if eff >= 1.0:
+        return None
+    return max(1, round(src_w * eff)), max(1, round(src_h * eff))
 
 
 # ── Background full-res loader (QThreadPool) ───────────────────────────────────
@@ -81,10 +125,9 @@ class ImageLoadTask(QRunnable):
             prefer_thumb = (settings_mod.get("raw_preference") or "embedded") == "embedded"
             img = raw_loader.load_raw(rec.path, prefer_thumb=prefer_thumb)
             if img is not None and not img.isNull():
-                if pct < 100:
-                    nw = max(1, int(img.width() * pct / 100))
-                    nh = max(1, int(img.height() * pct / 100))
-                    img = img.scaled(nw, nh,
+                ssz = _smart_scaled_size(img.width(), img.height(), pct)
+                if ssz is not None:
+                    img = img.scaled(ssz[0], ssz[1],
                                      Qt.AspectRatioMode.KeepAspectRatio,
                                      Qt.TransformationMode.SmoothTransformation)
                 return img
@@ -92,10 +135,10 @@ class ImageLoadTask(QRunnable):
         reader = QImageReader(rec.path)
         reader.setAutoTransform(True)
         size = reader.size()
-        if size.isValid() and pct < 100:
-            w = max(1, int(size.width() * pct / 100))
-            h = max(1, int(size.height() * pct / 100))
-            reader.setScaledSize(QSize(w, h))
+        if size.isValid():
+            ssz = _smart_scaled_size(size.width(), size.height(), pct)
+            if ssz is not None:
+                reader.setScaledSize(QSize(ssz[0], ssz[1]))
         img = reader.read()
         if img.isNull():
             img = QImage(400, 300, QImage.Format.Format_RGB32)
@@ -161,8 +204,12 @@ class ImageCanvas(QWidget):
         self._pulse_timer.setInterval(60)
         self._pulse_timer.timeout.connect(self._on_pulse_tick)
 
-        # Cross-fade animation state
+        # Cross-fade animation state. Progress advances linearly; the drawn
+        # opacity is run through an ease-in-out curve so the dissolve feels
+        # fluid rather than mechanically linear.
         self._fade_opacity = 1.0
+        self._fade_progress = 1.0
+        self._fade_curve = QEasingCurve(QEasingCurve.Type.InOutCubic)
         self._old_pixmap: QPixmap | None = None
         self._old_offset = QPointF(0, 0)
         self._old_zoom = 1.0
@@ -227,14 +274,17 @@ class ImageCanvas(QWidget):
             self._old_pixmap = self._pixmap
             self._old_offset = QPointF(self._offset)
             self._old_zoom = self._zoom
+        self._fade_progress = 0.0
         self._fade_opacity = 0.0
         self._fade_timer.start()
 
     def _fade_tick(self):
-        self._fade_opacity = min(1.0, self._fade_opacity + 0.08)
+        self._fade_progress = min(1.0, self._fade_progress + 0.07)
+        self._fade_opacity = self._fade_curve.valueForProgress(self._fade_progress)
         self.update()
-        if self._fade_opacity >= 1.0:
+        if self._fade_progress >= 1.0:
             self._fade_timer.stop()
+            self._fade_opacity = 1.0
             self._old_pixmap = None
 
     # ── Crop mode ──────────────────────────────────────────────────────────────
@@ -367,9 +417,14 @@ class ImageCanvas(QWidget):
         self.update()
 
     def rotate_cw(self) -> int:
+        return self.rotate_by(90)
+
+    def rotate_by(self, delta: int) -> int:
+        """Rotate the on-screen preview by `delta` degrees (any signed multiple
+        of 90). Non-destructive — the change lives in self._rotation until saved."""
         if self._base_pixmap is None:
             return self._rotation
-        self._rotation = (self._rotation + 90) % 360
+        self._rotation = (self._rotation + delta) % 360
         self._apply_rotation()
         self._fit_to_window()
         # Peaking overlay is oriented to the pre-rotation pixmap; re-compute.
@@ -966,13 +1021,24 @@ class ToastWidget(QWidget):
         self._hide_timer.setSingleShot(True)
         self._hide_timer.timeout.connect(self._fade_out)
 
-        self._anim = QPropertyAnimation(self, b"windowOpacity")
-        self._anim.setDuration(800)
-        self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-        self._anim.finished.connect(self.hide)
+        # windowOpacity only affects top-level windows; this is a child widget,
+        # so fade through a graphics effect instead (and it lets us slide too).
+        self._opacity = QGraphicsOpacityEffect(self)
+        self._opacity.setOpacity(1.0)
+        self.setGraphicsEffect(self._opacity)
+
+        self._fade = QPropertyAnimation(self._opacity, b"opacity", self)
+        self._fade.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._fade.finished.connect(self._on_fade_finished)
+        self._slide = QPropertyAnimation(self, b"pos", self)
+        self._slide.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._fading_out = False
 
     def show_message(self, text: str, ms: int = 1800, action: str = "", action_cb=None):
         self._hide_timer.stop()
+        self._fade.stop()
+        self._slide.stop()
+        self._fading_out = False
         self._label.setText(text)
         self._action_cb = action_cb
         if action and action_cb:
@@ -982,10 +1048,26 @@ class ToastWidget(QWidget):
             self._action_btn.hide()
         self.adjustSize()
         self._reposition()
-        self.setWindowOpacity(1.0)
+        rest = self.pos()
         self.show()
         self.raise_()
+        # Fade + a gentle 14px rise into place.
+        self._opacity.setOpacity(0.0)
+        self.move(rest.x(), rest.y() + 14)
+        self._fade.setDuration(200)
+        self._fade.setStartValue(0.0)
+        self._fade.setEndValue(1.0)
+        self._fade.start()
+        self._slide.setDuration(240)
+        self._slide.setStartValue(self.pos())
+        self._slide.setEndValue(rest)
+        self._slide.start()
         self._hide_timer.start(ms)
+
+    def _on_fade_finished(self):
+        if self._fading_out:
+            self._fading_out = False
+            self.hide()
 
     def mousePressEvent(self, event):
         if self._action_cb and self._action_btn.isVisible():
@@ -1008,9 +1090,12 @@ class ToastWidget(QWidget):
             self.move(x, y)
 
     def _fade_out(self):
-        self._anim.setStartValue(1.0)
-        self._anim.setEndValue(0.0)
-        self._anim.start()
+        self._fading_out = True
+        self._fade.stop()
+        self._fade.setDuration(420)
+        self._fade.setStartValue(self._opacity.opacity())
+        self._fade.setEndValue(0.0)
+        self._fade.start()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -1211,6 +1296,17 @@ class FilmstripBar(QWidget):
         self._apply_bg()
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
+        # Smooth recenter slide when navigating (eases the pan offset to 0).
+        self._animate_strip = bool(settings_mod.get("slideshow_animation"))
+        self._pan_anim = QVariantAnimation(self)
+        self._pan_anim.setDuration(240)
+        self._pan_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._pan_anim.valueChanged.connect(self._on_pan_anim)
+
+    def _on_pan_anim(self, value):
+        self._pan = int(value)
+        self.update()
+
     def _apply_bg(self):
         pal = self.palette()
         pal.setColor(self.backgroundRole(), theme_mod.c("filmstrip_bg"))
@@ -1221,10 +1317,27 @@ class FilmstripBar(QWidget):
         self.update()
 
     def set_current(self, idx: int):
+        old = self._current
+        # Slide the strip: start it where the newly-current thumb sat in the
+        # previous layout, then ease that offset back to centered (pan 0).
+        start_pan = 0
+        if self._animate_strip and old != idx and self._rects:
+            center = self.width() // 2
+            for ridx, rect in self._rects:
+                if ridx == idx:
+                    start_pan = rect.center().x() - center
+                    break
         self._current = idx
-        self._pan = 0   # recenter when navigating
         self._load_visible()
-        self.update()
+        self._pan_anim.stop()
+        if start_pan != 0:
+            self._pan = start_pan
+            self._pan_anim.setStartValue(start_pan)
+            self._pan_anim.setEndValue(0)
+            self._pan_anim.start()
+        else:
+            self._pan = 0
+            self.update()
 
     def _load_visible(self):
         half = 30
@@ -1405,6 +1518,7 @@ class FilmstripBar(QWidget):
             return
         if event.button() != Qt.MouseButton.LeftButton:
             return
+        self._pan_anim.stop()   # user is taking over — cancel any recenter slide
         self._drag_active = True
         self._drag_start_x = event.pos().x()
         self._drag_start_pan = self._pan
@@ -1492,6 +1606,7 @@ class FilmstripBar(QWidget):
         if delta == 0:
             event.ignore()
             return
+        self._pan_anim.stop()   # manual pan overrides any in-flight recenter
         step = self.WHEEL_PAN_STEP if delta > 0 else -self.WHEEL_PAN_STEP
         self._pan += step
         self._load_pan_range()
@@ -1565,6 +1680,11 @@ class SlideshowView(QWidget):
             self._canvas.update()
         if hasattr(self, "_toast"):
             self._toast._reposition()
+        # Grab keyboard focus so arrow keys work immediately — without this the
+        # user has to click the image first. Runs after the central-widget swap
+        # and fullscreen toggle have settled (called at 0 ms and 80 ms).
+        if self.isVisible():
+            self.setFocus(Qt.FocusReason.OtherFocusReason)
 
     def _build_ui(self):
         self.setAutoFillBackground(True)
@@ -2270,10 +2390,8 @@ class SlideshowView(QWidget):
         elif key == Qt.Key.Key_Question or (key == Qt.Key.Key_Slash and event.modifiers() & Qt.KeyboardModifier.ShiftModifier):
             self._show_cheatsheet()
         elif key == Qt.Key.Key_R and not ctrl:
-            new_rot = self._canvas.rotate_cw()
-            rec = self._manager.images[self._idx]
-            self._manager.rotations[rec.filename] = new_rot
-            self._filmstrip.refresh()
+            shift = event.modifiers() & Qt.KeyboardModifier.ShiftModifier
+            self._rotate_current(270 if shift else 90)
         elif key == Qt.Key.Key_H and not ctrl:
             self._canvas.toggle_histogram()
         elif key == Qt.Key.Key_Z and not ctrl:
@@ -2410,10 +2528,13 @@ class SlideshowView(QWidget):
 
     def _open_with_menu(self):
         menu = QMenu(self)
-        act = menu.addAction(menu_icon("photoshop"), "Open with Photoshop")
+        act = menu.addAction(menu_icon("photoshop"), "Adobe Photoshop")
         act.triggered.connect(lambda: self._open_external("photoshop"))
-        act = menu.addAction(menu_icon("lightroom"), "Open with Lightroom")
+        act = menu.addAction(menu_icon("lightroom"), "Adobe Lightroom")
         act.triggered.connect(lambda: self._open_external("lightroom"))
+        menu.addSeparator()
+        act = menu.addAction(menu_icon("system"), "System Default")
+        act.triggered.connect(lambda: self._open_external("default"))
         menu.exec(self.mapToGlobal(self.rect().center()))
 
     def _open_external(self, which: str):
@@ -2469,18 +2590,31 @@ class SlideshowView(QWidget):
         head.setEnabled(False)
         menu.addSeparator()
 
-        act_ps = menu.addAction(menu_icon("photoshop"), "Open with Photoshop")
-        act_ps.triggered.connect(lambda: self._open_external("photoshop"))
-        act_lr = menu.addAction(menu_icon("lightroom"), "Open with Lightroom")
-        act_lr.triggered.connect(lambda: self._open_external("lightroom"))
-        act_sys = menu.addAction(menu_icon("system"), "Open with System Default")
-        act_sys.triggered.connect(lambda: self._open_external("default"))
+        open_menu = menu.addMenu(menu_icon("photoshop"), "Open With")
+        open_menu.setToolTipsVisible(True)
+        a = open_menu.addAction(menu_icon("photoshop"), "Adobe Photoshop")
+        a.triggered.connect(lambda: self._open_external("photoshop"))
+        a = open_menu.addAction(menu_icon("lightroom"), "Adobe Lightroom")
+        a.triggered.connect(lambda: self._open_external("lightroom"))
+        open_menu.addSeparator()
+        a = open_menu.addAction(menu_icon("system"), "System Default")
+        a.triggered.connect(lambda: self._open_external("default"))
 
         menu.addSeparator()
 
         if not video:
-            act_rot = menu.addAction(menu_icon("system"), "Rotate 90° CW")
-            act_rot.triggered.connect(self._rotate_current)
+            rot_menu = menu.addMenu(menu_icon("system"), "Rotate")
+            a = rot_menu.addAction(menu_icon("system"), "Rotate 90° Clockwise")
+            a.setShortcut("R")
+            a.triggered.connect(lambda: self._rotate_current(90))
+            a = rot_menu.addAction(menu_icon("system"), "Rotate 90° Anticlockwise")
+            a.setShortcut("Shift+R")
+            a.triggered.connect(lambda: self._rotate_current(270))
+            a = rot_menu.addAction(menu_icon("system"), "Rotate 180°")
+            a.triggered.connect(lambda: self._rotate_current(180))
+            rot_menu.addSeparator()
+            a = rot_menu.addAction("Reset Rotation")
+            a.triggered.connect(self._reset_rotation)
             act_zoom = menu.addAction(menu_icon("select_all"), "Zoom 1:1")
             act_zoom.triggered.connect(lambda: (self._canvas.zoom_actual(),
                                                 self._toast.show_message("1:1", ms=800)))
@@ -2550,11 +2684,25 @@ class SlideshowView(QWidget):
 
         menu.exec(event.globalPos())
 
-    def _rotate_current(self):
-        new_rot = self._canvas.rotate_cw()
+    def _rotate_current(self, delta: int = 90):
+        new_rot = self._canvas.rotate_by(delta)
         rec = self._manager.images[self._idx]
         self._manager.rotations[rec.filename] = new_rot
         self._filmstrip.refresh()
+        labels = {90: "Rotated 90° clockwise", 270: "Rotated 90° anticlockwise",
+                  180: "Rotated 180°", 0: "Rotation reset"}
+        self._toast.show_message(labels.get(delta % 360, f"Rotated {delta}°"), ms=800)
+
+    def _reset_rotation(self):
+        delta = (360 - self._canvas._rotation) % 360
+        if delta == 0:
+            self._toast.show_message("Already unrotated", ms=800)
+            return
+        new_rot = self._canvas.rotate_by(delta)
+        rec = self._manager.images[self._idx]
+        self._manager.rotations[rec.filename] = new_rot
+        self._filmstrip.refresh()
+        self._toast.show_message("Rotation reset", ms=800)
 
     def _choose_transfer_current(self, *, move: bool):
         from PyQt6.QtWidgets import QFileDialog
@@ -2665,6 +2813,20 @@ class SlideshowView(QWidget):
         self.layout().insertWidget(0, self._compare_view, 1)
         self._compare_view.setFocus()
 
+        # Fluid fade-in so compare mode slides in rather than popping.
+        if bool(settings_mod.get("slideshow_animation")):
+            eff = QGraphicsOpacityEffect(self._compare_view)
+            self._compare_view.setGraphicsEffect(eff)
+            anim = QPropertyAnimation(eff, b"opacity", self._compare_view)
+            anim.setDuration(220)
+            anim.setStartValue(0.0)
+            anim.setEndValue(1.0)
+            anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+            anim.finished.connect(lambda: self._compare_view.setGraphicsEffect(None)
+                                  if self._compare_view is not None else None)
+            anim.start()
+            self._compare_anim = anim  # keep ref
+
     def _exit_compare(self):
         if not hasattr(self, "_compare_view") or self._compare_view is None:
             return
@@ -2721,9 +2883,10 @@ class SlideshowView(QWidget):
 class CompareView(QWidget):
     """Side-by-side image comparison with synchronized zoom and pan (loupe sync).
 
-    Shows 2 images at once. Zoom/pan on either canvas is mirrored to the other
-    in normalized coordinates so the same region of each image stays visible
-    regardless of resolution differences."""
+    Shows two images at once. Zoom/pan on either side is mirrored to the other in
+    normalized coordinates so the same region stays framed regardless of
+    resolution. One side is "active" (accent-outlined); ←/→ steps the active side
+    through the library, Tab/click switches sides, X swaps the pair."""
 
     closed = pyqtSignal()
     fullscreen_requested = pyqtSignal()
@@ -2733,7 +2896,9 @@ class CompareView(QWidget):
         self._manager = manager
         self._idx_a = idx_a
         self._idx_b = idx_b
+        self._active = "a"                 # which side ←/→ and zoom keys drive
         self._sync_enabled = True
+        self._dims: dict[str, tuple[int, int]] = {}   # side -> (w, h) once loaded
         self._loader_signals = _LoaderSignals()
         self._loader_signals.image_ready.connect(self._on_image_ready)
         self._pool = QThreadPool()
@@ -2741,8 +2906,10 @@ class CompareView(QWidget):
 
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self._build_ui()
+        self._set_active("a")
         self._load_both()
 
+    # ── UI ──────────────────────────────────────────────────────────────────
     def _build_ui(self):
         self.setAutoFillBackground(True)
         pal = self.palette()
@@ -2753,52 +2920,86 @@ class CompareView(QWidget):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
-        # Header
-        self._header = QLabel()
-        self._header.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._header.setStyleSheet(
-            "background: #1a1a1a; color: #d0d0d0; padding: 6px;"
-            " font-size: 12px; font-weight: 600;"
-        )
-        outer.addWidget(self._header)
+        # Header — one cell per side; the active side is accent-highlighted.
+        header = QWidget()
+        header.setStyleSheet("background:#141414;")
+        hlay = QHBoxLayout(header)
+        hlay.setContentsMargins(0, 0, 0, 0)
+        hlay.setSpacing(0)
+        self._head_a = QLabel()
+        self._head_b = QLabel()
+        for lbl in (self._head_a, self._head_b):
+            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            lbl.setTextFormat(Qt.TextFormat.RichText)
+        hlay.addWidget(self._head_a, 1)
+        hlay.addWidget(self._head_b, 1)
+        outer.addWidget(header)
 
-        # Canvas row
+        # Canvas row — each canvas wrapped in a frame we can outline when active.
         canvas_row = QWidget()
         row_lay = QHBoxLayout(canvas_row)
         row_lay.setContentsMargins(0, 0, 0, 0)
-        row_lay.setSpacing(2)
+        row_lay.setSpacing(0)
 
         self._canvas_a = ImageCanvas()
         self._canvas_a.set_double_click_enabled(False)
         self._canvas_b = ImageCanvas()
         self._canvas_b.set_double_click_enabled(False)
 
-        row_lay.addWidget(self._canvas_a, 1)
-
-        divider = QFrame()
-        divider.setFrameShape(QFrame.Shape.VLine)
-        divider.setStyleSheet("color: #333;")
-        row_lay.addWidget(divider)
-
-        row_lay.addWidget(self._canvas_b, 1)
+        self._frame_a = self._wrap_canvas(self._canvas_a, "a")
+        self._frame_b = self._wrap_canvas(self._canvas_b, "b")
+        row_lay.addWidget(self._frame_a, 1)
+        row_lay.addWidget(self._frame_b, 1)
         outer.addWidget(canvas_row, 1)
 
-        # Bottom bar
+        # Bottom hint bar
         self._bar = QLabel()
         self._bar.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._bar.setStyleSheet(
-            "background: #1a1a1a; color: #999; padding: 6px; font-size: 11px;"
+            "background:#141414; color:#9a9a9a; padding:7px; font-size:11px;"
         )
         self._bar.setText(
-            "← → swap images  ·  Scroll to zoom (synced)  ·  Drag to pan  ·  "
-            "S toggle sync  ·  F fullscreen  ·  ESC back"
+            "←/→ change active side   ·   Tab / click  switch side   ·   "
+            "X  swap   ·   scroll  zoom   ·   drag  pan   ·   "
+            "S  sync   ·   0  reset   ·   F  fullscreen   ·   Esc  back"
         )
         outer.addWidget(self._bar)
 
-        # Wire sync
         self._canvas_a.view_changed.connect(self._sync_from_a)
         self._canvas_b.view_changed.connect(self._sync_from_b)
 
+    def _wrap_canvas(self, canvas: "ImageCanvas", side: str) -> QFrame:
+        frame = QFrame()
+        frame.setObjectName(f"cmp_frame_{side}")
+        lay = QVBoxLayout(frame)
+        lay.setContentsMargins(3, 3, 3, 3)
+        lay.setSpacing(0)
+        lay.addWidget(canvas)
+        # Clicking anywhere on a side makes it active (pan still works — we only
+        # observe the press, we don't consume it).
+        canvas.installEventFilter(self)
+        return frame
+
+    def eventFilter(self, obj, event):
+        if event.type() == event.Type.MouseButtonPress:
+            if obj is self._canvas_a:
+                self._set_active("a")
+            elif obj is self._canvas_b:
+                self._set_active("b")
+        return super().eventFilter(obj, event)
+
+    def _set_active(self, side: str):
+        self._active = side
+        accent = theme_mod.c("accent").name()
+        for s, frame in (("a", self._frame_a), ("b", self._frame_b)):
+            on = (s == side)
+            frame.setStyleSheet(
+                f"#cmp_frame_{s} {{ background:#0d0d0d; border:3px solid "
+                f"{accent if on else 'transparent'}; border-radius:4px; }}"
+            )
+        self._update_header()
+
+    # ── Sync ──────────────────────────────────────────────────────────────────
     def _sync_from_a(self, cx, cy, zr):
         if self._sync_enabled:
             self._canvas_b.apply_sync(cx, cy, zr)
@@ -2807,24 +3008,38 @@ class CompareView(QWidget):
         if self._sync_enabled:
             self._canvas_a.apply_sync(cx, cy, zr)
 
+    # ── Loading / header ───────────────────────────────────────────────────────
     def _load_both(self):
         self._start_load(self._idx_a, "a")
         self._start_load(self._idx_b, "b")
         self._update_header()
 
-    def _update_header(self):
+    def _head_html(self, side: str, idx: int) -> str:
         imgs = self._manager.images
-        na = os.path.basename(imgs[self._idx_a].path) if self._idx_a < len(imgs) else "?"
-        nb = os.path.basename(imgs[self._idx_b].path) if self._idx_b < len(imgs) else "?"
-        sync_label = "SYNC ON" if self._sync_enabled else "SYNC OFF"
-        self._header.setText(
-            f"  A: {na}    ·    B: {nb}    ·    [{sync_label}]  "
-        )
+        n = len(imgs)
+        name = os.path.basename(imgs[idx].path) if 0 <= idx < n else "?"
+        dims = self._dims.get(side)
+        dim_txt = f"{dims[0]}×{dims[1]}" if dims else ""
+        active = (side == self._active)
+        accent = theme_mod.c("accent").name()
+        tag_bg = accent if active else "#333"
+        tag = (f"<span style='background:{tag_bg}; color:#fff; padding:1px 7px; "
+               f"border-radius:3px; font-weight:700;'>{side.upper()}</span>")
+        name_col = "#f0f0f0" if active else "#9a9a9a"
+        meta = f"  <span style='color:#6f6f6f;'>{idx+1}/{n}"
+        if dim_txt:
+            meta += f" · {dim_txt}"
+        meta += "</span>"
+        return (f"<div style='padding:6px;'>{tag} "
+                f"<span style='color:{name_col}; font-weight:600;'>{name}</span>{meta}</div>")
+
+    def _update_header(self):
+        self._head_a.setText(self._head_html("a", self._idx_a))
+        self._head_b.setText(self._head_html("b", self._idx_b))
 
     def _start_load(self, idx: int, slot: str):
         if idx < 0 or idx >= len(self._manager.images):
             return
-        tag = 10000 + idx if slot == "a" else 20000 + idx
         task = ImageLoadTask(self._manager, idx, self._loader_signals)
         self._pool.start(task)
 
@@ -2832,14 +3047,52 @@ class CompareView(QWidget):
     def _on_image_ready(self, idx: int, img: QImage):
         pm = QPixmap.fromImage(img)
         if idx == self._idx_a:
+            self._dims["a"] = (img.width(), img.height())
             self._canvas_a.set_pixmap(pm, key=("cmp_a", idx))
-        elif idx == self._idx_b:
+        if idx == self._idx_b:
+            self._dims["b"] = (img.width(), img.height())
             self._canvas_b.set_pixmap(pm, key=("cmp_b", idx))
+        self._update_header()
+
+    # ── Navigation ─────────────────────────────────────────────────────────────
+    def _nav_active(self, delta: int):
+        """Step the active side through the library, skipping the other side's
+        image so the two panes never show the same frame."""
+        n = len(self._manager.images)
+        other = self._idx_b if self._active == "a" else self._idx_a
+        cur = self._idx_a if self._active == "a" else self._idx_b
+        nxt = cur
+        for _ in range(n):
+            nxt = max(0, min(n - 1, nxt + delta))
+            if nxt != other or nxt == cur:
+                break
+        if nxt == other:           # only happens with n<2
+            return
+        if self._active == "a":
+            self._idx_a = nxt
+            self._start_load(nxt, "a")
+        else:
+            self._idx_b = nxt
+            self._start_load(nxt, "b")
+        self._update_header()
+
+    def _swap(self):
+        self._idx_a, self._idx_b = self._idx_b, self._idx_a
+        self._dims.clear()
+        self._load_both()
+
+    def event(self, e):
+        # Tab/Backtab are swallowed by focus traversal before keyPressEvent, so
+        # intercept them here to switch the active side.
+        if e.type() == e.Type.KeyPress and e.key() in (
+                Qt.Key.Key_Tab, Qt.Key.Key_Backtab):
+            self._set_active("b" if self._active == "a" else "a")
+            return True
+        return super().event(e)
 
     def keyPressEvent(self, event):
         key = event.key()
         ctrl = event.modifiers() & Qt.KeyboardModifier.ControlModifier
-        n = len(self._manager.images)
 
         if key == Qt.Key.Key_Escape:
             w = self.window()
@@ -2847,25 +3100,27 @@ class CompareView(QWidget):
                 self.fullscreen_requested.emit()
             else:
                 self.closed.emit()
-        elif key == Qt.Key.Key_F or key == Qt.Key.Key_F11:
+        elif key in (Qt.Key.Key_F, Qt.Key.Key_F11):
             self.fullscreen_requested.emit()
         elif key == Qt.Key.Key_S and not ctrl:
             self._sync_enabled = not self._sync_enabled
-            self._update_header()
+            self._bar.setText(
+                ("Sync ON — pan/zoom mirrored" if self._sync_enabled
+                 else "Sync OFF — pan/zoom each side independently")
+                + "   ·   press S to toggle"
+            )
+        elif key in (Qt.Key.Key_Tab, Qt.Key.Key_Space):
+            self._set_active("b" if self._active == "a" else "a")
+        elif key == Qt.Key.Key_X:
+            self._swap()
         elif key == Qt.Key.Key_Right:
-            self._idx_b = min(n - 1, self._idx_b + 1)
-            if self._idx_b == self._idx_a:
-                self._idx_b = min(n - 1, self._idx_b + 1)
-            self._load_both()
+            self._nav_active(1)
         elif key == Qt.Key.Key_Left:
-            self._idx_a = max(0, self._idx_a - 1)
-            if self._idx_a == self._idx_b:
-                self._idx_a = max(0, self._idx_a - 1)
-            self._load_both()
+            self._nav_active(-1)
         elif key in (Qt.Key.Key_Plus, Qt.Key.Key_Equal):
-            self._canvas_a.zoom(1.2)
+            (self._canvas_a if self._active == "a" else self._canvas_b).zoom(1.2)
         elif key == Qt.Key.Key_Minus:
-            self._canvas_a.zoom(1 / 1.2)
+            (self._canvas_a if self._active == "a" else self._canvas_b).zoom(1 / 1.2)
         elif key == Qt.Key.Key_0:
             self._canvas_a.zoom_reset()
             self._canvas_b.zoom_reset()

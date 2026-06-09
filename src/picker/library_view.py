@@ -207,6 +207,17 @@ class LibraryView(QWidget):
         self._scroll.setWidget(self._host)
         outer.addWidget(self._scroll, 1)
 
+        # Pinned recents bar at the bottom of the screen — kept outside the
+        # scroll area so it stays put no matter how many folders are listed.
+        self._recents_bar = QWidget()
+        self._recents_bar.setObjectName("recentsBar")
+        self._recents_bar.setStyleSheet(
+            "#recentsBar { border-top: 1px solid #1f1f1f; }")
+        self._recents_layout = QVBoxLayout(self._recents_bar)
+        self._recents_layout.setContentsMargins(0, 12, 0, 0)
+        self._recents_layout.setSpacing(10)
+        outer.addWidget(self._recents_bar)
+
         self.reload()
 
     def reload(self):
@@ -252,29 +263,50 @@ class LibraryView(QWidget):
             folders_section.addWidget(grid_host)
 
         self._host_layout.addLayout(folders_section)
-
-        # ── Recents section
-        recents = library_mod.recents()
-        if recents:
-            rec_section = QVBoxLayout()
-            rec_section.setSpacing(10)
-            rec_label = QLabel("Recent")
-            rec_label.setObjectName("section")
-            rec_section.addWidget(rec_label)
-
-            chips = QHBoxLayout()
-            chips.setSpacing(8)
-            for path in recents[:10]:
-                tile = _RecentTile(path)
-                tile.clicked.connect(lambda _=False, p=path: self.open_folder.emit(p))
-                chips.addWidget(tile)
-            chips.addStretch()
-            chip_host = QWidget()
-            chip_host.setLayout(chips)
-            rec_section.addWidget(chip_host)
-            self._host_layout.addLayout(rec_section)
-
         self._host_layout.addStretch()
+
+        # ── Recents — rebuilt into the pinned bottom bar
+        self._build_recents_bar()
+
+    def _build_recents_bar(self):
+        """(Re)populate the pinned bottom recents strip."""
+        # Clear previous contents
+        while self._recents_layout.count():
+            item = self._recents_layout.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+            elif item.layout() is not None:
+                self._clear_layout(item.layout())
+
+        recents = library_mod.recents()
+        self._recents_bar.setVisible(bool(recents))
+        if not recents:
+            return
+
+        rec_label = QLabel("Recent")
+        rec_label.setObjectName("section")
+        self._recents_layout.addWidget(rec_label)
+
+        chips = QHBoxLayout()
+        chips.setSpacing(8)
+        for path in recents[:10]:
+            tile = _RecentTile(path)
+            tile.clicked.connect(lambda _=False, p=path: self.open_folder.emit(p))
+            chips.addWidget(tile)
+        chips.addStretch()
+        chip_host = QWidget()
+        chip_host.setLayout(chips)
+        self._recents_layout.addWidget(chip_host)
+
+    def _clear_layout(self, layout):
+        while layout.count():
+            item = layout.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+            elif item.layout() is not None:
+                self._clear_layout(item.layout())
 
     def _place_cards(self):
         if not hasattr(self, "_grid") or not self._cards:

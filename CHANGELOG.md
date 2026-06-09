@@ -2,6 +2,45 @@
 
 ## v4.7.0 (2026-06-09)
 
+### Right-Click Menus
+- **Open With** is now a submenu — Adobe Photoshop, Adobe Lightroom, then System Default (slideshow + mosaic)
+- **Rotate** submenu with verbose actions: Rotate 90° Clockwise (R), Rotate 90° Anticlockwise (Shift+R), Rotate 180°, and Reset Rotation
+- The `O` quick "Open With" popup gained System Default for parity
+
+### Compare (rewritten, more user-friendly)
+- One side is "active" (accent-outlined); ←/→ steps that side through the library, the other pane stays put — no more confusing dual-cursor navigation
+- Tab or clicking a pane switches the active side; **X** swaps A↔B
+- Per-side header shows the file name, position (i/n) and pixel dimensions, with the active side highlighted
+- `+`/`−` zoom the active side; `0` resets both; `S` toggles loupe sync with a clear status hint
+- Smooth fade-in when entering compare mode
+
+### Smart Resolution Scaling
+- The display-resolution setting is now a hint, not a hard cut: small images are **never** downscaled, and large images are never decoded below your screen resolution, so a 100×100 photo stays pixel-sharp
+- Default decode resolution raised from 25% to **50%** (existing users still on the old 25% default are migrated to 50%)
+
+### Library / Startup
+- Cleaner opening Library screen; recent folders moved to the bottom of the screen
+
+### Folder Browser performance
+- Large folders open faster: image-dimension reads now run on their own thread pool instead of queueing behind the heavy thumbnail decodes, so the justified layout settles quickly instead of appearing stuck
+- No more runaway loading: navigating away from a big folder mid-load now stops its dimension/thumbnail reads instead of quietly finishing all of them in the background
+- Thumbnails remain viewport-driven (only what's on screen, plus a small look-ahead, is decoded)
+- The "Loading photos N / M" strip moved to the bottom of the window and stays out of the way while thumbnails stream in
+
+### Settings
+- Redesigned with a category **sidebar + paged content** (General, Gallery, Slideshow, Editing, Scanning, Integrations, Cache, Advanced) instead of one long scroll
+- Exposed previously hidden options: **Group images by** (None / Date / Folder / Camera) and **Date granularity**
+- Maintenance: **Clear all cache & database** and **Reset settings to defaults**
+- Quick fade when switching pages
+
+### UI / Animations
+- Navigating between views (Library ⇄ folders ⇄ gallery) now cross-dissolves — the outgoing screen is snapshotted and melted into the incoming one instead of hard-cutting
+- Slideshow cross-fade now runs through an ease-in-out curve for a more fluid dissolve
+- Filmstrip glides smoothly to recenter on the current image instead of snapping
+- Toasts fade and rise into place, then fade out (previously the fade-out never rendered on the child widget); all motion respects the "animate transitions" setting
+- Windows taskbar now shows the PICker icon correctly (explicit AppUserModelID set before any window is created)
+
+
 ### Album / Mosaic View — Multi-Selection
 - Marquee of selection methods: Ctrl+click toggles, Shift+click ranges, plain click still opens slideshow
 - Full keyboard navigation with a focus cursor (white dashed ring):

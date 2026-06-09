@@ -27,7 +27,7 @@ from PyQt6.QtCore import QPointF
 from PyQt6.QtWidgets import (
     QWidget, QScrollArea, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
     QGridLayout, QSizePolicy, QApplication, QFrame, QMenu, QMessageBox,
-    QFileDialog
+    QFileDialog, QProgressBar
 )
 
 from . import theme as theme_mod
@@ -387,6 +387,10 @@ class _ImageMosaic(QWidget):
     clicked = pyqtSignal(int)            # image index in the list passed in
     removed = pyqtSignal(list)           # paths gone from this folder (move/delete)
     scroll_to = pyqtSignal(int, int)     # (x, y) the parent scroll area should reveal
+    load_progress = pyqtSignal(int, int) # (headers_done, total) — drives the load bar
+    reload_requested = pyqtSignal()      # folder needs a rescan (e.g. rotate wrote new files)
+
+    HEADER_DISPATCH_CHUNK = 150          # headers queued per event-loop tick
 
     ROW_HEIGHT = 200
     ROW_HEIGHT_MIN = 90
@@ -418,8 +422,16 @@ class _ImageMosaic(QWidget):
         self._signals.header_ready.connect(self._on_header_ready)
         self._signals.thumb_ready.connect(self._on_thumb_ready)
 
+        cpu = os.cpu_count() or 4
         self._pool = QThreadPool()
-        self._pool.setMaxThreadCount(max(2, (os.cpu_count() or 4) // 2))
+        self._pool.setMaxThreadCount(max(2, cpu // 2))
+        # Dimension (header) reads get their OWN pool. Sharing one pool with the
+        # heavy thumbnail decodes meant the lightweight header pass — which the
+        # whole justified layout waits on — got stuck behind slow full-image
+        # decodes, so the layout (and the loading bar) crawled. Isolating them
+        # lets the grid settle fast while thumbnails fill in independently.
+        self._header_pool = QThreadPool()
+        self._header_pool.setMaxThreadCount(max(2, cpu))
 
         self._pending_headers: set[int] = set()
         self._pending_thumbs: set[int] = set()
@@ -431,10 +443,19 @@ class _ImageMosaic(QWidget):
         pal.setColor(self.backgroundRole(), _qc("canvas_bg"))
         self.setPalette(pal)
 
-        for idx, item in enumerate(items):
+        # Header dimensions drive the justified layout. Dispatching all of them
+        # synchronously here blocks the main thread (~0.6 ms each → seconds on a
+        # 1700-photo folder), freezing the UI and the loading screen. Instead we
+        # seed default aspects so the mosaic paints immediately, then queue the
+        # header reads in chunks across event-loop ticks so the canvas shows and
+        # the progress bar animates while they stream in.
+        for idx in range(len(items)):
             self._aspects[idx] = 1.5
-            self._pending_headers.add(idx)
-            self._pool.start(_HeaderTask(idx, item.path, self._signals))
+        self._headers_done = 0
+        self._header_dispatch_i = 0
+        self._stopped = False
+        from PyQt6.QtCore import QTimer
+        QTimer.singleShot(0, self._dispatch_headers_chunk)
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -443,7 +464,27 @@ class _ImageMosaic(QWidget):
             self._viewport_width = width
             self._recompute_layout()
 
+    def _dispatch_headers_chunk(self):
+        """Queue the next batch of header reads, then yield to the event loop."""
+        if self._stopped:
+            return  # view was torn down — stop reading headers for a folder we left
+        n = len(self._items)
+        end = min(n, self._header_dispatch_i + self.HEADER_DISPATCH_CHUNK)
+        for idx in range(self._header_dispatch_i, end):
+            self._pending_headers.add(idx)
+            self._header_pool.start(_HeaderTask(idx, self._items[idx].path, self._signals))
+        self._header_dispatch_i = end
+        if end < n:
+            from PyQt6.QtCore import QTimer
+            QTimer.singleShot(0, self._dispatch_headers_chunk)
+
     def cleanup(self):
+        self._stopped = True   # halt the chunked header dispatch loop
+        try:
+            self._header_pool.clear()
+            self._header_pool.waitForDone(200)
+        except Exception:
+            pass
         try:
             self._pool.clear()
             self._pool.waitForDone(200)
@@ -480,9 +521,13 @@ class _ImageMosaic(QWidget):
         self._aspects = new_aspects
         self._pixmaps = new_pixmaps
         # Outstanding header/thumb tasks reference old indices — let their
-        # callbacks no-op rather than write into a remapped slot.
+        # callbacks no-op rather than write into a remapped slot. Stop any
+        # remaining chunked header dispatch (the surviving items already have
+        # their aspects).
         self._pending_headers.clear()
         self._pending_thumbs.clear()
+        self._header_dispatch_i = len(self._items)
+        self._headers_done = len(self._items)
         self._selected = set()
         self._anchor = -1
         self._cursor = -1
@@ -573,9 +618,14 @@ class _ImageMosaic(QWidget):
         if idx not in self._pending_headers:
             return
         self._pending_headers.discard(idx)
+        self._headers_done += 1
         if h > 0:
             self._aspects[idx] = w / h
-        # Throttle relayouts to every 50 incoming headers, plus once at the end.
+        # Drive the load bar (coarsely, plus a final exact tick).
+        total = len(self._items)
+        if self._headers_done >= total or self._headers_done % 25 == 0:
+            self.load_progress.emit(self._headers_done, total)
+        # Relayout while headers are still arriving (every 50) and once at the end.
         if not self._pending_headers or len(self._pending_headers) % 50 == 0:
             self._recompute_layout()
 
@@ -909,16 +959,24 @@ class _ImageMosaic(QWidget):
         act_open.triggered.connect(lambda: self.clicked.emit(targets[0]))
         menu.addSeparator()
 
-        act_ps = menu.addAction(menu_icon("photoshop"),
-                                "Open with Photoshop" + (f" ({n})" if multi else ""))
+        open_menu = menu.addMenu(menu_icon("photoshop"), "Open With" + (f" ({n})" if multi else ""))
+        open_menu.setToolTipsVisible(True)
+        act_ps = open_menu.addAction(menu_icon("photoshop"), "Adobe Photoshop")
         act_ps.triggered.connect(lambda: self._open_editor("photoshop", list(paths)))
-
-        act_lr = menu.addAction(menu_icon("lightroom"),
-                                "Open with Lightroom" + (f" ({n})" if multi else ""))
+        act_lr = open_menu.addAction(menu_icon("lightroom"), "Adobe Lightroom")
         act_lr.triggered.connect(lambda: self._open_editor("lightroom", list(paths)))
-
-        act_sys = menu.addAction(menu_icon("system"), "Open with System Default")
+        open_menu.addSeparator()
+        act_sys = open_menu.addAction(menu_icon("system"), "System Default")
         act_sys.triggered.connect(lambda: self._open_many(external.open_default, None, paths))
+
+        rot_menu = menu.addMenu(menu_icon("system"), "Rotate" + (f" ({n})" if multi else ""))
+        rot_menu.setToolTipsVisible(True)
+        act_rcw = rot_menu.addAction(menu_icon("system"), "Rotate 90° Clockwise")
+        act_rcw.triggered.connect(lambda: self._rotate_paths(list(paths), 90))
+        act_rccw = rot_menu.addAction(menu_icon("system"), "Rotate 90° Anticlockwise")
+        act_rccw.triggered.connect(lambda: self._rotate_paths(list(paths), 270))
+        act_r180 = rot_menu.addAction(menu_icon("system"), "Rotate 180°")
+        act_r180.triggered.connect(lambda: self._rotate_paths(list(paths), 180))
 
         menu.addSeparator()
 
@@ -989,6 +1047,59 @@ class _ImageMosaic(QWidget):
         if not app:
             return
         self._open_many(external.open_with, app, paths)
+
+    def _rotate_paths(self, paths, degrees):
+        """Rotate the selected files on disk (mosaic has no live preview, so the
+        rotation is written immediately, honouring the edit-save-mode setting)."""
+        from . import edits as edits_mod
+        from . import save_dialog as save_dialog_mod
+        if not paths:
+            return
+        mode = save_dialog_mod.resolve_save_mode(paths[0], self)
+        if mode is None:
+            return  # user cancelled the save-mode prompt
+        done = 0
+        errors: list[str] = []
+        made_new = False
+        with log.timed("album.rotate", n=len(paths), deg=degrees, mode=mode):
+            for path in paths:
+                out, err = edits_mod.apply_rotation(path, degrees, mode)
+                if err:
+                    errors.append(f"{os.path.basename(path)}: {err}")
+                    continue
+                done += 1
+                same = out and (os.path.normcase(os.path.abspath(out))
+                                == os.path.normcase(os.path.abspath(path)))
+                if same:
+                    self._refresh_thumb_for_path(path)
+                else:
+                    made_new = True
+        if errors:
+            QMessageBox.warning(
+                self, "Rotate",
+                f"{done} rotated, {len(errors)} failed:\n" + "\n".join(errors[:8]))
+        if made_new:
+            # Save-as-new (or RAW, which always writes a sibling JPEG) created
+            # files the current grid doesn't know about — rescan to show them.
+            self.reload_requested.emit()
+
+    def _refresh_thumb_for_path(self, path):
+        """Re-decode a single tile's thumbnail after its file changed on disk."""
+        norm = os.path.normcase(os.path.abspath(path))
+        for idx, it in enumerate(self._items):
+            if os.path.normcase(os.path.abspath(it.path)) != norm:
+                continue
+            cf = thumb_cache_file(self._source, it.path)
+            try:
+                if cf and os.path.isfile(cf):
+                    os.remove(cf)
+            except OSError:
+                pass
+            self._pixmaps.pop(idx, None)
+            self._pending_thumbs.discard(idx)
+            self._ensure_thumb(idx)
+            self.update()
+            return
 
     def _open_many(self, fn, app, paths):
         errs = []
@@ -1223,6 +1334,8 @@ class AlbumBrowserView(QWidget):
         self._scan_strip.setStyleSheet(
             "#scanStrip { background: #16203a; }"
             "QLabel#scanLbl { color: #cfd8e8; font-size: 11px; padding: 4px 12px; }"
+            "QProgressBar#scanBar { background: #0f1729; border: none; }"
+            "QProgressBar#scanBar::chunk { background: #2a82da; }"
         )
         scan_lay = QHBoxLayout(self._scan_strip)
         scan_lay.setContentsMargins(0, 0, 0, 0)
@@ -1230,8 +1343,13 @@ class AlbumBrowserView(QWidget):
         self._scan_label = QLabel("")
         self._scan_label.setObjectName("scanLbl")
         scan_lay.addWidget(self._scan_label)
+        self._scan_bar = QProgressBar()
+        self._scan_bar.setObjectName("scanBar")
+        self._scan_bar.setFixedHeight(4)
+        self._scan_bar.setTextVisible(False)
+        self._scan_bar.hide()
+        scan_lay.addWidget(self._scan_bar, 1)
         self._scan_strip.hide()
-        outer.addWidget(self._scan_strip)
 
         # Scrollable grid
         scroll = QScrollArea()
@@ -1253,6 +1371,10 @@ class AlbumBrowserView(QWidget):
 
         scroll.setWidget(self._grid_host)
         outer.addWidget(scroll, 1)
+
+        # Loading strip pinned at the BOTTOM, under the grid — unobtrusive while
+        # thumbnails/dimensions stream in (shown only while work is pending).
+        outer.addWidget(self._scan_strip)
 
     # ── Scan + render ─────────────────────────────────────────────────────────
 
@@ -1302,11 +1424,16 @@ class AlbumBrowserView(QWidget):
         while len(self._scan_cache) > self._scan_cache_max:
             self._scan_cache.popitem(last=False)
         self._was_cached = False
-        loading.close_smoothly()
         self._scan_strip.hide()
+        # Keep the loading screen up THROUGH render + first paint. It used to
+        # close right after the disk scan, so the user stared at an empty dark
+        # canvas while thousands of tiles were built and laid out. Render under
+        # the overlay, flush one paint, then fade it out.
         with log.timed("album.render", path=path, cached=False,
                        folders=len(self._folders), images=len(self._items)):
             self._render_grid()
+        QApplication.processEvents()
+        loading.close_smoothly()
         self._update_count()
         log.info("album.open", path=path, cached=False,
                  folders=len(self._folders), images=len(self._items))
@@ -1456,17 +1583,42 @@ class AlbumBrowserView(QWidget):
             self._mosaic = _ImageMosaic(self._items, self._source, parent=self._grid_host)
             self._mosaic.clicked.connect(self._on_image_clicked)
             self._mosaic.removed.connect(self._on_items_removed)
+            self._mosaic.reload_requested.connect(self._force_rescan)
             self._mosaic.scroll_to.connect(self._scroll_mosaic_to)
+            self._mosaic.load_progress.connect(self._set_load_progress)
+            self._set_load_progress(0, len(self._items))
             self._grid.addWidget(self._mosaic, row, 0, 1, max(cols, 1))
             # Push the row's column stretch so the mosaic spans full width.
             for c in range(max(cols, 1)):
                 self._grid.setColumnStretch(c, 1)
-            # Initial layout pass + a deferred one (viewport may not be settled).
+            # Lay out immediately so the mosaic already has tiles + a real
+            # height on its very first paint — otherwise it's a zero-height
+            # blank until the deferred timer fires (the gap users notice).
+            self._kick_mosaic_width()
+            # Deferred passes too: on a fresh view the viewport width may not
+            # be settled yet, so re-run once the event loop / resize lands.
             from PyQt6.QtCore import QTimer
             QTimer.singleShot(0, self._kick_mosaic_width)
             QTimer.singleShot(80, self._kick_mosaic_width)
 
         self._load_covers()
+
+    # Below this many photos, headers finish near-instantly — skip the bar
+    # so it doesn't flash for small folders.
+    _LOAD_BAR_MIN = 80
+
+    def _set_load_progress(self, done: int, total: int):
+        """Determinate 'Loading photos X / N' strip, fed by the mosaic as it
+        reads headers. Hides itself once every photo is processed."""
+        if total < self._LOAD_BAR_MIN or done >= total:
+            self._scan_bar.hide()
+            self._scan_strip.hide()
+            return
+        self._scan_label.setText(f"Loading photos   {done} / {total}")
+        self._scan_bar.setRange(0, total)
+        self._scan_bar.setValue(done)
+        self._scan_bar.show()
+        self._scan_strip.show()
 
     def _scroll_mosaic_to(self, x: int, y: int):
         """Keep the keyboard-focused mosaic tile within the viewport. The tile

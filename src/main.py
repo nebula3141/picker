@@ -20,7 +20,7 @@ os.environ.setdefault(
     ]),
 )
 
-from PyQt6.QtWidgets import QApplication, QMainWindow, QMessageBox, QGraphicsOpacityEffect
+from PyQt6.QtWidgets import QApplication, QMainWindow, QMessageBox, QGraphicsOpacityEffect, QLabel
 from PyQt6.QtCore import Qt, pyqtSlot, QTimer, qInstallMessageHandler, QtMsgType, QPropertyAnimation, QEasingCurve
 from PyQt6.QtGui import QAction, QDragEnterEvent, QDropEvent
 
@@ -297,8 +297,7 @@ class MainWindow(QMainWindow):
         self._album_browser = AlbumBrowserView(self._source_folder, self)
         self._album_browser.open_image.connect(self._open_image_in_folder)
         self._album_browser.back_requested.connect(self._show_library_view)
-        self.setCentralWidget(self._album_browser)
-        self._fade_in(self._album_browser)
+        self._set_central(self._album_browser)
         bar = self.statusBar()
         bar.showMessage(f"  {self._source_folder}")
 
@@ -435,7 +434,7 @@ class MainWindow(QMainWindow):
 
         self._gallery = GalleryView(self._manager)
         self._gallery.open_slideshow.connect(self._open_slideshow)
-        self.setCentralWidget(self._gallery)
+        self._set_central(self._gallery)
         self._update_status()
 
     def _update_status(self):
@@ -469,6 +468,15 @@ class MainWindow(QMainWindow):
             self._fade_in(self._slideshow)
         if not self.isFullScreen():
             self._toggle_fullscreen()
+        # Fullscreen toggle / fade can steal focus; re-assert it next tick so
+        # arrow keys work without a click. (_post_show_settle also retries.)
+        from PyQt6.QtCore import QTimer
+        QTimer.singleShot(0, self._focus_slideshow)
+
+    def _focus_slideshow(self):
+        if self._slideshow is not None:
+            self.activateWindow()
+            self._slideshow.setFocus(Qt.FocusReason.OtherFocusReason)
 
     @pyqtSlot(int)
     def _on_slideshow_closed(self, last_idx: int):
@@ -488,17 +496,68 @@ class MainWindow(QMainWindow):
                 self._gallery.scroll_to(last_idx)
                 self._update_status()
 
-    def _fade_in(self, widget):
+    def _fade_in(self, widget, duration: int = 250):
         effect = QGraphicsOpacityEffect(widget)
         widget.setGraphicsEffect(effect)
         anim = QPropertyAnimation(effect, b"opacity")
-        anim.setDuration(250)
+        anim.setDuration(duration)
         anim.setStartValue(0.0)
         anim.setEndValue(1.0)
         anim.setEasingCurve(QEasingCurve.Type.OutCubic)
         anim.finished.connect(lambda: widget.setGraphicsEffect(None))
         anim.start()
         self._view_anim = anim
+
+    def _set_central(self, widget, *, animate: bool = True):
+        """Swap the central view with a cross-dissolve: the outgoing view is
+        snapshotted and melted out on top while the incoming view fades in,
+        so navigating between Library / folders / gallery feels fluid rather
+        than a hard cut. Falls back to a plain swap when animation is off."""
+        old = self.centralWidget()
+        snap = None
+        if (animate and bool(settings_mod.get("slideshow_animation"))
+                and old is not None and old.isVisible()
+                and old.width() > 1 and old.height() > 1):
+            try:
+                snap = old.grab()
+            except Exception:
+                snap = None
+
+        self.setCentralWidget(widget)
+
+        if snap is None or snap.isNull():
+            if animate and bool(settings_mod.get("slideshow_animation")):
+                self._fade_in(widget)
+            return
+
+        self._fade_in(widget, duration=300)
+
+        # Outgoing snapshot laid over the new view, faded to transparent.
+        overlay = QLabel(widget)
+        overlay.setScaledContents(True)
+        overlay.setPixmap(snap)
+        overlay.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+
+        def _place_and_run():
+            if overlay.parent() is None:
+                return
+            overlay.setGeometry(widget.rect())
+            overlay.raise_()
+            overlay.show()
+            eff = QGraphicsOpacityEffect(overlay)
+            overlay.setGraphicsEffect(eff)
+            anim = QPropertyAnimation(eff, b"opacity", overlay)
+            anim.setDuration(300)
+            anim.setStartValue(1.0)
+            anim.setEndValue(0.0)
+            anim.setEasingCurve(QEasingCurve.Type.InOutCubic)
+            anim.finished.connect(overlay.deleteLater)
+            anim.start()
+            self._overlay_anim = anim
+
+        # Defer one tick so the new central widget has its real geometry.
+        from PyQt6.QtCore import QTimer
+        QTimer.singleShot(0, _place_and_run)
 
     def _toggle_fullscreen(self):
         if self.isFullScreen():
@@ -683,7 +742,7 @@ class MainWindow(QMainWindow):
         self._library_view.open_folder.connect(self._swap_source)
         self._library_view.manage_requested.connect(self._manage_library_roots)
         self._library_view.add_requested.connect(self._add_library_root)
-        self.setCentralWidget(self._library_view)
+        self._set_central(self._library_view)
         self.statusBar().clearMessage()
         self._schedule_idle_index()
 
@@ -1064,6 +1123,23 @@ def _detect_portable() -> bool:
     return (base / "portable.txt").exists() or (base / ".portable").exists()
 
 
+def _set_app_user_model_id(app_id: str = "PICker.PhotoCuller") -> None:
+    """Windows-only: register an explicit AppUserModelID so the OS shows our
+    window icon on the taskbar (and groups windows under our app, not the
+    Python host). No-op / harmless elsewhere."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(app_id)
+    except Exception as e:
+        try:
+            from picker import log
+            log.warn("could not set AppUserModelID", err=str(e))
+        except Exception:
+            pass
+
+
 def main():
     args = _parse_args()
     print(f"[PICker DEBUG] sys.argv={sys.argv}", flush=True)
@@ -1083,8 +1159,14 @@ def main():
         import os
         os.environ["PICKER_LOG"] = "1"
 
+    # Windows: bind an explicit AppUserModelID *before* any window exists so the
+    # taskbar uses our window icon instead of grouping under the host process
+    # (python.exe / the launcher), which otherwise shows a generic/Python icon.
+    _set_app_user_model_id()
+
     app = QApplication(sys.argv)
     app.setApplicationName("PICker")
+    app.setApplicationDisplayName("PICker")
     app.setOrganizationName("PICker")
     app.setWindowIcon(app_icon())
     app.setStyle("Fusion")

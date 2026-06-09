@@ -242,7 +242,7 @@ class ImageManager:
     def create_seeded(cls, source_folder: str, target_file: str,
                       seed_count: int = 5,
                       destinations: list[dict] | None = None,
-                      mode: str = "copy", resolution_pct: int = 25,
+                      mode: str = "copy", resolution_pct: int = 50,
                       on_progress=None, on_complete=None):
         """Create ImageManager with only ±seed_count files around target_file loaded.
         Remaining files discovered in background thread, closest-first."""

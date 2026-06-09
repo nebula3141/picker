@@ -3,7 +3,7 @@ from pathlib import Path
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QLineEdit, QPushButton,
     QGroupBox, QFileDialog, QFrame, QComboBox, QSpinBox, QDoubleSpinBox, QCheckBox,
-    QScrollArea, QWidget, QMessageBox, QSizePolicy
+    QScrollArea, QWidget, QMessageBox, QSizePolicy, QListWidget, QStackedWidget
 )
 from PyQt6.QtCore import Qt
 
@@ -154,6 +154,27 @@ QCheckBox::indicator:checked {
 }
 
 QFrame#divider { background: #262626; max-height: 1px; }
+
+QListWidget#nav {
+    background: #1b1b1b;
+    border: 1px solid #262626;
+    border-radius: 10px;
+    padding: 6px;
+    outline: 0;
+    font-size: 13px;
+}
+QListWidget#nav::item {
+    color: #b8b8b8;
+    padding: 9px 12px;
+    border-radius: 7px;
+    margin: 2px 0;
+}
+QListWidget#nav::item:hover { background: #242424; color: #e8e8e8; }
+QListWidget#nav::item:selected {
+    background: #2a82da;
+    color: #ffffff;
+    font-weight: 600;
+}
 """
 
 
@@ -193,32 +214,38 @@ class SettingsDialog(QDialog):
         divider.setFixedHeight(1)
         outer.addWidget(divider)
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        inner = QWidget()
-        inner.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-        root = QVBoxLayout(inner)
-        root.setContentsMargins(2, 2, 2, 2)
-        root.setSpacing(12)
+        # Category sidebar + stacked pages — keeps each screen short and focused
+        # instead of one long scroll through every group at once.
+        body = QHBoxLayout()
+        body.setSpacing(16)
 
-        root.addWidget(self._build_defaults())
-        root.addWidget(self._build_gallery())
-        root.addWidget(self._build_slideshow())
-        root.addWidget(self._build_editing())
-        root.addWidget(self._build_scanning())
-        root.addWidget(self._build_maintenance())
-        root.addWidget(self._build_appearance())
-        root.addWidget(self._build_overlays())
-        root.addWidget(self._build_editors())
-        root.addWidget(self._build_system())
-        root.addWidget(self._build_advanced())
-        root.addStretch(1)
+        self._nav = QListWidget()
+        self._nav.setObjectName("nav")
+        self._nav.setFixedWidth(170)
+        self._nav.setFrameShape(QFrame.Shape.NoFrame)
+        self._nav.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        body.addWidget(self._nav)
 
-        scroll.setWidget(inner)
-        outer.addWidget(scroll, 1)
+        self._stack = QStackedWidget()
+        body.addWidget(self._stack, 1)
+
+        pages = [
+            ("General",      [self._build_defaults(), self._build_appearance()]),
+            ("Gallery",      [self._build_gallery()]),
+            ("Slideshow",    [self._build_slideshow(), self._build_overlays()]),
+            ("Editing",      [self._build_editing()]),
+            ("Scanning",     [self._build_scanning()]),
+            ("Integrations", [self._build_editors(), self._build_system()]),
+            ("Cache",        [self._build_maintenance()]),
+            ("Advanced",     [self._build_advanced()]),
+        ]
+        for label, groups in pages:
+            self._stack.addWidget(self._make_page(groups))
+            self._nav.addItem(label)
+        self._nav.currentRowChanged.connect(self._switch_page)
+        self._nav.setCurrentRow(0)
+
+        outer.addLayout(body, 1)
 
         bottom_div = QFrame()
         bottom_div.setObjectName("divider")
@@ -242,6 +269,43 @@ class SettingsDialog(QDialog):
         btn_row.addWidget(save)
         outer.addLayout(btn_row)
 
+    def _switch_page(self, idx: int):
+        """Change page with a quick fade so navigation feels fluid."""
+        self._stack.setCurrentIndex(idx)
+        from PyQt6.QtWidgets import QGraphicsOpacityEffect
+        from PyQt6.QtCore import QPropertyAnimation, QEasingCurve
+        page = self._stack.currentWidget()
+        if page is None:
+            return
+        eff = QGraphicsOpacityEffect(page)
+        page.setGraphicsEffect(eff)
+        anim = QPropertyAnimation(eff, b"opacity", page)
+        anim.setDuration(150)
+        anim.setStartValue(0.25)
+        anim.setEndValue(1.0)
+        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        anim.finished.connect(lambda: page.setGraphicsEffect(None))
+        anim.start()
+        self._page_anim = anim  # keep ref
+
+    def _make_page(self, groups) -> QScrollArea:
+        """Wrap a list of group boxes in a scrollable page for the stack."""
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        inner = QWidget()
+        inner.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        lay = QVBoxLayout(inner)
+        lay.setContentsMargins(2, 2, 8, 2)
+        lay.setSpacing(12)
+        for grp in groups:
+            lay.addWidget(grp)
+        lay.addStretch(1)
+        scroll.setWidget(inner)
+        return scroll
+
     def _set_accessible_names(self):
         """Set accessible names on interactive widgets for screen readers."""
         name_map = {
@@ -249,6 +313,8 @@ class SettingsDialog(QDialog):
             "res_combo": "Resolution percentage",
             "full_res_cb": "Display full resolution",
             "thumb_size_combo": "Thumbnail row height",
+            "group_by_combo": "Group images by",
+            "group_gran_combo": "Date group granularity",
             "preload_spin": "Preload count",
             "auto_advance_cb": "Auto advance on send",
             "filmstrip_cb": "Show filmstrip",
@@ -313,7 +379,9 @@ class SettingsDialog(QDialog):
         self.res_combo.setFixedWidth(120)
         g.addWidget(self.res_combo, 2, 1, Qt.AlignmentFlag.AlignLeft)
 
-        hint = QLabel("Applied when opening a new source folder. Resolution = fraction of original pixels used in slideshow.")
+        hint = QLabel("Applied when opening a new source folder. A fraction of the original "
+                      "pixels are decoded for the viewer to save memory. Smart-scaling never "
+                      "shrinks an image below your screen resolution, so small photos stay sharp.")
         hint.setObjectName("hint")
         hint.setWordWrap(True)
         g.addWidget(hint, 3, 0, 1, 2)
@@ -339,7 +407,31 @@ class SettingsDialog(QDialog):
             self.thumb_size_combo.addItem(label, px)
         self.thumb_size_combo.setFixedWidth(200)
         g.addWidget(self.thumb_size_combo, 0, 1, Qt.AlignmentFlag.AlignLeft)
+
+        g.addWidget(QLabel("Group images by"), 1, 0)
+        self.group_by_combo = QComboBox()
+        self.group_by_combo.addItem("None (flat grid)", "flat")
+        self.group_by_combo.addItem("Date taken", "date")
+        self.group_by_combo.addItem("Folder", "folder")
+        self.group_by_combo.addItem("Camera", "camera")
+        self.group_by_combo.setFixedWidth(200)
+        self.group_by_combo.currentIndexChanged.connect(self._sync_group_gran_enabled)
+        g.addWidget(self.group_by_combo, 1, 1, Qt.AlignmentFlag.AlignLeft)
+
+        self.group_gran_label = QLabel("Date granularity")
+        g.addWidget(self.group_gran_label, 2, 0)
+        self.group_gran_combo = QComboBox()
+        self.group_gran_combo.addItem("Day", "day")
+        self.group_gran_combo.addItem("Month", "month")
+        self.group_gran_combo.addItem("Year", "year")
+        self.group_gran_combo.setFixedWidth(200)
+        g.addWidget(self.group_gran_combo, 2, 1, Qt.AlignmentFlag.AlignLeft)
         return grp
+
+    def _sync_group_gran_enabled(self):
+        on = self.group_by_combo.currentData() == "date"
+        self.group_gran_label.setEnabled(on)
+        self.group_gran_combo.setEnabled(on)
 
     # Slideshow
     def _build_slideshow(self) -> QGroupBox:
@@ -486,10 +578,21 @@ class SettingsDialog(QDialog):
         clear_recent_btn.clicked.connect(self._clear_recents)
         g.addWidget(clear_recent_btn, 2, 0, 1, 2)
 
-        hint = QLabel("Cache lives under each source folder in `.picker_cache/`. Oldest thumbs evict when over cap.")
+        clear_all_btn = QPushButton("Clear all cache && database")
+        clear_all_btn.setObjectName("danger")
+        clear_all_btn.clicked.connect(self._clear_all_cache_db)
+        g.addWidget(clear_all_btn, 3, 0, 1, 2)
+
+        reset_btn = QPushButton("Reset settings to defaults")
+        reset_btn.setObjectName("danger")
+        reset_btn.clicked.connect(self._reset_defaults)
+        g.addWidget(reset_btn, 4, 0, 1, 2)
+
+        hint = QLabel("Cache lives under each source folder in `.picker_cache/`. Oldest thumbs evict when over cap. "
+                      "Clearing the database wipes the indexed image metadata (rebuilt on next scan).")
         hint.setObjectName("hint")
         hint.setWordWrap(True)
-        g.addWidget(hint, 3, 0, 1, 3)
+        g.addWidget(hint, 5, 0, 1, 3)
         return grp
 
     # Appearance
@@ -675,6 +778,70 @@ class SettingsDialog(QDialog):
         )
         self._refresh_cache_size()
 
+    def _clear_all_cache_db(self):
+        confirm = QMessageBox.question(
+            self, "Clear all cache & database",
+            "This wipes all thumbnail caches, the image metadata database, and "
+            "the move/position history.\n\nYour photos are NOT touched. Continue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        import shutil
+        from pathlib import Path as _Path
+        # 1) Per-source thumbnail caches
+        for src in recent_mod.load():
+            p = _Path(src) / ".picker_cache"
+            if p.is_dir():
+                shutil.rmtree(p, ignore_errors=True)
+        # 2) Index database
+        try:
+            from . import index as index_mod
+            index_mod.clear_all()
+        except Exception:
+            pass
+        # 3) In-memory scan caches (folder browser)
+        try:
+            from . import album_browser_view as abv
+            abv.invalidate_scan_cache()
+        except Exception:
+            pass
+        # 4) Sidecar state files under the config dir
+        try:
+            cfg = settings_mod._config_dir()
+            for name in ("move-journal.json", "positions.json"):
+                f = cfg / name
+                if f.exists():
+                    f.unlink()
+        except Exception:
+            pass
+        QMessageBox.information(
+            self, "Cleared",
+            "All caches and the database were cleared. They rebuild automatically "
+            "as you browse.")
+        self._refresh_cache_size()
+
+    def _reset_defaults(self):
+        confirm = QMessageBox.question(
+            self, "Reset settings",
+            "Reset every setting on this screen back to its default value?\n\n"
+            "(External-editor paths and file associations are left as-is.)",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        defaults = dict(settings_mod.DEFAULTS)
+        # Preserve things the user shouldn't lose on a settings reset.
+        for keep in ("photoshop_path", "lightroom_path",
+                     "file_associations_registered", "recent_target_folders",
+                     "last_folder"):
+            defaults[keep] = settings_mod.get(keep)
+        settings_mod.save(defaults)
+        self._load()   # repaint every control from the fresh defaults
+        QMessageBox.information(
+            self, "Settings reset",
+            "Settings restored to defaults. Some changes apply after you click Save.")
+
     def _refresh_cache_size(self):
         total = 0
         count = 0
@@ -698,11 +865,14 @@ class SettingsDialog(QDialog):
         data = settings_mod.load()
 
         self._select_data(self.mode_combo, data.get("default_mode", "copy"))
-        self._select_data(self.res_combo, int(data.get("default_resolution_pct", 25)))
+        self._select_data(self.res_combo, int(data.get("default_resolution_pct", 50)))
         self.full_res_cb.setChecked(bool(data.get("display_full_resolution", False)))
         # Reflect the checkbox state in dropdown visibility on open.
         self._sync_res_combo_visible(self.full_res_cb.isChecked())
         self._select_data(self.thumb_size_combo, int(data.get("thumbnail_row_height", 170)))
+        self._select_data(self.group_by_combo, data.get("group_by", "flat"))
+        self._select_data(self.group_gran_combo, data.get("date_group_granularity", "day"))
+        self._sync_group_gran_enabled()
 
         self.preload_spin.setValue(int(data.get("preload_count", 2)))
         self.auto_advance_cb.setChecked(bool(data.get("auto_advance_on_send", True)))
@@ -785,10 +955,12 @@ class SettingsDialog(QDialog):
 
         settings_mod.save({
             "default_mode": self.mode_combo.currentData() or "copy",
-            "default_resolution_pct": int(self.res_combo.currentData() or 25),
+            "default_resolution_pct": int(self.res_combo.currentData() or 50),
             "display_full_resolution": bool(self.full_res_cb.isChecked()),
 
             "thumbnail_row_height": int(self.thumb_size_combo.currentData() or 170),
+            "group_by": self.group_by_combo.currentData() or "flat",
+            "date_group_granularity": self.group_gran_combo.currentData() or "day",
 
             "preload_count": int(self.preload_spin.value()),
             "auto_advance_on_send": bool(self.auto_advance_cb.isChecked()),

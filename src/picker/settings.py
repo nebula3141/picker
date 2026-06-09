@@ -29,7 +29,7 @@ def is_portable() -> bool:
 def portable_dir() -> Path | None:
     return _portable_dir
 
-SETTINGS_VERSION = 2
+SETTINGS_VERSION = 3
 
 DEFAULTS = {
     # ── Internal
@@ -37,7 +37,7 @@ DEFAULTS = {
 
     # ── Defaults (moved from StartupDialog)
     "default_mode": "copy",              # "copy" | "move"
-    "default_resolution_pct": 25,        # 10 | 25 | 50 | 100
+    "default_resolution_pct": 50,        # 10 | 25 | 50 | 100 (smart: small images never downscaled)
     "display_full_resolution": False,    # if True, override pct and decode at native (RAM-heavy on 60MP RAW)
 
     # ── Gallery
@@ -121,6 +121,17 @@ def _migrate_v0_to_v1(data: dict) -> dict:
 def _migrate_v1_to_v2(data: dict) -> dict:
     data.setdefault("check_updates", True)
     data["settings_version"] = 2
+    return data
+
+
+@_migration(2)
+def _migrate_v2_to_v3(data: dict) -> dict:
+    # Old default decode resolution was 25%, which softened small images.
+    # Bump users still sitting on the old default up to the new 50% default.
+    # Anyone who deliberately picked another value is left untouched.
+    if data.get("default_resolution_pct") == 25:
+        data["default_resolution_pct"] = 50
+    data["settings_version"] = 3
     return data
 
 
