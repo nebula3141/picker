@@ -60,6 +60,151 @@ def app_icon() -> QIcon:
     return icon
 
 
+# ── Context-menu glyph icons ────────────────────────────────────────────────
+# Flat 1-color glyphs sized for QMenu (16px base, multi-res). Drawn in a light
+# neutral so they read on the dark menu background. `name` selects the glyph.
+
+_MENU_FG = QColor(220, 224, 230)
+_MENU_ACCENT = QColor(90, 150, 230)
+
+
+def _draw_glyph(p: QPainter, name: str, s: int) -> None:
+    """Paint glyph `name` into an s×s canvas (origin 0,0)."""
+    fg = _MENU_FG
+    pen = QPen(fg, max(1.0, s * 0.085))
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+
+    def box(x0, y0, x1, y1):
+        return QRectF(x0 * s, y0 * s, (x1 - x0) * s, (y1 - y0) * s)
+
+    if name == "slideshow":
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(fg)
+        p.drawPolygon(QPolygonF([
+            QPointF(0.30 * s, 0.22 * s),
+            QPointF(0.30 * s, 0.78 * s),
+            QPointF(0.80 * s, 0.50 * s),
+        ]))
+
+    elif name in ("photoshop", "lightroom"):
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(35, 60, 115) if name == "photoshop" else QColor(40, 90, 150))
+        p.drawRoundedRect(box(0.12, 0.12, 0.88, 0.88), s * 0.16, s * 0.16)
+        f = p.font(); f.setBold(True); f.setPixelSize(int(s * 0.5)); p.setFont(f)
+        p.setPen(QColor(120, 190, 255))
+        p.drawText(box(0.12, 0.10, 0.88, 0.90),
+                   Qt.AlignmentFlag.AlignCenter,
+                   "Ps" if name == "photoshop" else "Lr")
+
+    elif name == "system":
+        p.setPen(pen); p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRoundedRect(box(0.15, 0.20, 0.85, 0.70), s * 0.06, s * 0.06)
+        p.drawLine(QPointF(0.38 * s, 0.82 * s), QPointF(0.62 * s, 0.82 * s))
+        p.drawLine(QPointF(0.50 * s, 0.70 * s), QPointF(0.50 * s, 0.82 * s))
+
+    elif name == "copy_path":
+        p.setPen(pen); p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRoundedRect(box(0.24, 0.16, 0.76, 0.86), s * 0.07, s * 0.07)
+        p.setBrush(fg)
+        p.drawRoundedRect(box(0.38, 0.10, 0.62, 0.22), s * 0.04, s * 0.04)
+
+    elif name == "reveal":
+        # open folder
+        p.setPen(Qt.PenStyle.NoPen); p.setBrush(fg)
+        p.drawPolygon(QPolygonF([
+            QPointF(0.14 * s, 0.30 * s), QPointF(0.42 * s, 0.30 * s),
+            QPointF(0.50 * s, 0.40 * s), QPointF(0.86 * s, 0.40 * s),
+            QPointF(0.86 * s, 0.78 * s), QPointF(0.14 * s, 0.78 * s),
+        ]))
+
+    elif name == "folder":
+        p.setPen(Qt.PenStyle.NoPen); p.setBrush(fg)
+        p.drawPolygon(QPolygonF([
+            QPointF(0.14 * s, 0.28 * s), QPointF(0.44 * s, 0.28 * s),
+            QPointF(0.52 * s, 0.38 * s), QPointF(0.86 * s, 0.38 * s),
+            QPointF(0.86 * s, 0.78 * s), QPointF(0.14 * s, 0.78 * s),
+        ]))
+
+    elif name == "move":
+        # folder + right arrow into it
+        p.setPen(Qt.PenStyle.NoPen); p.setBrush(QColor(180, 186, 196))
+        p.drawPolygon(QPolygonF([
+            QPointF(0.42 * s, 0.30 * s), QPointF(0.62 * s, 0.30 * s),
+            QPointF(0.68 * s, 0.38 * s), QPointF(0.90 * s, 0.38 * s),
+            QPointF(0.90 * s, 0.80 * s), QPointF(0.42 * s, 0.80 * s),
+        ]))
+        ap = QPen(_MENU_ACCENT, max(1.0, s * 0.11))
+        ap.setCapStyle(Qt.PenCapStyle.RoundCap)
+        ap.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        p.setPen(ap); p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawLine(QPointF(0.10 * s, 0.58 * s), QPointF(0.46 * s, 0.58 * s))
+        p.drawPolyline(QPolygonF([
+            QPointF(0.34 * s, 0.46 * s), QPointF(0.48 * s, 0.58 * s),
+            QPointF(0.34 * s, 0.70 * s),
+        ]))
+
+    elif name == "copy":
+        p.setPen(pen); p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRoundedRect(box(0.22, 0.14, 0.62, 0.62), s * 0.06, s * 0.06)
+        p.drawRoundedRect(box(0.40, 0.38, 0.80, 0.86), s * 0.06, s * 0.06)
+
+    elif name == "delete":
+        ap = QPen(QColor(225, 110, 110), max(1.0, s * 0.085))
+        ap.setCapStyle(Qt.PenCapStyle.RoundCap)
+        ap.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        p.setPen(ap); p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawLine(QPointF(0.22 * s, 0.26 * s), QPointF(0.78 * s, 0.26 * s))
+        p.drawLine(QPointF(0.42 * s, 0.18 * s), QPointF(0.58 * s, 0.18 * s))
+        p.drawPolyline(QPolygonF([
+            QPointF(0.28 * s, 0.30 * s), QPointF(0.34 * s, 0.82 * s),
+            QPointF(0.66 * s, 0.82 * s), QPointF(0.72 * s, 0.30 * s),
+        ]))
+        p.drawLine(QPointF(0.43 * s, 0.40 * s), QPointF(0.45 * s, 0.74 * s))
+        p.drawLine(QPointF(0.57 * s, 0.40 * s), QPointF(0.55 * s, 0.74 * s))
+
+    elif name == "select_all":
+        p.setPen(pen); p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRoundedRect(box(0.16, 0.16, 0.84, 0.84), s * 0.10, s * 0.10)
+        ap = QPen(_MENU_ACCENT, max(1.0, s * 0.11))
+        ap.setCapStyle(Qt.PenCapStyle.RoundCap)
+        ap.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        p.setPen(ap)
+        p.drawPolyline(QPolygonF([
+            QPointF(0.32 * s, 0.52 * s), QPointF(0.45 * s, 0.66 * s),
+            QPointF(0.70 * s, 0.34 * s),
+        ]))
+
+    elif name == "clear":
+        p.setPen(pen); p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRoundedRect(box(0.16, 0.16, 0.84, 0.84), s * 0.10, s * 0.10)
+        p.drawLine(QPointF(0.34 * s, 0.34 * s), QPointF(0.66 * s, 0.66 * s))
+        p.drawLine(QPointF(0.66 * s, 0.34 * s), QPointF(0.34 * s, 0.66 * s))
+
+
+_menu_icon_cache: dict[str, QIcon] = {}
+
+
+def menu_icon(name: str) -> QIcon:
+    """Cached QIcon for a context-menu action glyph."""
+    if name in _menu_icon_cache:
+        return _menu_icon_cache[name]
+    icon = QIcon()
+    for s in (16, 24, 32):
+        pm = QPixmap(s, s)
+        pm.fill(Qt.GlobalColor.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+        try:
+            _draw_glyph(p, name, s)
+        finally:
+            p.end()
+        icon.addPixmap(pm)
+    _menu_icon_cache[name] = icon
+    return icon
+
+
 def export_ico(path: str) -> None:
     """Write multi-size PNG-embedded .ico for PyInstaller --icon."""
     import struct

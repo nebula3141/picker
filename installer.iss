@@ -8,7 +8,7 @@
 #define MyAppURL "https://github.com/nebula3141/picker"
 
 #ifndef MyAppVersion
-  #define MyAppVersion "4.6.0"
+  #define MyAppVersion "4.7.0"
 #endif
 
 [Setup]

@@ -26,11 +26,15 @@ from PyQt6.QtGui import (
 from PyQt6.QtCore import QPointF
 from PyQt6.QtWidgets import (
     QWidget, QScrollArea, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
-    QGridLayout, QSizePolicy, QApplication, QFrame, QMenu
+    QGridLayout, QSizePolicy, QApplication, QFrame, QMenu, QMessageBox,
+    QFileDialog
 )
 
 from . import theme as theme_mod
+from . import settings as settings_mod
+from . import log
 from .album import Folder, ImageItem, scan_path
+from .icon import menu_icon
 from .gallery_view import (
     cache_file as thumb_cache_file,
     THUMB_MAX_DIM,
@@ -59,6 +63,135 @@ def invalidate_scan_cache(path: str | None = None):
         _SCAN_CACHE.clear()
     else:
         _SCAN_CACHE.pop(path, None)
+
+
+# ── Move / copy + recent destinations ──────────────────────────────────────────
+
+def recent_target_folders() -> list[str]:
+    """Last ≤3 move/copy destinations that still exist on disk."""
+    raw = settings_mod.get("recent_target_folders") or []
+    out: list[str] = []
+    seen: set[str] = set()
+    for f in raw:
+        if not isinstance(f, str) or not os.path.isdir(f):
+            continue
+        key = os.path.normcase(os.path.abspath(f))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(f)
+        if len(out) >= 3:
+            break
+    return out
+
+
+def push_recent_target(folder: str) -> None:
+    """Promote `folder` to the front of the recent-destinations list (cap 3)."""
+    folder = os.path.abspath(folder)
+    key = os.path.normcase(folder)
+    cur = settings_mod.get("recent_target_folders") or []
+    cur = [f for f in cur if isinstance(f, str)
+           and os.path.normcase(os.path.abspath(f)) != key]
+    cur.insert(0, folder)
+    settings_mod.set_value("recent_target_folders", cur[:3])
+
+
+def _unique_dest(dest: str) -> str:
+    """If `dest` exists, append ' (n)' before the extension until free."""
+    if not os.path.exists(dest):
+        return dest
+    root, ext = os.path.splitext(dest)
+    n = 1
+    while True:
+        cand = f"{root} ({n}){ext}"
+        if not os.path.exists(cand):
+            return cand
+        n += 1
+
+
+def make_conflict_resolver(parent):
+    """Build a per-conflict resolver honouring the `conflict_default` setting.
+    'ask' shows the side-by-side ConflictDialog; otherwise the fixed policy is
+    applied to every clash. Returns a callable (src, dest) -> choice string of
+    'replace' | 'rename' | 'skip' | 'cancel'."""
+    policy = settings_mod.get("conflict_default") or "ask"
+
+    def resolve(src: str, dest: str) -> str:
+        if policy in ("rename", "replace", "skip"):
+            return policy
+        from . import conflict_dialog
+        return conflict_dialog.ask(parent, src, dest)
+
+    return resolve
+
+
+def transfer_files(paths: list[str], dest_dir: str, *, move: bool,
+                   conflict_cb=None) -> tuple[list[str], list[str], bool]:
+    """Move/copy each path into dest_dir.
+
+    On a name clash, `conflict_cb(src, dest)` decides: 'replace' | 'rename'
+    | 'skip' | 'cancel' ('cancel' aborts the rest of the batch). With no
+    callback the legacy behaviour (auto-rename) is used.
+
+    Returns (ok_sources, errors, cancelled) — ok_sources are the source paths
+    that were successfully transferred, so callers can update their model
+    without rescanning.
+    """
+    import shutil
+    ok: list[str] = []
+    errors: list[str] = []
+    for src in paths:
+        base = os.path.basename(src)
+        try:
+            dst = os.path.join(dest_dir, base)
+            if os.path.normcase(os.path.abspath(src)) == os.path.normcase(os.path.abspath(dst)):
+                continue  # same location — skip silently
+            if os.path.exists(dst):
+                choice = conflict_cb(src, dst) if conflict_cb else "rename"
+                if choice == "cancel":
+                    return ok, errors, True
+                if choice == "skip":
+                    continue
+                if choice == "rename":
+                    dst = _unique_dest(dst)
+                elif choice == "replace":
+                    try:
+                        os.remove(dst)
+                    except OSError:
+                        pass
+                else:
+                    dst = _unique_dest(dst)
+            try:
+                if move:
+                    shutil.move(src, dst)
+                else:
+                    shutil.copy2(src, dst)
+            except PermissionError:
+                # WinError 5 (Access Denied) — most often the read-only
+                # attribute. Clear it on src (and on dst if we're replacing)
+                # and retry once before giving up.
+                _clear_readonly(src)
+                if os.path.exists(dst):
+                    _clear_readonly(dst)
+                if move:
+                    shutil.move(src, dst)
+                else:
+                    shutil.copy2(src, dst)
+            ok.append(src)
+        except PermissionError:
+            errors.append(f"{base}: access denied — file is read-only or open "
+                          f"in another program (WinError 5)")
+        except Exception as e:
+            errors.append(f"{base}: {e}")
+    return ok, errors, False
+
+
+def _clear_readonly(path: str) -> None:
+    import stat
+    try:
+        os.chmod(path, stat.S_IWRITE)
+    except OSError:
+        pass
 
 
 def _draw_play_badge(p: QPainter, rect: QRect, *, size: int = 38) -> None:
@@ -252,6 +385,8 @@ class _ImageMosaic(QWidget):
     but driven by a list of `ImageItem` instead of an `ImageManager`."""
 
     clicked = pyqtSignal(int)            # image index in the list passed in
+    removed = pyqtSignal(list)           # paths gone from this folder (move/delete)
+    scroll_to = pyqtSignal(int, int)     # (x, y) the parent scroll area should reveal
 
     ROW_HEIGHT = 200
     ROW_HEIGHT_MIN = 90
@@ -272,6 +407,12 @@ class _ImageMosaic(QWidget):
         self._total_height = 0
         self._hover_idx = -1
         self._row_height = self.ROW_HEIGHT
+
+        # Multi-selection (shift = range from anchor, ctrl = toggle).
+        self._selected: set[int] = set()
+        self._anchor: int = -1
+        self._cursor: int = -1          # keyboard focus tile (arrow-key navigation)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
         self._signals = _WorkerSignals()
         self._signals.header_ready.connect(self._on_header_ready)
@@ -308,6 +449,46 @@ class _ImageMosaic(QWidget):
             self._pool.waitForDone(200)
         except Exception:
             pass
+
+    def _remove_paths(self, paths) -> None:
+        """Remove items by path (move/delete) and notify the parent — no rescan."""
+        pathset = {os.path.normcase(os.path.abspath(p)) for p in paths}
+        indices = [i for i, it in enumerate(self._items)
+                   if os.path.normcase(os.path.abspath(it.path)) in pathset]
+        if not indices:
+            return
+        self.remove_indices(indices)
+        self.removed.emit(list(paths))
+
+    def remove_indices(self, indices) -> None:
+        """Drop the given item indices in place and relayout. Aspects/pixmaps
+        already computed for surviving items are remapped to their new indices
+        so nothing re-decodes; pending tasks for old indices are dropped (their
+        callbacks no-op via the pending-set guard)."""
+        drop = {i for i in indices if 0 <= i < len(self._items)}
+        if not drop:
+            return
+        keep = [i for i in range(len(self._items)) if i not in drop]
+        self._items = [self._items[i] for i in keep]
+        new_aspects: dict[int, float] = {}
+        new_pixmaps: dict[int, QPixmap] = {}
+        for new_idx, old_idx in enumerate(keep):
+            if old_idx in self._aspects:
+                new_aspects[new_idx] = self._aspects[old_idx]
+            if old_idx in self._pixmaps:
+                new_pixmaps[new_idx] = self._pixmaps[old_idx]
+        self._aspects = new_aspects
+        self._pixmaps = new_pixmaps
+        # Outstanding header/thumb tasks reference old indices — let their
+        # callbacks no-op rather than write into a remapped slot.
+        self._pending_headers.clear()
+        self._pending_thumbs.clear()
+        self._selected = set()
+        self._anchor = -1
+        self._cursor = -1
+        self._hover_idx = -1
+        self._recompute_layout()
+        self.update()
 
     # ── Layout ────────────────────────────────────────────────────────────────
 
@@ -388,6 +569,9 @@ class _ImageMosaic(QWidget):
 
     @pyqtSlot(int, int, int)
     def _on_header_ready(self, idx: int, w: int, h: int):
+        # Stale callback from a task whose index was removed/remapped — ignore.
+        if idx not in self._pending_headers:
+            return
         self._pending_headers.discard(idx)
         if h > 0:
             self._aspects[idx] = w / h
@@ -397,6 +581,9 @@ class _ImageMosaic(QWidget):
 
     @pyqtSlot(int, QPixmap, int, int)
     def _on_thumb_ready(self, idx: int, pm: QPixmap, w: int, h: int):
+        # Stale callback from a task whose index was removed/remapped — ignore.
+        if idx not in self._pending_thumbs:
+            return
         self._pending_thumbs.discard(idx)
         self._pixmaps[idx] = pm
         needs_relayout = False
@@ -464,12 +651,46 @@ class _ImageMosaic(QWidget):
             if is_video(self._items[idx].path):
                 _draw_play_badge(p, rect)
 
-            if idx == self._hover_idx:
+            selected = idx in self._selected
+            if selected:
+                p.fillRect(rect, QColor(80, 140, 220, 70))
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.setPen(QPen(QColor(90, 160, 240), self.HOVER_BORDER + 1))
+                inset = (self.HOVER_BORDER + 1) // 2
+                p.drawRect(rect.adjusted(inset, inset, -inset, -inset))
+                self._draw_check_badge(p, rect)
+            elif idx == self._hover_idx:
                 p.setBrush(Qt.BrushStyle.NoBrush)
                 p.setPen(QPen(QColor(80, 140, 220), self.HOVER_BORDER))
                 inset = self.HOVER_BORDER // 2
                 p.drawRect(rect.adjusted(inset, inset, -inset, -inset))
+
+            # Keyboard focus ring — white dashed, drawn over any state above.
+            if idx == self._cursor:
+                pen = QPen(QColor(255, 255, 255), 2, Qt.PenStyle.DashLine)
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.setPen(pen)
+                p.drawRect(rect.adjusted(2, 2, -2, -2))
         p.end()
+
+    @staticmethod
+    def _draw_check_badge(p: QPainter, rect: QRect) -> None:
+        """Filled accent disc with white tick, top-left of a selected tile."""
+        r = 11
+        cx = rect.left() + r + 6
+        cy = rect.top() + r + 6
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(90, 160, 240))
+        p.drawEllipse(QPointF(float(cx), float(cy)), r, r)
+        pen = QPen(QColor(255, 255, 255), 2.2)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        p.setPen(pen)
+        p.drawPolyline(QPolygonF([
+            QPointF(cx - 5, cy + 0),
+            QPointF(cx - 1, cy + 4),
+            QPointF(cx + 5, cy - 4),
+        ]))
 
     # ── Hover + click ────────────────────────────────────────────────────────
 
@@ -501,48 +722,364 @@ class _ImageMosaic(QWidget):
                     self.update(rect)
                     break
 
-    def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.RightButton:
-            pos = event.position().toPoint()
-            for idx, rect in self._tiles:
-                if rect.contains(pos):
-                    self._show_context_menu(idx, event.globalPosition().toPoint())
-                    return
-            return
-        if event.button() != Qt.MouseButton.LeftButton:
-            return
-        pos = event.position().toPoint()
+    def _idx_at(self, pos) -> int:
         for idx, rect in self._tiles:
             if rect.contains(pos):
-                self.clicked.emit(idx)
-                return
+                return idx
+        return -1
+
+    def _set_selection(self, indices):
+        new = {i for i in indices if 0 <= i < len(self._items)}
+        if new != self._selected:
+            self._selected = new
+            self.update()
+
+    def mousePressEvent(self, event):
+        pos = event.position().toPoint()
+        idx = self._idx_at(pos)
+        mods = event.modifiers()
+        ctrl = bool(mods & Qt.KeyboardModifier.ControlModifier)
+        shift = bool(mods & Qt.KeyboardModifier.ShiftModifier)
+
+        if event.button() == Qt.MouseButton.RightButton:
+            self.setFocus()
+            # Right-click outside the current selection retargets to that tile.
+            if idx >= 0 and idx not in self._selected:
+                self._set_selection({idx})
+                self._anchor = idx
+            self._show_context_menu(idx, event.globalPosition().toPoint())
+            return
+
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        self.setFocus()
+
+        if idx < 0:
+            if not (ctrl or shift):
+                self._set_selection(set())
+                self._anchor = -1
+            return
+
+        self._cursor = idx
+        if shift:
+            if self._anchor < 0:
+                self._anchor = idx
+            lo, hi = sorted((self._anchor, idx))
+            sel = set(range(lo, hi + 1))
+            if ctrl:
+                sel |= self._selected
+            self._set_selection(sel)
+        elif ctrl:
+            sel = set(self._selected)
+            sel.symmetric_difference_update({idx})
+            self._set_selection(sel)
+            self._anchor = idx
+        else:
+            # Plain click — preserve original behaviour: open the slideshow.
+            self._set_selection(set())
+            self._anchor = idx
+            self.clicked.emit(idx)
+
+    def keyPressEvent(self, event):
+        key = event.key()
+        mods = event.modifiers()
+        ctrl = bool(mods & Qt.KeyboardModifier.ControlModifier)
+        shift = bool(mods & Qt.KeyboardModifier.ShiftModifier)
+        n = len(self._items)
+
+        if ctrl and key == Qt.Key.Key_A:
+            self._set_selection(set(range(n)))
+            self._anchor = 0
+            self._cursor = max(self._cursor, 0)
+            return
+        if key == Qt.Key.Key_Escape:
+            self._set_selection(set())
+            self._anchor = -1
+            return
+        if key in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace) and self._selected:
+            self._delete_paths(sorted(self._selected))
+            return
+
+        if n == 0:
+            super().keyPressEvent(event)
+            return
+
+        # ── Arrow / Home / End navigation with selection ───────────────────────
+        cur = self._cursor if self._cursor >= 0 else (
+            min(self._selected) if self._selected else 0)
+        target = None
+        if key == Qt.Key.Key_Right:
+            target = min(n - 1, cur + 1)
+        elif key == Qt.Key.Key_Left:
+            target = max(0, cur - 1)
+        elif key == Qt.Key.Key_Down:
+            target = self._vertical_idx(cur, down=True)
+        elif key == Qt.Key.Key_Up:
+            target = self._vertical_idx(cur, down=False)
+        elif key == Qt.Key.Key_Home:
+            target = 0
+        elif key == Qt.Key.Key_End:
+            target = n - 1
+
+        if target is not None:
+            self._move_cursor(target, shift=shift, ctrl=ctrl)
+            return
+
+        if key == Qt.Key.Key_Space:
+            # Toggle the focused tile in/out of the selection.
+            if self._cursor < 0:
+                self._cursor = 0
+            sel = set(self._selected)
+            sel.symmetric_difference_update({self._cursor})
+            self._set_selection(sel)
+            self._anchor = self._cursor
+            return
+        if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            if self._cursor >= 0:
+                self.clicked.emit(self._cursor)
+            return
+
+        super().keyPressEvent(event)
+
+    def _vertical_idx(self, cur_idx: int, *, down: bool) -> int:
+        """Nearest tile one row up/down from `cur_idx`, matched by x-centre.
+        Rows share a y (uniform row height) so this lands in the adjacent row."""
+        rects = dict(self._tiles)
+        cur = rects.get(cur_idx)
+        if cur is None:
+            return cur_idx
+        cx, cy = cur.center().x(), cur.center().y()
+        best, best_key = cur_idx, None
+        for i, r in self._tiles:
+            rcy = r.center().y()
+            if down and rcy <= cy:
+                continue
+            if not down and rcy >= cy:
+                continue
+            key = (abs(rcy - cy), abs(r.center().x() - cx))
+            if best_key is None or key < best_key:
+                best_key, best = key, i
+        return best
+
+    def _move_cursor(self, target: int, *, shift: bool, ctrl: bool) -> None:
+        target = max(0, min(len(self._items) - 1, target))
+        if shift:
+            if self._anchor < 0:
+                self._anchor = self._cursor if self._cursor >= 0 else target
+            lo, hi = sorted((self._anchor, target))
+            self._set_selection(set(range(lo, hi + 1)))
+        elif ctrl:
+            pass  # move focus only; selection unchanged
+        else:
+            self._set_selection({target})
+            self._anchor = target
+        self._cursor = target
+        self.update()
+        for i, r in self._tiles:
+            if i == target:
+                self.scroll_to.emit(r.center().x(), r.center().y())
+                break
+
+    # ── Context menu ───────────────────────────────────────────────────────────
+
+    def _target_indices(self, idx: int) -> list[int]:
+        """Indices the menu acts on: the selection, or just `idx`."""
+        if self._selected:
+            return sorted(self._selected)
+        return [idx] if 0 <= idx < len(self._items) else []
 
     def _show_context_menu(self, idx: int, global_pos):
-        if idx < 0 or idx >= len(self._items):
+        targets = self._target_indices(idx)
+        if not targets:
             return
-        item = self._items[idx]
-        path = item.path
+        paths = [self._items[i].path for i in targets]
+        n = len(paths)
+        multi = n > 1
         menu = QMenu(self)
+        menu.setToolTipsVisible(True)
 
-        act_open = menu.addAction("Open in Slideshow")
-        act_open.triggered.connect(lambda: self.clicked.emit(idx))
+        if multi:
+            head = menu.addAction(f"{n} selected")
+            head.setEnabled(False)
+            menu.addSeparator()
+
+        from . import external
+
+        act_open = menu.addAction(menu_icon("slideshow"), "Open in Slideshow")
+        act_open.triggered.connect(lambda: self.clicked.emit(targets[0]))
         menu.addSeparator()
 
-        act_sys = menu.addAction("Open with System Default")
-        act_sys.triggered.connect(lambda: self._open_default(path))
+        act_ps = menu.addAction(menu_icon("photoshop"),
+                                "Open with Photoshop" + (f" ({n})" if multi else ""))
+        act_ps.triggered.connect(lambda: self._open_editor("photoshop", list(paths)))
 
-        act_copy = menu.addAction("Copy Path")
-        act_copy.triggered.connect(lambda: QApplication.clipboard().setText(path))
+        act_lr = menu.addAction(menu_icon("lightroom"),
+                                "Open with Lightroom" + (f" ({n})" if multi else ""))
+        act_lr.triggered.connect(lambda: self._open_editor("lightroom", list(paths)))
+
+        act_sys = menu.addAction(menu_icon("system"), "Open with System Default")
+        act_sys.triggered.connect(lambda: self._open_many(external.open_default, None, paths))
 
         menu.addSeparator()
-        act_reveal = menu.addAction("Reveal in Explorer")
-        act_reveal.triggered.connect(lambda: self._reveal(path))
+
+        recents = recent_target_folders()
+        suffix = f" ({n})" if multi else ""
+
+        move_menu = menu.addMenu(menu_icon("move"), "Move to" + suffix)
+        move_menu.setToolTipsVisible(True)
+        for folder in recents:
+            label = os.path.basename(folder.rstrip(os.sep)) or folder
+            act = move_menu.addAction(menu_icon("folder"), label)
+            act.setToolTip(folder)
+            act.triggered.connect(
+                lambda _=False, f=folder, pp=list(paths): self._move_to(pp, f, confirm=True))
+        if recents:
+            move_menu.addSeparator()
+        act_move_choose = move_menu.addAction(menu_icon("reveal"), "Choose Folder…")
+        act_move_choose.triggered.connect(lambda: self._choose_and_transfer(list(paths), move=True))
+
+        copy_menu = menu.addMenu(menu_icon("copy"), "Copy to" + suffix)
+        copy_menu.setToolTipsVisible(True)
+        for folder in recents:
+            label = os.path.basename(folder.rstrip(os.sep)) or folder
+            act = copy_menu.addAction(menu_icon("folder"), label)
+            act.setToolTip(folder)
+            act.triggered.connect(
+                lambda _=False, f=folder, pp=list(paths): self._copy_to(pp, f, confirm=True))
+        if recents:
+            copy_menu.addSeparator()
+        act_copy_choose = copy_menu.addAction(menu_icon("reveal"), "Choose Folder…")
+        act_copy_choose.triggered.connect(lambda: self._choose_and_transfer(list(paths), move=False))
+
+        menu.addSeparator()
+
+        act_copy = menu.addAction(menu_icon("copy_path"),
+                                  "Copy Path" + ("s" if multi else ""))
+        act_copy.triggered.connect(
+            lambda: QApplication.clipboard().setText("\n".join(paths)))
+
+        act_reveal = menu.addAction(menu_icon("reveal"), "Reveal in Explorer")
+        act_reveal.triggered.connect(lambda: self._reveal(paths[0]))
+
+        menu.addSeparator()
+
+        if multi:
+            act_all = menu.addAction(menu_icon("select_all"), "Select All")
+            act_all.triggered.connect(
+                lambda: self._set_selection(set(range(len(self._items)))))
+            act_none = menu.addAction(menu_icon("clear"), "Clear Selection")
+            act_none.triggered.connect(lambda: self._set_selection(set()))
+        else:
+            act_all = menu.addAction(menu_icon("select_all"), "Select All")
+            act_all.triggered.connect(
+                lambda: self._set_selection(set(range(len(self._items)))))
+
+        menu.addSeparator()
+        act_del = menu.addAction(menu_icon("delete"),
+                                 "Delete" + (f" {n} Items" if multi else "") + " (Recycle Bin)")
+        act_del.triggered.connect(lambda: self._delete_paths(targets))
 
         menu.exec(global_pos)
 
-    def _open_default(self, path: str):
+    # ── Actions ────────────────────────────────────────────────────────────────
+
+    def _open_editor(self, which, paths):
         from . import external
-        external.open_default(path)
+        app = external.resolve_or_prompt(which, self)
+        if not app:
+            return
+        self._open_many(external.open_with, app, paths)
+
+    def _open_many(self, fn, app, paths):
+        errs = []
+        for path in paths:
+            err = fn(app, path) if app is not None else fn(path)
+            if err:
+                errs.append(err)
+        if errs:
+            QMessageBox.warning(self, "Launch failed", "\n".join(errs[:8]))
+
+    def _choose_and_transfer(self, paths, *, move: bool):
+        start = recent_target_folders()
+        verb = "Move" if move else "Copy"
+        dest = QFileDialog.getExistingDirectory(
+            self, f"{verb} {len(paths)} item(s) to folder",
+            start[0] if start else (self._source or ""))
+        if not dest:
+            return
+        self._do_transfer(paths, dest, move=move)
+
+    def _move_to(self, paths, folder, *, confirm: bool):
+        if confirm:
+            name = os.path.basename(folder.rstrip(os.sep)) or folder
+            ok = QMessageBox.question(
+                self, "Move files",
+                f"Move {len(paths)} item(s) to “{name}”?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes)
+            if ok != QMessageBox.StandardButton.Yes:
+                return
+        self._do_transfer(paths, folder, move=True)
+
+    def _copy_to(self, paths, folder, *, confirm: bool):
+        if confirm:
+            name = os.path.basename(folder.rstrip(os.sep)) or folder
+            ok = QMessageBox.question(
+                self, "Copy files",
+                f"Copy {len(paths)} item(s) to “{name}”?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes)
+            if ok != QMessageBox.StandardButton.Yes:
+                return
+        self._do_transfer(paths, folder, move=False)
+
+    def _do_transfer(self, paths, dest, *, move: bool):
+        resolver = make_conflict_resolver(self)
+        with log.timed("album.transfer", op="move" if move else "copy",
+                       n=len(paths), dest=dest):
+            ok_sources, errors, _cancelled = transfer_files(
+                paths, dest, move=move, conflict_cb=resolver)
+        log.info("album.transfer done", op="move" if move else "copy",
+                 ok=len(ok_sources), failed=len(errors))
+        push_recent_target(dest)
+        invalidate_scan_cache(dest)
+        if errors:
+            QMessageBox.warning(
+                self, "Some files failed",
+                f"{len(ok_sources)} ok, {len(errors)} failed:\n" + "\n".join(errors[:8]))
+        # A move empties the source — drop those tiles incrementally (no rescan).
+        if move and ok_sources:
+            self._remove_paths(ok_sources)
+
+    def _delete_paths(self, indices):
+        paths = [self._items[i].path for i in indices if 0 <= i < len(self._items)]
+        if not paths:
+            return
+        n = len(paths)
+        ok = QMessageBox.question(
+            self, "Delete files",
+            f"Send {n} item{'s' if n != 1 else ''} to the Recycle Bin?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if ok != QMessageBox.StandardButton.Yes:
+            return
+        from . import _recycle
+        failed = []
+        deleted = []
+        with log.timed("album.delete", n=len(paths)):
+            for path in paths:
+                try:
+                    if _recycle.send_to_recycle_bin(path):
+                        deleted.append(path)
+                    else:
+                        failed.append(os.path.basename(path))
+                except Exception as e:
+                    failed.append(f"{os.path.basename(path)}: {e}")
+        if failed:
+            QMessageBox.warning(self, "Some files failed",
+                                "\n".join(failed[:8]))
+        if deleted:
+            self._remove_paths(deleted)
 
     def _reveal(self, path: str):
         import subprocess
@@ -729,8 +1266,12 @@ class AlbumBrowserView(QWidget):
             self._scan_cache.move_to_end(path)
             self._was_cached = True
             self._scan_strip.hide()
-            self._render_grid()
+            with log.timed("album.render", path=path, cached=True,
+                           folders=len(self._folders), images=len(self._items)):
+                self._render_grid()
             self._update_count()
+            log.info("album.open", path=path, cached=True,
+                     folders=len(self._folders), images=len(self._items))
             return
 
         # Show full loading screen for heavy folders.
@@ -753,7 +1294,8 @@ class AlbumBrowserView(QWidget):
                 )
                 QApplication.processEvents()
 
-        self._folders, self._items = scan_path(path, progress_cb=_cb)
+        with log.timed("album.scan", path=path):
+            self._folders, self._items = scan_path(path, progress_cb=_cb)
         # Store in cache (LRU eviction on overflow).
         self._scan_cache[path] = (self._folders, self._items)
         self._scan_cache.move_to_end(path)
@@ -762,13 +1304,31 @@ class AlbumBrowserView(QWidget):
         self._was_cached = False
         loading.close_smoothly()
         self._scan_strip.hide()
-        self._render_grid()
+        with log.timed("album.render", path=path, cached=False,
+                       folders=len(self._folders), images=len(self._items)):
+            self._render_grid()
         self._update_count()
+        log.info("album.open", path=path, cached=False,
+                 folders=len(self._folders), images=len(self._items))
 
     def _force_rescan(self):
         # Drop just the current folder from cache and rescan it.
         self._scan_cache.pop(self.current_path, None)
         self._scan_and_render(force=True)
+
+    def _on_items_removed(self, paths):
+        """Files left the current folder (move/delete). Update the model and
+        cache in place — the mosaic already dropped its tiles, so we must NOT
+        rebuild the grid (that would re-create the mosaic from scratch and
+        re-decode every surviving thumbnail)."""
+        pathset = {os.path.normcase(os.path.abspath(p)) for p in paths}
+        self._items = [it for it in self._items
+                       if os.path.normcase(os.path.abspath(it.path)) not in pathset]
+        # Keep the in-memory scan cache consistent for back-navigation.
+        self._scan_cache[self.current_path] = (self._folders, self._items)
+        self._scan_cache.move_to_end(self.current_path)
+        self._was_cached = True
+        self._update_count()
 
     def _update_breadcrumb(self):
         # Source / sub1 / sub2 / current  — segments are clickable links.
@@ -895,6 +1455,8 @@ class AlbumBrowserView(QWidget):
             row += 1
             self._mosaic = _ImageMosaic(self._items, self._source, parent=self._grid_host)
             self._mosaic.clicked.connect(self._on_image_clicked)
+            self._mosaic.removed.connect(self._on_items_removed)
+            self._mosaic.scroll_to.connect(self._scroll_mosaic_to)
             self._grid.addWidget(self._mosaic, row, 0, 1, max(cols, 1))
             # Push the row's column stretch so the mosaic spans full width.
             for c in range(max(cols, 1)):
@@ -905,6 +1467,17 @@ class AlbumBrowserView(QWidget):
             QTimer.singleShot(80, self._kick_mosaic_width)
 
         self._load_covers()
+
+    def _scroll_mosaic_to(self, x: int, y: int):
+        """Keep the keyboard-focused mosaic tile within the viewport. The tile
+        point arrives in mosaic-local coords; map it into the scroll widget
+        (the mosaic sits below the folder grid + section header) first."""
+        from PyQt6.QtCore import QPoint
+        try:
+            pt = self._mosaic.mapTo(self._grid_host, QPoint(int(x), int(y)))
+            self._scroll.ensureVisible(pt.x(), pt.y(), 0, 120)
+        except (RuntimeError, AttributeError):
+            pass
 
     def _kick_mosaic_width(self):
         if getattr(self, "_mosaic", None) is None:

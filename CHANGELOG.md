@@ -1,5 +1,39 @@
 # Changelog
 
+## v4.7.0 (2026-06-09)
+
+### Album / Mosaic View — Multi-Selection
+- Marquee of selection methods: Ctrl+click toggles, Shift+click ranges, plain click still opens slideshow
+- Full keyboard navigation with a focus cursor (white dashed ring):
+  - Arrow keys move the cursor (Up/Down jump rows by x-position), Home/End to ends
+  - Shift+arrow extends the selection from the anchor, Ctrl+arrow moves focus only
+  - Space toggles the focused tile, Enter opens it, Ctrl+A / Esc select-all / clear
+  - Focused tile auto-scrolls into view
+- Selected tiles show a tint, accent border and check badge
+
+### Right-Click Menus (everywhere, with icons)
+- Mosaic tiles and the slideshow image view now share a full, icon-tagged menu
+- Move to / Copy to submenus listing the last 3 destinations + "Choose Folder…"
+- Open with Photoshop / Lightroom / System Default, Copy Path, Reveal in Explorer
+- Slideshow menu adds Rotate, Zoom 1:1, Crop, Histogram, Focus Peaking, Compare, Info, Fullscreen, Send-to destinations
+- 12 hand-drawn vector glyph icons (cached) for menu actions
+
+### File Operations
+- Move/copy through the existing side-by-side ConflictDialog (honours the `conflict_default` setting: ask / rename / replace / skip; cancel aborts the batch)
+- Read-only / WinError 5 handling: clears the read-only attribute and retries, with a clear "file is read-only or open in another program" message on real failures
+- Incremental view updates — moving/deleting N of M files drops only those tiles and remaps cached thumbnails in place (no full folder rescan, no re-decode)
+- Last-3 destination folders remembered across sessions (`recent_target_folders`)
+
+### Editors
+- First use of Open with Photoshop/Lightroom prompts for the executable if auto-detection fails, then remembers it
+
+### Performance
+- Settings cached in memory (was re-reading + re-parsing settings.json on every `get()`)
+- Stale thumbnail/header worker callbacks are now ignored after tiles are removed/remapped
+
+### Logging
+- Timing logged for folder open/scan/render, image decode, and move/copy/delete operations (always written to picker.log)
+
 ## v4.6.0 (2026-06-01)
 
 ### Instant Open

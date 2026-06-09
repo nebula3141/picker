@@ -249,6 +249,36 @@ def lightroom_path() -> str | None:
     ])
 
 
+def manual_set(which: str, exe_path: str) -> None:
+    """Persist a user-chosen editor path and drop the resolve cache."""
+    key = "photoshop_path" if which == "photoshop" else "lightroom_path"
+    settings_mod.set_value(key, exe_path)
+    invalidate_cache()
+
+
+def resolve_or_prompt(which: str, parent=None) -> str | None:
+    """Return the editor exe, auto-detecting first. If detection fails, ask the
+    user to locate it once (file picker) and remember the choice. `which` is
+    'photoshop' or 'lightroom'. Returns None if unresolved / user cancelled."""
+    path = photoshop_path() if which == "photoshop" else lightroom_path()
+    if path:
+        return path
+    # GUI import is lazy so this module stays usable headless.
+    from PyQt6.QtWidgets import QFileDialog
+    name = "Photoshop" if which == "photoshop" else "Lightroom"
+    default_exe = f"{name}.exe"
+    if sys.platform == "win32":
+        filt = f"{name} ({default_exe});;Programs (*.exe);;All files (*)"
+    else:
+        filt = "All files (*)"
+    exe, _ = QFileDialog.getOpenFileName(
+        parent, f"Locate {name} — automatic detection failed", "", filt)
+    if not exe or not os.path.isfile(exe):
+        return None
+    manual_set(which, exe)
+    return exe
+
+
 def open_with(app_path: str, image_path: str) -> str | None:
     try:
         subprocess.Popen([app_path, image_path], close_fds=True)

@@ -19,6 +19,7 @@ def enable_portable(base: Path | None = None):
             base = Path(__file__).resolve().parent.parent / "data"
     base.mkdir(parents=True, exist_ok=True)
     _portable_dir = base
+    invalidate()  # config dir changed — drop any cache built from %APPDATA%
 
 
 def is_portable() -> bool:
@@ -74,6 +75,7 @@ DEFAULTS = {
     "auto_scan_on_launch": False,        # rescan only when user clicks Rescan; folders cached in-memory after first visit
     "scan_recursive": True,              # walk subfolders under each root
     "last_folder": "",                   # remember last viewed folder in gallery
+    "recent_target_folders": [],         # last ≤3 move/copy destinations (album view right-click)
     "group_by": "flat",                  # "flat"|"date"|"folder"|"camera"
     "date_group_granularity": "day",     # "year"|"month"|"day"
     "sort_order": "date_taken",          # filename|date_taken|mtime|size|rating|random
@@ -206,14 +208,37 @@ def _settings_file() -> Path:
     return _config_dir() / "settings.json"
 
 
+# In-memory cache of the merged settings. `get()`/`load()` were re-reading and
+# re-parsing settings.json from disk on every single call; modules poll settings
+# constantly, so this turned into thousands of redundant syscalls + JSON parses.
+# We hold the merged dict in memory and only touch disk on first load / save().
+# Single-process app, so an external edit to the file won't be picked up until
+# restart — acceptable, and `invalidate()` is available if ever needed.
+_mem: dict | None = None
+_mem_path: str | None = None   # file path the cache was built from (dir can change in tests/portable)
+
+
+def invalidate() -> None:
+    """Drop the in-memory cache so the next load() re-reads from disk."""
+    global _mem, _mem_path
+    _mem = None
+    _mem_path = None
+
+
 def load() -> dict:
+    global _mem, _mem_path
+    cur_path = str(_settings_file())
+    if _mem is not None and _mem_path == cur_path:
+        return dict(_mem)
     data = dict(DEFAULTS)
     try:
         p = _settings_file()
         if p.exists():
             text = p.read_text(encoding="utf-8")
             if not text.strip():
-                return data
+                _mem = dict(data)
+                _mem_path = cur_path
+                return dict(data)
             raw = json.loads(text)
             if isinstance(raw, dict):
                 version = raw.get("settings_version", 0)
@@ -229,17 +254,22 @@ def load() -> dict:
             pass
     except Exception:
         pass
-    return data
+    _mem = dict(data)
+    _mem_path = cur_path
+    return dict(data)
 
 
 def save(data: dict) -> None:
     """Atomic write: dump to .tmp, fsync, rename. A crash mid-write leaves
     the previous good file intact instead of an empty/partial JSON that
     `load()` would silently fall back to defaults for (= losing all user prefs)."""
+    global _mem, _mem_path
     try:
         merged = dict(DEFAULTS)
         merged.update({k: v for k, v in data.items() if k in DEFAULTS})
         target = _settings_file()
+        _mem = dict(merged)            # keep cache in sync with what we persist
+        _mem_path = str(target)
         tmp = target.with_suffix(target.suffix + ".tmp")
         payload = json.dumps(merged, indent=2)
         with open(tmp, "w", encoding="utf-8") as f:

@@ -1,5 +1,6 @@
 import math
 import os
+import time
 from collections import OrderedDict
 from pathlib import Path
 
@@ -33,6 +34,8 @@ from . import conflict_dialog
 from . import theme as theme_mod
 from . import edits as edits_mod
 from . import save_dialog as save_dialog_mod
+from . import log
+from .icon import menu_icon
 
 # Cache settings-derived values on slideshow init; refreshed only when reloading image.
 # Avoids re-parsing settings.json on every nav.
@@ -1520,6 +1523,7 @@ class SlideshowView(QWidget):
         self._pixmap_cache: "OrderedDict[int, QPixmap]" = OrderedDict()
         self._pixmap_cache_bytes = 0
         self._inflight: set[int] = set()
+        self._load_t0: dict[int, float] = {}   # idx → perf_counter at dispatch
         self._info_panel_visible = False
         self._compare_view = None
         self._filmstrip_deferred = filmstrip_hidden
@@ -1935,6 +1939,7 @@ class SlideshowView(QWidget):
         if is_video(self._manager.images[idx].path):
             return
         self._inflight.add(idx)
+        self._load_t0[idx] = time.perf_counter()
         task = ImageLoadTask(self._manager, idx, self._loader_signals)
         self._pool.start(task)
 
@@ -1954,6 +1959,13 @@ class SlideshowView(QWidget):
     @pyqtSlot(int, QImage)
     def _on_image_ready(self, idx: int, img: QImage):
         self._inflight.discard(idx)
+        t0 = self._load_t0.pop(idx, None)
+        if t0 is not None:
+            ms = (time.perf_counter() - t0) * 1000
+            rec = self._manager.images[idx] if idx < len(self._manager.images) else None
+            log.info("image.decode", file=os.path.basename(rec.path) if rec else "?",
+                     idx=idx, current=(idx == self._idx),
+                     px=f"{img.width()}x{img.height()}", ms=f"{ms:.1f}")
         pixmap = QPixmap.fromImage(img)
         self._pixmap_cache[idx] = pixmap
         self._pixmap_cache.move_to_end(idx)
@@ -2398,17 +2410,10 @@ class SlideshowView(QWidget):
 
     def _open_with_menu(self):
         menu = QMenu(self)
-        ps = external.photoshop_path()
-        if ps:
-            act = menu.addAction("Open with Photoshop")
-            act.triggered.connect(lambda: self._open_external("photoshop"))
-        lr = external.lightroom_path()
-        if lr:
-            act = menu.addAction("Open with Lightroom")
-            act.triggered.connect(lambda: self._open_external("lightroom"))
-        if not menu.actions():
-            self._toast.show_message("No external editors detected")
-            return
+        act = menu.addAction(menu_icon("photoshop"), "Open with Photoshop")
+        act.triggered.connect(lambda: self._open_external("photoshop"))
+        act = menu.addAction(menu_icon("lightroom"), "Open with Lightroom")
+        act.triggered.connect(lambda: self._open_external("lightroom"))
         menu.exec(self.mapToGlobal(self.rect().center()))
 
     def _open_external(self, which: str):
@@ -2416,16 +2421,14 @@ class SlideshowView(QWidget):
             return
         path = self._manager.images[self._idx].path
         if which == "photoshop":
-            app = external.photoshop_path()
+            app = external.resolve_or_prompt("photoshop", self)
             if not app:
-                self._toast.show_message("Photoshop not found")
                 return
             err = external.open_with(app, path)
             name = "Photoshop"
         elif which == "lightroom":
-            app = external.lightroom_path()
+            app = external.resolve_or_prompt("lightroom", self)
             if not app:
-                self._toast.show_message("Lightroom not found")
                 return
             err = external.open_with(app, path)
             name = "Lightroom"
@@ -2447,6 +2450,161 @@ class SlideshowView(QWidget):
             self._toast.show_message("Opened in Explorer", ms=1200)
         except Exception as exc:
             self._toast.show_message(f"Error: {exc}", ms=3000)
+
+    # ── Right-click menu (all actions) ───────────────────────────────────────
+
+    def contextMenuEvent(self, event):
+        if self._idx < 0 or self._idx >= len(self._manager.images):
+            return
+        rec = self._manager.images[self._idx]
+        path = rec.path
+        from .media import is_video
+        from . import album_browser_view as abv
+        video = is_video(path)
+
+        menu = QMenu(self)
+        menu.setToolTipsVisible(True)
+
+        head = menu.addAction(os.path.basename(path))
+        head.setEnabled(False)
+        menu.addSeparator()
+
+        act_ps = menu.addAction(menu_icon("photoshop"), "Open with Photoshop")
+        act_ps.triggered.connect(lambda: self._open_external("photoshop"))
+        act_lr = menu.addAction(menu_icon("lightroom"), "Open with Lightroom")
+        act_lr.triggered.connect(lambda: self._open_external("lightroom"))
+        act_sys = menu.addAction(menu_icon("system"), "Open with System Default")
+        act_sys.triggered.connect(lambda: self._open_external("default"))
+
+        menu.addSeparator()
+
+        if not video:
+            act_rot = menu.addAction(menu_icon("system"), "Rotate 90° CW")
+            act_rot.triggered.connect(self._rotate_current)
+            act_zoom = menu.addAction(menu_icon("select_all"), "Zoom 1:1")
+            act_zoom.triggered.connect(lambda: (self._canvas.zoom_actual(),
+                                                self._toast.show_message("1:1", ms=800)))
+            act_crop = menu.addAction(menu_icon("move"), "Crop")
+            act_crop.triggered.connect(lambda: (self._canvas.enter_crop_mode(),
+                                                self._toast.show_message("Crop mode — drag to select", ms=1200)))
+            act_hist = menu.addAction(menu_icon("system"), "Toggle Histogram")
+            act_hist.triggered.connect(self._canvas.toggle_histogram)
+            act_peak = menu.addAction(menu_icon("system"), "Toggle Focus Peaking")
+            act_peak.triggered.connect(lambda: (self._canvas.toggle_peaking(),
+                                                self._toast.show_message("Focus peaking toggled", ms=800)))
+            menu.addSeparator()
+
+        act_cmp = menu.addAction(menu_icon("copy"), "Compare")
+        act_cmp.triggered.connect(
+            lambda: self._exit_compare() if self._compare_view is not None else self._enter_compare())
+        act_info = menu.addAction(menu_icon("copy_path"), "Info Panel")
+        act_info.triggered.connect(self._toggle_info_panel)
+        act_fs = menu.addAction(menu_icon("select_all"), "Toggle Fullscreen")
+        act_fs.triggered.connect(self.fullscreen_requested.emit)
+
+        menu.addSeparator()
+
+        # Send to a configured destination (cull workflow).
+        if self._manager.has_destinations:
+            send_menu = menu.addMenu(menu_icon("move"), "Send to")
+            for i, d in enumerate(self._manager.destinations):
+                a = send_menu.addAction(menu_icon("folder"), d.get("name", f"Dest {i+1}"))
+                a.triggered.connect(lambda _=False, di=i: self._send_to(di))
+
+        recents = abv.recent_target_folders()
+
+        move_menu = menu.addMenu(menu_icon("move"), "Move to")
+        move_menu.setToolTipsVisible(True)
+        for folder in recents:
+            label = os.path.basename(folder.rstrip(os.sep)) or folder
+            a = move_menu.addAction(menu_icon("folder"), label)
+            a.setToolTip(folder)
+            a.triggered.connect(lambda _=False, f=folder: self._move_or_copy_current(f, move=True, confirm=True))
+        if recents:
+            move_menu.addSeparator()
+        a = move_menu.addAction(menu_icon("reveal"), "Choose Folder…")
+        a.triggered.connect(lambda: self._choose_transfer_current(move=True))
+
+        copy_menu = menu.addMenu(menu_icon("copy"), "Copy to")
+        copy_menu.setToolTipsVisible(True)
+        for folder in recents:
+            label = os.path.basename(folder.rstrip(os.sep)) or folder
+            a = copy_menu.addAction(menu_icon("folder"), label)
+            a.setToolTip(folder)
+            a.triggered.connect(lambda _=False, f=folder: self._move_or_copy_current(f, move=False, confirm=True))
+        if recents:
+            copy_menu.addSeparator()
+        a = copy_menu.addAction(menu_icon("reveal"), "Choose Folder…")
+        a.triggered.connect(lambda: self._choose_transfer_current(move=False))
+
+        menu.addSeparator()
+
+        act_copy = menu.addAction(menu_icon("copy_path"), "Copy Path")
+        act_copy.triggered.connect(lambda: QApplication.clipboard().setText(path))
+        act_reveal = menu.addAction(menu_icon("reveal"), "Reveal in Explorer")
+        act_reveal.triggered.connect(self._reveal_in_explorer)
+
+        menu.addSeparator()
+        act_del = menu.addAction(menu_icon("delete"), "Delete (Recycle Bin)")
+        act_del.triggered.connect(self._delete_current)
+
+        menu.exec(event.globalPos())
+
+    def _rotate_current(self):
+        new_rot = self._canvas.rotate_cw()
+        rec = self._manager.images[self._idx]
+        self._manager.rotations[rec.filename] = new_rot
+        self._filmstrip.refresh()
+
+    def _choose_transfer_current(self, *, move: bool):
+        from PyQt6.QtWidgets import QFileDialog
+        from . import album_browser_view as abv
+        start = abv.recent_target_folders()
+        verb = "Move" if move else "Copy"
+        dest = QFileDialog.getExistingDirectory(
+            self, f"{verb} image to folder",
+            start[0] if start else (self._manager.source_folder or ""))
+        if dest:
+            self._move_or_copy_current(dest, move=move, confirm=False)
+
+    def _move_or_copy_current(self, dest: str, *, move: bool, confirm: bool):
+        if self._idx < 0 or self._idx >= len(self._manager.images):
+            return
+        from . import album_browser_view as abv
+        rec = self._manager.images[self._idx]
+        name = os.path.basename(dest.rstrip(os.sep)) or dest
+        if confirm:
+            verb = "Move" if move else "Copy"
+            reply = QMessageBox.question(
+                self, f"{verb} File", f"{verb} to “{name}”?\n\n{os.path.basename(rec.path)}",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes)
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+        resolver = abv.make_conflict_resolver(self)
+        with log.timed("image.transfer", op="move" if move else "copy", dest=dest):
+            ok_sources, errors, cancelled = abv.transfer_files(
+                [rec.path], dest, move=move, conflict_cb=resolver)
+        abv.push_recent_target(dest)
+        abv.invalidate_scan_cache(dest)
+        if errors:
+            self._toast.show_message(f"Failed: {errors[0]}", ms=3000)
+            return
+        if cancelled:
+            return
+        if move and ok_sources:
+            self._toast.show_message(f"Moved → {name}", ms=1500)
+            self._manager.images.pop(self._idx)
+            if not self._manager.images:
+                self.closed.emit(0)
+                return
+            if self._idx >= len(self._manager.images):
+                self._idx = len(self._manager.images) - 1
+            self._load_image(self._idx)
+            self._filmstrip.refresh()
+            self.status_changed.emit()
+        else:
+            self._toast.show_message(f"Copied → {name}", ms=1500)
 
     # ── Delete to Recycle Bin ────────────────────────────────────────────────
 
