@@ -3,8 +3,8 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>PICker — Fast photo viewer for photographers</title>
-<meta name="description" content="Lightning-fast photo and video viewer for photographers. Opens 60MP RAW files instantly on any PC. Keyboard-driven culling for wedding, event, and studio shoots.">
+<title>PICker — A fast photo viewer for photographers</title>
+<meta name="description" content="A fast, minimalist photo and video viewer for photographers. Opens 60MP RAW files instantly on any PC. No catalog, no cloud, no waiting.">
 <link rel="icon" href="favicon.ico" sizes="48x48">
 <link rel="icon" type="image/png" sizes="48x48" href="favicon-32x32.png">
 <link rel="icon" type="image/png" sizes="32x32" href="favicon-32x32.png">
@@ -16,194 +16,94 @@
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{
   --bg:#09090b;
-  --surface:#111113;
-  --surface-2:#1a1a1e;
-  --border:#222228;
-  --fg:#e4e4e7;
-  --muted:#71717a;
+  --surface:#101012;
+  --surface-2:#161619;
+  --border:#1f1f24;
+  --fg:#e7e7ea;
+  --muted:#8a8a93;
   --accent:#2a82da;
-  --accent-glow:rgba(42,130,218,0.15);
-  --radius:12px;
+  --radius:14px;
 }
 html{scroll-behavior:smooth;font-size:16px}
 body{
   font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif;
   background:var(--bg);color:var(--fg);
-  line-height:1.6;
-  -webkit-font-smoothing:antialiased;
-  overflow-x:hidden;
+  line-height:1.65;-webkit-font-smoothing:antialiased;overflow-x:hidden;
 }
-a{color:var(--accent);text-decoration:none;transition:opacity .2s}
-a:hover{opacity:.8}
+a{color:inherit;text-decoration:none}
 
-/* Glow orb background */
+/* one faint glow, nothing more */
 .glow{
-  position:fixed;top:-200px;left:50%;transform:translateX(-50%);
-  width:800px;height:800px;
-  background:radial-gradient(circle,rgba(42,130,218,0.08) 0%,transparent 70%);
-  pointer-events:none;z-index:0;
+  position:fixed;top:-280px;left:50%;transform:translateX(-50%);
+  width:760px;height:760px;pointer-events:none;z-index:0;
+  background:radial-gradient(circle,rgba(42,130,218,.10) 0%,transparent 65%);
 }
 
-/* Nav */
-nav{
-  position:fixed;top:0;left:0;right:0;z-index:100;
-  backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);
-  background:rgba(9,9,11,0.8);
-  border-bottom:1px solid var(--border);
-}
-.nav-inner{
-  max-width:1100px;margin:0 auto;
-  padding:0 24px;height:56px;
-  display:flex;align-items:center;justify-content:space-between;
-}
-.nav-logo{font-weight:700;font-size:1.1rem;letter-spacing:-.02em;display:flex;align-items:center;gap:10px}
-.nav-logo img{width:28px;height:28px;border-radius:6px}
-.nav-links{display:flex;gap:28px;font-size:.875rem;color:var(--muted)}
+/* nav */
+nav{position:fixed;inset:0 0 auto 0;z-index:100;
+  background:rgba(9,9,11,.72);backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);
+  border-bottom:1px solid var(--border)}
+.nav-inner{max-width:1000px;margin:0 auto;padding:0 24px;height:58px;
+  display:flex;align-items:center;justify-content:space-between}
+.nav-logo{display:flex;align-items:center;gap:10px;font-weight:700;letter-spacing:-.02em}
+.nav-logo img{width:26px;height:26px;border-radius:6px}
+.nav-links{display:flex;gap:26px;font-size:.9rem}
 .nav-links a{color:var(--muted);transition:color .2s}
 .nav-links a:hover{color:var(--fg)}
-.nav-dl{
-  font-size:.8125rem;padding:8px 18px;
-  background:var(--accent);color:#fff;
-  border-radius:8px;font-weight:600;
-  transition:transform .15s,box-shadow .15s;
-}
-.nav-dl:hover{transform:translateY(-1px);box-shadow:0 4px 20px rgba(42,130,218,0.3);opacity:1}
+.nav-dl{font-size:.85rem;padding:8px 16px;background:var(--accent);color:#fff;
+  border-radius:9px;font-weight:600;transition:opacity .2s}
+.nav-dl:hover{opacity:.88}
 
-/* Hero */
-.hero{
-  max-width:1100px;margin:0 auto;
-  padding:160px 24px 100px;
-  text-align:center;position:relative;z-index:1;
-}
-.hero h1{
-  font-size:clamp(2.5rem,6vw,4.5rem);
-  font-weight:800;letter-spacing:-.04em;
-  line-height:1.1;
-  background:linear-gradient(135deg,#fff 0%,#a0a0a8 100%);
-  -webkit-background-clip:text;-webkit-text-fill-color:transparent;
-  background-clip:text;
-}
-.hero .tagline{
-  font-size:clamp(1rem,2.5vw,1.35rem);
-  color:var(--muted);margin:20px auto 0;
-  max-width:560px;font-weight:400;
-}
-.hero-buttons{display:flex;gap:14px;justify-content:center;margin-top:40px;flex-wrap:wrap}
-.btn-primary{
-  padding:14px 32px;background:var(--accent);color:#fff;
-  border-radius:10px;font-weight:600;font-size:.95rem;
-  transition:transform .15s,box-shadow .15s;
-  display:inline-flex;align-items:center;gap:8px;
-}
-.btn-primary:hover{transform:translateY(-2px);box-shadow:0 8px 30px rgba(42,130,218,0.35);opacity:1}
-.btn-secondary{
-  padding:14px 32px;background:var(--surface-2);color:var(--fg);
-  border:1px solid var(--border);border-radius:10px;
-  font-weight:600;font-size:.95rem;
-  transition:transform .15s,border-color .15s;
-  display:inline-flex;align-items:center;gap:8px;
-}
-.btn-secondary:hover{transform:translateY(-2px);border-color:var(--muted);opacity:1}
-.hero-meta{margin-top:28px;font-size:.8125rem;color:var(--muted)}
+/* layout */
+section{max-width:1000px;margin:0 auto;padding:0 24px;position:relative;z-index:1}
+.eyebrow{font-size:.75rem;text-transform:uppercase;letter-spacing:.14em;color:var(--accent);font-weight:600}
 
-/* Hero logo */
-.hero-logo{
-  width:96px;height:96px;border-radius:24px;
-  margin:0 auto 32px;
-  filter:drop-shadow(0 8px 40px rgba(42,130,218,0.3));
-  animation:fadeUp .6s ease-out both;
-}
+/* hero */
+.hero{text-align:center;padding:168px 24px 96px}
+.hero img.logo{width:88px;height:88px;border-radius:22px;margin:0 auto 30px;
+  filter:drop-shadow(0 10px 36px rgba(42,130,218,.28))}
+.hero h1{font-size:clamp(2.4rem,6vw,4rem);font-weight:800;letter-spacing:-.04em;line-height:1.08}
+.hero p{color:var(--muted);font-size:clamp(1rem,2.2vw,1.2rem);max-width:540px;margin:22px auto 0}
+.buttons{display:flex;gap:13px;justify-content:center;flex-wrap:wrap;margin-top:38px}
+.btn{display:inline-flex;align-items:center;gap:9px;padding:13px 26px;border-radius:11px;
+  font-weight:600;font-size:.95rem;transition:transform .15s,opacity .2s,border-color .2s}
+.btn-primary{background:var(--accent);color:#fff}
+.btn-primary:hover{transform:translateY(-2px)}
+.btn-ghost{background:transparent;color:var(--fg);border:1px solid var(--border)}
+.btn-ghost:hover{border-color:var(--muted)}
+.meta{margin-top:26px;font-size:.82rem;color:var(--muted)}
+.btn svg{width:18px;height:18px}
 
-/* Aperture SVG icon */
-.aperture-icon{width:20px;height:20px;stroke:currentColor;stroke-width:2;fill:none}
+/* features */
+.features-head{text-align:center;margin-bottom:52px}
+.features-head h2{font-size:clamp(1.6rem,3vw,2.2rem);font-weight:700;letter-spacing:-.03em;margin-top:10px}
+.features-head p{color:var(--muted);max-width:520px;margin:14px auto 0}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:18px}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);
+  padding:26px;transition:border-color .25s,transform .25s}
+.card:hover{border-color:rgba(42,130,218,.45);transform:translateY(-2px)}
+.card .ico{width:40px;height:40px;border-radius:11px;background:rgba(42,130,218,.12);
+  display:flex;align-items:center;justify-content:center;color:var(--accent);margin-bottom:16px}
+.card .ico svg{width:20px;height:20px}
+.card h3{font-size:1.02rem;font-weight:650;margin-bottom:7px}
+.card p{font-size:.9rem;color:var(--muted)}
 
-/* Section shared */
-section{max-width:1100px;margin:0 auto;padding:80px 24px;position:relative;z-index:1}
-.section-label{
-  font-size:.75rem;text-transform:uppercase;letter-spacing:.1em;
-  color:var(--accent);font-weight:600;margin-bottom:8px;
-}
-.section-title{
-  font-size:clamp(1.5rem,3vw,2.25rem);font-weight:700;
-  letter-spacing:-.03em;margin-bottom:16px;
-}
-.section-desc{color:var(--muted);max-width:560px;font-size:1rem;margin-bottom:48px}
+/* download / cta */
+.cta{text-align:center;padding:104px 24px}
+.cta h2{font-size:clamp(1.6rem,3vw,2.4rem);font-weight:700;letter-spacing:-.03em}
+.cta p{color:var(--muted);margin:14px auto 34px;max-width:480px}
 
-/* Feature grid */
-.features{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:20px}
-.feature-card{
-  background:var(--surface);border:1px solid var(--border);
-  border-radius:var(--radius);padding:28px;
-  transition:border-color .25s,transform .25s;
-}
-.feature-card:hover{border-color:rgba(42,130,218,0.4);transform:translateY(-2px)}
-.feature-icon{
-  width:40px;height:40px;border-radius:10px;
-  background:var(--accent-glow);
-  display:flex;align-items:center;justify-content:center;
-  margin-bottom:16px;color:var(--accent);font-size:1.2rem;
-}
-.feature-card h3{font-size:1rem;font-weight:600;margin-bottom:6px}
-.feature-card p{font-size:.875rem;color:var(--muted);line-height:1.5}
+/* footer */
+footer{border-top:1px solid var(--border);padding:30px 24px;text-align:center;
+  font-size:.82rem;color:var(--muted);position:relative;z-index:1}
+footer a{color:var(--muted);transition:color .2s}
+footer a:hover{color:var(--fg)}
 
-/* Keyboard shortcuts showcase */
-.keys-section{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:40px;margin-top:60px}
-.keys-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:24px;margin-top:24px}
-.key-group h4{font-size:.8125rem;text-transform:uppercase;letter-spacing:.08em;color:var(--accent);margin-bottom:12px}
-.key-row{display:flex;align-items:center;gap:10px;margin-bottom:8px;font-size:.875rem}
-kbd{
-  display:inline-block;padding:3px 8px;
-  background:var(--surface-2);border:1px solid var(--border);
-  border-radius:5px;font-family:inherit;font-size:.8rem;
-  color:var(--fg);min-width:28px;text-align:center;
-  box-shadow:0 1px 2px rgba(0,0,0,.3);
-}
-.key-label{color:var(--muted)}
+@media(max-width:620px){.nav-links{display:none}.hero{padding:128px 20px 64px}.grid{grid-template-columns:1fr}}
 
-/* Stats */
-.stats{display:flex;gap:40px;justify-content:center;flex-wrap:wrap;padding:60px 24px;position:relative;z-index:1}
-.stat{text-align:center}
-.stat-value{font-size:2rem;font-weight:800;letter-spacing:-.03em}
-.stat-label{font-size:.8125rem;color:var(--muted);margin-top:4px}
-
-/* Tech stack */
-.tech-row{display:flex;gap:12px;flex-wrap:wrap;justify-content:center}
-.tech-pill{
-  padding:8px 16px;background:var(--surface);
-  border:1px solid var(--border);border-radius:8px;
-  font-size:.8125rem;color:var(--muted);font-weight:500;
-  transition:border-color .2s;
-}
-.tech-pill:hover{border-color:var(--accent)}
-
-/* CTA */
-.cta{text-align:center;padding:100px 24px;position:relative;z-index:1}
-.cta h2{font-size:clamp(1.5rem,3vw,2.5rem);font-weight:700;letter-spacing:-.03em;margin-bottom:12px}
-.cta p{color:var(--muted);margin-bottom:32px;font-size:1rem}
-
-/* Footer */
-footer{
-  border-top:1px solid var(--border);
-  padding:32px 24px;text-align:center;
-  font-size:.8125rem;color:var(--muted);
-  position:relative;z-index:1;
-}
-
-/* Responsive */
-@media(max-width:640px){
-  .nav-links{display:none}
-  .hero{padding:120px 20px 60px}
-  .features{grid-template-columns:1fr}
-  .keys-grid{grid-template-columns:1fr}
-  .stats{gap:24px}
-}
-
-/* Subtle animations */
-@keyframes fadeUp{from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:translateY(0)}}
-.hero h1,.hero .tagline,.hero-buttons,.hero-meta{animation:fadeUp .6s ease-out both}
-.hero .tagline{animation-delay:.1s}
-.hero-buttons{animation-delay:.2s}
-.hero-meta{animation-delay:.3s}
+@keyframes up{from{opacity:0;transform:translateY(18px)}to{opacity:1;transform:translateY(0)}}
+.hero img.logo,.hero h1,.hero p,.buttons,.meta{animation:up .55s ease-out both}
+.hero h1{animation-delay:.05s}.hero p{animation-delay:.12s}.buttons{animation-delay:.2s}.meta{animation-delay:.28s}
 </style>
 </head>
 <body>
@@ -212,171 +112,93 @@ footer{
 
 <nav>
   <div class="nav-inner">
-    <div class="nav-logo">
-      <img src="logo.png" alt="PICker logo" width="28" height="28">
-      PICker
-    </div>
+    <div class="nav-logo"><img src="logo.png" alt="PICker logo" width="26" height="26"> PICker</div>
     <div class="nav-links">
       <a href="#features">Features</a>
-      <a href="#shortcuts">Shortcuts</a>
-      <a href="#stack">Stack</a>
-      <a href="https://github.com/nebula3141/picker" target="_blank">GitHub</a>
+      <a href="#download">Download</a>
+      <a href="https://github.com/nebula3141/picker" target="_blank" rel="noopener">GitHub</a>
     </div>
-    <a href="https://github.com/nebula3141/picker/releases" class="nav-dl" target="_blank">Download</a>
+    <a href="#download" class="nav-dl">Download</a>
   </div>
 </nav>
 
 <header class="hero">
-  <img src="logo.png" alt="PICker" class="hero-logo" width="96" height="96">
+  <img src="logo.png" alt="PICker" class="logo" width="88" height="88">
   <h1>Your photos.<br>Lightning fast.</h1>
-  <p class="tagline">Photo viewer built for photographers who shoot thousands of files. Opens 60MP RAW files instantly — even on a potato PC. No catalog. No cloud. No waiting.</p>
-  <div class="hero-buttons">
-    <a href="https://github.com/nebula3141/picker/releases/download/v4.7.0/PICker-4.7.0-setup.exe" class="btn-primary" target="_blank">
-      <svg class="aperture-icon" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
-      Download Installer
+  <p>A fast, no-nonsense photo viewer and culler for photographers who shoot thousands of files. Opens 60MP RAW instantly — no catalog, no cloud, no waiting.</p>
+  <div class="buttons">
+    <a href="https://github.com/nebula3141/picker/releases/download/v4.7.0/PICker-4.7.0-setup.exe" class="btn btn-primary" target="_blank" rel="noopener">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg>
+      Download for Windows
     </a>
-    <a href="https://github.com/nebula3141/picker" class="btn-secondary" target="_blank">
-      <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/></svg>
-      Source Code
+    <a href="https://github.com/nebula3141/picker" class="btn btn-ghost" target="_blank" rel="noopener">
+      <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/></svg>
+      Source
     </a>
   </div>
-  <p class="hero-meta">Windows 10+ &middot; 86 MB installer or 135 MB portable exe &middot; Python + Qt + ffmpeg bundled</p>
+  <p class="meta">Windows 10+ &middot; 85 MB installer or 133 MB portable &middot; ffmpeg bundled</p>
 </header>
 
-<div class="stats">
-  <div class="stat"><div class="stat-value">Instant</div><div class="stat-label">Image open from Explorer</div></div>
-  <div class="stat"><div class="stat-value">60MP</div><div class="stat-label">RAW files on 8GB RAM</div></div>
-  <div class="stat"><div class="stat-value">18+</div><div class="stat-label">RAW formats supported</div></div>
-  <div class="stat"><div class="stat-value">98</div><div class="stat-label">Tests passing</div></div>
-</div>
-
 <section id="features">
-  <div class="section-label">Built for photographers</div>
-  <h2 class="section-title">Cull faster.<br>Deliver sooner.</h2>
-  <p class="section-desc">Wedding, events, studio — PICker handles the shoot sizes that make other viewers choke.</p>
-  <div class="features">
-    <div class="feature-card">
-      <div class="feature-icon">
-        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
-      </div>
-      <h3>Instant Open</h3>
-      <p>Double-click any image in Explorer — it's on screen instantly. No splash, no catalog import. The filmstrip loads in the background.</p>
+  <div class="features-head">
+    <div class="eyebrow">Features</div>
+    <h2>Everything you need. Nothing you don't.</h2>
+    <p>Built for the shoot sizes that make other viewers choke.</p>
+  </div>
+  <div class="grid">
+
+    <div class="card">
+      <div class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg></div>
+      <h3>Instant open</h3>
+      <p>Double-click any image in Explorer and it's on screen instantly — no splash, no catalog import. The filmstrip loads in the background.</p>
     </div>
-    <div class="feature-card">
-      <div class="feature-icon">
-        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="14.31" y1="8" x2="20.05" y2="17.94"/><line x1="9.69" y1="8" x2="21.17" y2="8"/><line x1="7.38" y1="12" x2="13.12" y2="2.06"/></svg>
-      </div>
-      <h3>Every RAW Format</h3>
-      <p>Canon CR2/CR3, Nikon NEF, Sony ARW, Fuji RAF, DNG, Olympus ORF, Panasonic RW2, Pentax PEF, Samsung SRW. 60MP files on 8GB RAM.</p>
+
+    <div class="card">
+      <div class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="14.31" y1="8" x2="20.05" y2="17.94"/><line x1="9.69" y1="8" x2="21.17" y2="8"/><line x1="7.38" y1="12" x2="13.12" y2="2.06"/></svg></div>
+      <h3>Every RAW format</h3>
+      <p>Canon CR2/CR3, Nikon NEF, Sony ARW, Fuji RAF, DNG, Olympus ORF, Panasonic RW2, Pentax PEF, Samsung SRW — plus all common formats.</p>
     </div>
-    <div class="feature-card">
-      <div class="feature-icon">
-        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
-      </div>
-      <h3>Runs on Anything</h3>
-      <p>Smart 50% decode by default — small images stay full-res and nothing is ever softer than your screen, yet a 60MP RAW that makes Lightroom swap to disk still shows instantly here. Bump to 100% only when pixel-peeping.</p>
+
+    <div class="card">
+      <div class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg></div>
+      <h3>Runs on anything</h3>
+      <p>Smart decoding keeps small images full-res and never softer than your screen, while a 60MP RAW that bogs down Lightroom still opens instantly on 8 GB of RAM.</p>
     </div>
-    <div class="feature-card">
-      <div class="feature-icon">
-        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 3a3 3 0 00-3 3v12a3 3 0 003 3 3 3 0 003-3 3 3 0 00-3-3H6a3 3 0 00-3 3 3 3 0 003 3 3 3 0 003-3V6a3 3 0 00-3-3 3 3 0 00-3 3 3 3 0 003 3h12a3 3 0 003-3 3 3 0 00-3-3z"/></svg>
-      </div>
-      <h3>Keyboard Culling</h3>
-      <p>1/2/3 sorts to destinations, Enter sends, Ctrl+Z undoes, arrows navigate. Cull a 3,000-image wedding without touching the mouse.</p>
+
+    <div class="card">
+      <div class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h11"/></svg></div>
+      <h3>Sort &amp; cull fast</h3>
+      <p>Send picks to destination folders, move, copy, or recycle — with one-key undo and a full right-click menu everywhere. Tear through a 3,000-image shoot.</p>
     </div>
-    <div class="feature-card">
-      <div class="feature-icon">
-        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
-      </div>
-      <h3>Photographer's Tools</h3>
-      <p>RGB histogram with clipping warning, focus peaking overlay, 1:1 zoom, crop, rotation, side-by-side compare, EXIF info panel.</p>
+
+    <div class="card">
+      <div class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></svg></div>
+      <h3>Pro viewing tools</h3>
+      <p>RGB histogram with clipping warning, focus peaking, 1:1 zoom, crop, rotate, side-by-side compare, and a full EXIF panel — plus open in Photoshop or Lightroom in one click.</p>
     </div>
-    <div class="feature-card">
-      <div class="feature-icon">
-        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2" ry="2"/></svg>
-      </div>
-      <h3>Video Inline</h3>
-      <p>MP4/MOV/MKV alongside photos. Frame step, speed control (0.25x–4x), loop, scrub. Same filmstrip, same cull workflow.</p>
+
+    <div class="card">
+      <div class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg></div>
+      <h3>Video inline</h3>
+      <p>MP4, MOV and MKV sit right alongside your stills — frame-step, scrub, loop, and 0.25&times;&ndash;4&times; speed in the same filmstrip and workflow.</p>
     </div>
+
   </div>
 </section>
 
-<section id="shortcuts">
-  <div class="keys-section">
-    <div class="section-label">Keyboard-first</div>
-    <h2 class="section-title">Every action, one key.</h2>
-    <div class="keys-grid">
-      <div class="key-group">
-        <h4>Navigation</h4>
-        <div class="key-row"><kbd>&larr;</kbd> <kbd>&rarr;</kbd> <span class="key-label">Previous / Next</span></div>
-        <div class="key-row"><kbd>Esc</kbd> <span class="key-label">Go up one level</span></div>
-        <div class="key-row"><kbd>Ctrl</kbd>+<kbd>H</kbd> <span class="key-label">Home</span></div>
-        <div class="key-row"><kbd>F11</kbd> <span class="key-label">Fullscreen</span></div>
-      </div>
-      <div class="key-group">
-        <h4>Viewing</h4>
-        <div class="key-row"><kbd>Z</kbd> <span class="key-label">1:1 focus check</span></div>
-        <div class="key-row"><kbd>H</kbd> <span class="key-label">Histogram</span></div>
-        <div class="key-row"><kbd>F</kbd> <span class="key-label">Focus peaking</span></div>
-        <div class="key-row"><kbd>I</kbd> <span class="key-label">Info panel</span></div>
-      </div>
-      <div class="key-group">
-        <h4>Editing</h4>
-        <div class="key-row"><kbd>R</kbd> / <kbd>Shift</kbd>+<kbd>R</kbd> <span class="key-label">Rotate CW / CCW</span></div>
-        <div class="key-row"><kbd>C</kbd> <span class="key-label">Crop</span></div>
-        <div class="key-row"><kbd>V</kbd> <span class="key-label">Compare two images</span></div>
-        <div class="key-row"><kbd>O</kbd> <span class="key-label">Open With (PS / LR / system)</span></div>
-        <div class="key-row"><kbd>Ctrl</kbd>+<kbd>S</kbd> <span class="key-label">Save</span></div>
-      </div>
-      <div class="key-group">
-        <h4>Video</h4>
-        <div class="key-row"><kbd>Space</kbd> <span class="key-label">Play / pause</span></div>
-        <div class="key-row"><kbd>J</kbd> <kbd>L</kbd> <span class="key-label">Skip &plusmn;10s</span></div>
-        <div class="key-row"><kbd>[</kbd> <kbd>]</kbd> <span class="key-label">Speed &minus;/+</span></div>
-        <div class="key-row"><kbd>;</kbd> <kbd>'</kbd> <span class="key-label">Frame step</span></div>
-      </div>
-      <div class="key-group">
-        <h4>Sorting</h4>
-        <div class="key-row"><kbd>1</kbd> <kbd>2</kbd> <kbd>3</kbd> <span class="key-label">Rate / sort</span></div>
-        <div class="key-row"><kbd>Ctrl</kbd>+<kbd>Z</kbd> <span class="key-label">Undo</span></div>
-        <div class="key-row"><kbd>Del</kbd> <span class="key-label">Recycle Bin</span></div>
-        <div class="key-row"><kbd>Enter</kbd> <span class="key-label">Send to active</span></div>
-      </div>
-    </div>
+<section id="download" class="cta">
+  <div class="eyebrow">Download</div>
+  <h2>Free, open source, no install required.</h2>
+  <p>Grab the installer, or the single portable .exe — drop it anywhere and run.</p>
+  <div class="buttons">
+    <a href="https://github.com/nebula3141/picker/releases/download/v4.7.0/PICker-4.7.0-setup.exe" class="btn btn-primary" target="_blank" rel="noopener">Installer (.exe)</a>
+    <a href="https://github.com/nebula3141/picker/releases/download/v4.7.0/PICker-4.7.0.exe" class="btn btn-ghost" target="_blank" rel="noopener">Portable (.exe)</a>
   </div>
-</section>
-
-<section id="stack">
-  <div style="text-align:center">
-    <div class="section-label">Built with</div>
-    <h2 class="section-title">Lean stack. No bloat.</h2>
-    <p class="section-desc" style="margin:0 auto 32px">Every dependency earns its place. No Electron, no browser engine, no runtime download.</p>
-    <div class="tech-row">
-      <span class="tech-pill">Python 3.11+</span>
-      <span class="tech-pill">PyQt6</span>
-      <span class="tech-pill">Pillow</span>
-      <span class="tech-pill">rawpy / LibRaw</span>
-      <span class="tech-pill">NumPy</span>
-      <span class="tech-pill">SQLite WAL</span>
-      <span class="tech-pill">ffmpeg (optional)</span>
-      <span class="tech-pill">PyInstaller</span>
-    </div>
-  </div>
-</section>
-
-<section class="cta">
-  <h2>Cull your next shoot<br>in minutes, not hours.</h2>
-  <p>4,000 wedding photos? PICker opens them instantly. Sort, rate, and deliver — all from the keyboard.</p>
-  <div class="hero-buttons">
-    <a href="https://github.com/nebula3141/picker/releases/download/v4.7.0/PICker-4.7.0-setup.exe" class="btn-primary" target="_blank">
-      <svg class="aperture-icon" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
-      Download Installer
-    </a>
-    <a href="https://github.com/nebula3141/picker" class="btn-secondary" target="_blank">View on GitHub</a>
-  </div>
+  <p class="meta">Latest release: v4.7.0 &middot; <a href="https://github.com/nebula3141/picker/releases" target="_blank" rel="noopener" style="color:var(--accent)">all releases &amp; changelog</a></p>
 </section>
 
 <footer>
-  <p>Built by nebula3141 &middot; PICker v4.7.0 &middot; GPL-3.0 License</p>
+  <p>Built by <a href="https://github.com/nebula3141" target="_blank" rel="noopener">nebula3141</a> &middot; PICker v4.7.0 &middot; GPL-3.0 &middot; Python + Qt</p>
 </footer>
 
 </body>
