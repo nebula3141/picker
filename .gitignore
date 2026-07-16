@@ -42,3 +42,6 @@ venv/
 
 # Reg files (local dev only)
 *.reg
+
+# Release staging
+dist_multi/

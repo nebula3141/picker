@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v4.8.0 (2026-07-17)
 
 ### Modern UI
 - App-wide visual refresh: new accent (#3b82f6), deeper neutral dark palette, modern rounded

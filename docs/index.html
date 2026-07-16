@@ -21,7 +21,7 @@
   --border:#1f1f24;
   --fg:#e7e7ea;
   --muted:#8a8a93;
-  --accent:#2a82da;
+  --accent:#3b82f6;
   --radius:14px;
 }
 html{scroll-behavior:smooth;font-size:16px}
@@ -36,7 +36,7 @@ a{color:inherit;text-decoration:none}
 .glow{
   position:fixed;top:-280px;left:50%;transform:translateX(-50%);
   width:760px;height:760px;pointer-events:none;z-index:0;
-  background:radial-gradient(circle,rgba(42,130,218,.10) 0%,transparent 65%);
+  background:radial-gradient(circle,rgba(59,130,246,.10) 0%,transparent 65%);
 }
 
 /* nav */
@@ -61,7 +61,7 @@ section{max-width:1000px;margin:0 auto;padding:0 24px;position:relative;z-index:
 /* hero */
 .hero{text-align:center;padding:168px 24px 96px}
 .hero img.logo{width:88px;height:88px;border-radius:22px;margin:0 auto 30px;
-  filter:drop-shadow(0 10px 36px rgba(42,130,218,.28))}
+  filter:drop-shadow(0 10px 36px rgba(59,130,246,.28))}
 .hero h1{font-size:clamp(2.4rem,6vw,4rem);font-weight:800;letter-spacing:-.04em;line-height:1.08}
 .hero p{color:var(--muted);font-size:clamp(1rem,2.2vw,1.2rem);max-width:540px;margin:22px auto 0}
 .buttons{display:flex;gap:13px;justify-content:center;flex-wrap:wrap;margin-top:38px}
@@ -81,8 +81,8 @@ section{max-width:1000px;margin:0 auto;padding:0 24px;position:relative;z-index:
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:18px}
 .card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);
   padding:26px;transition:border-color .25s,transform .25s}
-.card:hover{border-color:rgba(42,130,218,.45);transform:translateY(-2px)}
-.card .ico{width:40px;height:40px;border-radius:11px;background:rgba(42,130,218,.12);
+.card:hover{border-color:rgba(59,130,246,.45);transform:translateY(-2px)}
+.card .ico{width:40px;height:40px;border-radius:11px;background:rgba(59,130,246,.12);
   display:flex;align-items:center;justify-content:center;color:var(--accent);margin-bottom:16px}
 .card .ico svg{width:20px;height:20px}
 .card h3{font-size:1.02rem;font-weight:650;margin-bottom:7px}
@@ -127,7 +127,7 @@ footer a:hover{color:var(--fg)}
   <h1>Your photos.<br>Lightning fast.</h1>
   <p>A fast, no-nonsense photo viewer and culler for photographers who shoot thousands of files. Opens 60MP RAW instantly — no catalog, no cloud, no waiting.</p>
   <div class="buttons">
-    <a href="https://github.com/nebula3141/picker/releases/download/v4.7.0/PICker-4.7.0-setup.exe" class="btn btn-primary" target="_blank" rel="noopener">
+    <a href="https://github.com/nebula3141/picker/releases/download/v4.8.0/PICker-4.8.0-setup.exe" class="btn btn-primary" target="_blank" rel="noopener">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg>
       Download for Windows
     </a>
@@ -136,7 +136,7 @@ footer a:hover{color:var(--fg)}
       Source
     </a>
   </div>
-  <p class="meta">Windows 10+ &middot; 85 MB installer or 133 MB portable &middot; ffmpeg bundled</p>
+  <p class="meta">Windows 10+ &middot; 133 MB installer or 215 MB portable &middot; ffmpeg bundled</p>
 </header>
 
 <section id="features">
@@ -191,14 +191,14 @@ footer a:hover{color:var(--fg)}
   <h2>Free, open source, no install required.</h2>
   <p>Grab the installer, or the single portable .exe — drop it anywhere and run.</p>
   <div class="buttons">
-    <a href="https://github.com/nebula3141/picker/releases/download/v4.7.0/PICker-4.7.0-setup.exe" class="btn btn-primary" target="_blank" rel="noopener">Installer (.exe)</a>
+    <a href="https://github.com/nebula3141/picker/releases/download/v4.8.0/PICker-4.8.0-setup.exe" class="btn btn-primary" target="_blank" rel="noopener">Installer (.exe)</a>
     <a href="https://github.com/nebula3141/picker/releases/download/v4.7.0/PICker-4.7.0.exe" class="btn btn-ghost" target="_blank" rel="noopener">Portable (.exe)</a>
   </div>
   <p class="meta">Latest release: v4.7.0 &middot; <a href="https://github.com/nebula3141/picker/releases" target="_blank" rel="noopener" style="color:var(--accent)">all releases &amp; changelog</a></p>
 </section>
 
 <footer>
-  <p>Built by <a href="https://github.com/nebula3141" target="_blank" rel="noopener">nebula3141</a> &middot; PICker v4.7.0 &middot; GPL-3.0 &middot; Python + Qt</p>
+  <p>Built by <a href="https://github.com/nebula3141" target="_blank" rel="noopener">nebula3141</a> &middot; PICker v4.8.0 &middot; GPL-3.0 &middot; Python + Qt</p>
 </footer>
 
 </body>
