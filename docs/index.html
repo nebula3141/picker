@@ -88,6 +88,21 @@ section{max-width:1000px;margin:0 auto;padding:0 24px;position:relative;z-index:
 .card h3{font-size:1.02rem;font-weight:650;margin-bottom:7px}
 .card p{font-size:.9rem;color:var(--muted)}
 
+/* what's new */
+#whatsnew{padding-top:8px}
+.newlist{max-width:680px;margin:0 auto;list-style:none;display:flex;flex-direction:column;gap:12px}
+.newlist li{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);
+  padding:16px 20px;font-size:.92rem;color:var(--muted)}
+.newlist li b{color:var(--fg);font-weight:600}
+
+/* linux box */
+.linuxbox{max-width:560px;margin:44px auto 0;background:var(--surface);
+  border:1px solid var(--border);border-radius:var(--radius);padding:22px 24px;text-align:left}
+.linuxbox-title{font-weight:600;font-size:.92rem;margin-bottom:12px}
+.linuxbox pre{background:var(--bg);border:1px solid var(--border);border-radius:9px;
+  padding:14px 16px;font-size:.82rem;color:var(--fg);overflow-x:auto;
+  font-family:ui-monospace,'Cascadia Code',Consolas,monospace}
+
 /* download / cta */
 .cta{text-align:center;padding:104px 24px}
 .cta h2{font-size:clamp(1.6rem,3vw,2.4rem);font-weight:700;letter-spacing:-.03em}
@@ -115,6 +130,7 @@ footer a:hover{color:var(--fg)}
     <div class="nav-logo"><img src="logo.png" alt="PICker logo" width="26" height="26"> PICker</div>
     <div class="nav-links">
       <a href="#features">Features</a>
+      <a href="#whatsnew">What's new</a>
       <a href="#download">Download</a>
       <a href="https://github.com/nebula3141/picker" target="_blank" rel="noopener">GitHub</a>
     </div>
@@ -136,7 +152,7 @@ footer a:hover{color:var(--fg)}
       Source
     </a>
   </div>
-  <p class="meta">Windows 10+ &middot; 133 MB installer or 215 MB portable &middot; ffmpeg bundled</p>
+  <p class="meta">Windows 10+ &middot; Linux (from source) &middot; 133 MB installer or 215 MB portable &middot; video support built in</p>
 </header>
 
 <section id="features">
@@ -180,10 +196,24 @@ footer a:hover{color:var(--fg)}
     <div class="card">
       <div class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg></div>
       <h3>Video inline</h3>
-      <p>MP4, MOV and MKV sit right alongside your stills — frame-step, scrub, loop, and 0.25&times;&ndash;4&times; speed in the same filmstrip and workflow.</p>
+      <p>MP4, MOV and MKV sit right alongside your stills — frame-step, scrub, loop, and 0.25&times;&ndash;4&times; speed. As of v4.8.0 video support is bundled out of the box, no ffmpeg install needed.</p>
     </div>
 
   </div>
+</section>
+
+<section id="whatsnew">
+  <div class="features-head">
+    <div class="eyebrow">What's new</div>
+    <h2>v4.8.0 — Modern UI &amp; Linux</h2>
+  </div>
+  <ul class="newlist">
+    <li><b>Modern interface</b> — refreshed accent and dark palette, rounded menus and right-click menus everywhere, unified dialogs, fluid transitions.</li>
+    <li><b>Linux support</b> — run from source with a one-shot setup script and a cross-platform launcher; Windows-only integrations switch off automatically.</li>
+    <li><b>Video bundled</b> — ffmpeg and its codecs now ship inside the installer and portable exe, so thumbnails and metadata just work.</li>
+    <li><b>Smarter Escape</b> — Esc on a photo opened from Explorer now drops you into that folder's mosaic to keep browsing (configurable).</li>
+    <li><b>Open project</b> — CI on Windows + Linux, contribution guide, and a complete <a href="https://github.com/nebula3141/picker/blob/master/APPLICATION.md" target="_blank" rel="noopener" style="color:var(--accent)">feature spec</a>.</li>
+  </ul>
 </section>
 
 <section id="download" class="cta">
@@ -192,9 +222,16 @@ footer a:hover{color:var(--fg)}
   <p>Grab the installer, or the single portable .exe — drop it anywhere and run.</p>
   <div class="buttons">
     <a href="https://github.com/nebula3141/picker/releases/download/v4.8.0/PICker-4.8.0-setup.exe" class="btn btn-primary" target="_blank" rel="noopener">Installer (.exe)</a>
-    <a href="https://github.com/nebula3141/picker/releases/download/v4.7.0/PICker-4.7.0.exe" class="btn btn-ghost" target="_blank" rel="noopener">Portable (.exe)</a>
+    <a href="https://github.com/nebula3141/picker/releases/download/v4.8.0/PICker-4.8.0.exe" class="btn btn-ghost" target="_blank" rel="noopener">Portable (.exe)</a>
   </div>
-  <p class="meta">Latest release: v4.7.0 &middot; <a href="https://github.com/nebula3141/picker/releases" target="_blank" rel="noopener" style="color:var(--accent)">all releases &amp; changelog</a></p>
+  <p class="meta">Latest release: v4.8.0 &middot; <a href="https://github.com/nebula3141/picker/releases" target="_blank" rel="noopener" style="color:var(--accent)">all releases &amp; changelog</a></p>
+  <div class="linuxbox">
+    <div class="linuxbox-title">🐧 On Linux? Run it from source:</div>
+    <pre>git clone https://github.com/nebula3141/picker.git
+cd picker/linux &amp;&amp; ./setup.sh &amp;&amp; ./run.sh</pre>
+    <p class="meta" style="margin-top:10px">Full guide: <a href="https://github.com/nebula3141/picker/blob/master/linux/README.md" target="_blank" rel="noopener" style="color:var(--accent)">linux/README.md</a></p>
+  </div>
+  <p class="meta" style="margin-top:34px; font-style:italic">Started as a tool to sort my own wedding album — a passion project, free and open source ever since.</p>
 </section>
 
 <footer>
