@@ -76,10 +76,26 @@ def _find_binary(name: str) -> str | None:
         # When frozen by PyInstaller, sys.executable is the .exe location.
         import sys
         if getattr(sys, "frozen", False):
-            candidates.append(Path(sys.executable).parent / f"{name}.exe")
-        # Repo root (for dev runs).
-        candidates.append(Path(__file__).resolve().parent.parent / f"{name}.exe")
-        candidates.append(Path(__file__).resolve().parent.parent / name)
+            # Bundled binaries live in the PyInstaller extraction dir (_MEIPASS):
+            # onefile → a temp dir; onedir → the "_internal" folder. The spec
+            # ships them under a "bin/" subfolder.
+            meipass = getattr(sys, "_MEIPASS", None)
+            if meipass:
+                candidates.append(Path(meipass) / "bin" / f"{name}.exe")
+                candidates.append(Path(meipass) / f"{name}.exe")
+            # Also honor a binary the user drops next to the executable.
+            exe_dir = Path(sys.executable).parent
+            candidates.append(exe_dir / f"{name}.exe")
+            candidates.append(exe_dir / "bin" / f"{name}.exe")
+        else:
+            # Dev runs: repo-root bin/ (bundled ffmpeg/ffprobe) then src/.
+            here = Path(__file__).resolve()
+            src_dir = here.parent.parent
+            repo_root = here.parents[2]
+            candidates.append(repo_root / "bin" / f"{name}.exe")
+            candidates.append(repo_root / "bin" / name)
+            candidates.append(src_dir / f"{name}.exe")
+            candidates.append(src_dir / name)
     except Exception:
         pass
     for c in candidates:

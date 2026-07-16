@@ -48,6 +48,7 @@ DEFAULTS = {
     "preload_count": 2,                  # 1..5 neighbors each side
     "auto_advance_on_send": True,
     "show_filmstrip": True,
+    "explorer_escape_action": "mosaic",  # "mosaic" | "close" — Esc from a photo opened via Explorer/file-association
     "conflict_default": "ask",           # "ask"|"rename"|"replace"|"skip"
     "zoom_factor": 1.18,                 # 1.05..1.5
     "peaking_threshold": 28,             # 5..80

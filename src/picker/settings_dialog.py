@@ -10,6 +10,8 @@ from PyQt6.QtCore import Qt
 from . import settings as settings_mod
 from . import external
 from . import recent as recent_mod
+from . import theme as theme_mod
+from .sysfeatures import windows_features_enabled
 
 
 POSITION_LABELS = [
@@ -29,149 +31,30 @@ FILE_TYPE_LABELS = [
 ]
 
 
-DIALOG_QSS = """
-QDialog { background: #141414; }
-QScrollArea { background: #141414; border: 0; }
-QScrollArea > QWidget > QWidget { background: #141414; }
-QScrollBar:vertical {
-    background: transparent;
-    width: 10px;
-    margin: 0;
-}
-QScrollBar::handle:vertical {
-    background: #303030;
-    border-radius: 5px;
-    min-height: 40px;
-}
-QScrollBar::handle:vertical:hover { background: #444; }
-QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
-QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
-
-QGroupBox {
-    color: #d4d4d4;
-    font-weight: 600;
-    border: 1px solid #262626;
-    border-radius: 10px;
-    margin-top: 20px;
-    padding: 22px 18px 16px 18px;
-    background: #1b1b1b;
-}
-QGroupBox::title {
-    subcontrol-origin: margin;
-    subcontrol-position: top left;
-    left: 16px;
-    padding: 2px 8px;
-    color: #8b9cb4;
-    font-size: 10px;
-    font-weight: 700;
-    text-transform: uppercase;
-    letter-spacing: 1.4px;
-    background: #141414;
-}
-
-QLabel { color: #d4d4d4; font-size: 13px; }
-QLabel#hint { color: #6b7280; font-size: 11px; }
-QLabel#detected { color: #6b7280; font-size: 11px; font-style: italic; }
-
-QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {
-    background: #0f0f0f;
-    color: #e8e8e8;
-    border: 1px solid #2a2a2a;
-    border-radius: 6px;
-    padding: 7px 10px;
-    font-size: 13px;
-    selection-background-color: #2a82da;
-}
-QLineEdit:hover, QComboBox:hover, QSpinBox:hover, QDoubleSpinBox:hover {
-    border-color: #3a3a3a;
-}
-QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus {
-    border: 1px solid #2a82da;
-    background: #121212;
-}
-QComboBox::drop-down { border: none; width: 24px; }
-QComboBox::down-arrow {
-    image: none;
-    border-left: 4px solid transparent;
-    border-right: 4px solid transparent;
-    border-top: 5px solid #888;
-    width: 0; height: 0;
-    margin-right: 8px;
-}
-QComboBox QAbstractItemView {
-    background: #1b1b1b;
-    color: #e5e5e5;
-    border: 1px solid #2a2a2a;
-    border-radius: 6px;
-    selection-background-color: #2a82da;
-    padding: 4px;
-    outline: 0;
-}
-QSpinBox::up-button, QDoubleSpinBox::up-button,
-QSpinBox::down-button, QDoubleSpinBox::down-button {
-    background: transparent;
-    border: 0;
-    width: 16px;
-}
-
-QPushButton {
-    background: #262626;
-    color: #e5e5e5;
-    border: 1px solid #353535;
-    border-radius: 6px;
-    padding: 7px 14px;
-    font-size: 12px;
-}
-QPushButton:hover { background: #2f2f2f; border-color: #4a4a4a; }
-QPushButton:pressed { background: #202020; }
-QPushButton#primary {
-    background: #2a82da;
-    border: 1px solid #2a82da;
-    color: white;
-    font-weight: 600;
-    padding: 8px 22px;
-}
-QPushButton#primary:hover { background: #3a92ea; border-color: #3a92ea; }
-QPushButton#primary:pressed { background: #1f6fbf; }
-QPushButton#danger {
-    background: transparent;
-    color: #e57373;
-    border: 1px solid #432626;
-}
-QPushButton#danger:hover { background: #2a1616; border-color: #e57373; color: #fff; }
-
-QCheckBox { color: #d4d4d4; spacing: 10px; font-size: 13px; padding: 2px 0; }
-QCheckBox::indicator {
-    width: 16px; height: 16px;
-    border-radius: 4px;
-    border: 1px solid #3a3a3a;
-    background: #0f0f0f;
-}
-QCheckBox::indicator:hover { border-color: #555; }
-QCheckBox::indicator:checked {
-    background: #2a82da;
-    border: 1px solid #2a82da;
-}
-
-QFrame#divider { background: #262626; max-height: 1px; }
+# Only the rules unique to this dialog (paged scroll area + sidebar nav); the
+# base (cards, inputs, toggles, buttons, #primary/#danger/#hint/#detected,
+# scrollbars, #divider) comes from theme.dialog_qss().
+_EXTRA_QSS = """
+QScrollArea { background: #141416; border: 0; }
+QScrollArea > QWidget > QWidget { background: #141416; }
 
 QListWidget#nav {
-    background: #1b1b1b;
-    border: 1px solid #262626;
-    border-radius: 10px;
+    background: #1a1a1e;
+    border: 1px solid #26262c;
+    border-radius: 12px;
     padding: 6px;
     outline: 0;
     font-size: 13px;
 }
 QListWidget#nav::item {
-    color: #b8b8b8;
-    padding: 9px 12px;
-    border-radius: 7px;
+    color: #b6b6bf;
+    padding: 10px 12px;
+    border-radius: 8px;
     margin: 2px 0;
 }
-QListWidget#nav::item:hover { background: #242424; color: #e8e8e8; }
+QListWidget#nav::item:hover { background: #24242a; color: #eaeaef; }
 QListWidget#nav::item:selected {
-    background: #2a82da;
+    background: #3b82f6;
     color: #ffffff;
     font-weight: 600;
 }
@@ -186,7 +69,7 @@ class SettingsDialog(QDialog):
         self.setWindowIcon(app_icon())
         self.setMinimumSize(760, 680)
         self.resize(820, 720)
-        self.setStyleSheet(DIALOG_QSS)
+        self.setStyleSheet(theme_mod.dialog_qss() + _EXTRA_QSS)
         self._build_ui()
         self._set_accessible_names()
         self._load()
@@ -229,13 +112,20 @@ class SettingsDialog(QDialog):
         self._stack = QStackedWidget()
         body.addWidget(self._stack, 1)
 
+        # File associations + shell context menu are Windows-only; on Linux/macOS
+        # the Integrations page shows just the external-editor settings.
+        self._win_features = windows_features_enabled()
+        integrations = [self._build_editors()]
+        if self._win_features:
+            integrations.append(self._build_system())
+
         pages = [
             ("General",      [self._build_defaults(), self._build_appearance()]),
             ("Gallery",      [self._build_gallery()]),
             ("Slideshow",    [self._build_slideshow(), self._build_overlays()]),
             ("Editing",      [self._build_editing()]),
             ("Scanning",     [self._build_scanning()]),
-            ("Integrations", [self._build_editors(), self._build_system()]),
+            ("Integrations", integrations),
             ("Cache",        [self._build_maintenance()]),
             ("Advanced",     [self._build_advanced()]),
         ]
@@ -320,6 +210,7 @@ class SettingsDialog(QDialog):
             "filmstrip_cb": "Show filmstrip",
             "animation_cb": "Slideshow animation",
             "conflict_combo": "Conflict handling",
+            "explorer_esc_combo": "Escape action for Explorer-opened photo",
             "edit_save_combo": "Edit save mode",
             "edit_suffix_edit": "Edit new file suffix",
             "edit_quality_spin": "JPEG quality",
@@ -466,6 +357,18 @@ class SettingsDialog(QDialog):
         self.conflict_combo.addItem("Skip", "skip")
         self.conflict_combo.setFixedWidth(200)
         g.addWidget(self.conflict_combo, 4, 1, Qt.AlignmentFlag.AlignLeft)
+
+        g.addWidget(QLabel("Esc on a photo opened from Explorer"), 5, 0)
+        self.explorer_esc_combo = QComboBox()
+        self.explorer_esc_combo.addItem("Open the folder (mosaic)", "mosaic")
+        self.explorer_esc_combo.addItem("Close PICker", "close")
+        self.explorer_esc_combo.setFixedWidth(200)
+        g.addWidget(self.explorer_esc_combo, 5, 1, Qt.AlignmentFlag.AlignLeft)
+        hint = QLabel("When you double-click a photo in Explorer and press Esc: browse that "
+                      "folder as a mosaic, or quit.")
+        hint.setObjectName("hint")
+        hint.setWordWrap(True)
+        g.addWidget(hint, 6, 0, 1, 3)
         return grp
 
     # Editing
@@ -879,6 +782,7 @@ class SettingsDialog(QDialog):
         self.filmstrip_cb.setChecked(bool(data.get("show_filmstrip", True)))
         self.animation_cb.setChecked(bool(data.get("slideshow_animation", True)))
         self._select_data(self.conflict_combo, data.get("conflict_default", "ask"))
+        self._select_data(self.explorer_esc_combo, data.get("explorer_escape_action", "mosaic"))
 
         self._select_data(self.edit_save_combo, data.get("edit_save_mode", "ask"))
         self.edit_suffix_edit.setText(data.get("edit_new_suffix", "_edit"))
@@ -914,14 +818,15 @@ class SettingsDialog(QDialog):
         self.log_cb.setChecked(bool(data.get("log_enabled", False)))
         self.check_updates_cb.setChecked(bool(data.get("check_updates", True)))
 
-        from .file_assoc import is_registered
-        registered = is_registered()
-        self.file_assoc_cb.setChecked(registered)
-        self.dir_context_cb.setEnabled(registered)
-        self.dir_context_cb.setChecked(registered)
-        self._assoc_status.setText(
-            "Status: Registered" if registered else "Status: Not registered"
-        )
+        if getattr(self, "_win_features", False):
+            from .file_assoc import is_registered
+            registered = is_registered()
+            self.file_assoc_cb.setChecked(registered)
+            self.dir_context_cb.setEnabled(registered)
+            self.dir_context_cb.setChecked(registered)
+            self._assoc_status.setText(
+                "Status: Registered" if registered else "Status: Not registered"
+            )
 
     def _refresh_detected(self):
         external.invalidate_cache()
@@ -967,6 +872,7 @@ class SettingsDialog(QDialog):
             "show_filmstrip": bool(self.filmstrip_cb.isChecked()),
             "slideshow_animation": bool(self.animation_cb.isChecked()),
             "conflict_default": self.conflict_combo.currentData() or "ask",
+            "explorer_escape_action": self.explorer_esc_combo.currentData() or "mosaic",
 
             "edit_save_mode": self.edit_save_combo.currentData() or "ask",
             "edit_new_suffix": (self.edit_suffix_edit.text().strip() or "_edit"),
@@ -1000,17 +906,18 @@ class SettingsDialog(QDialog):
         })
         external.invalidate_cache()
 
-        from .file_assoc import is_registered, register, unregister
-        want_assoc = self.file_assoc_cb.isChecked()
-        currently = is_registered()
-        if want_assoc and not currently:
-            err = register()
-            if err:
-                QMessageBox.warning(self, "File Association", f"Failed to register: {err}")
-        elif not want_assoc and currently:
-            err = unregister()
-            if err:
-                QMessageBox.warning(self, "File Association", f"Failed to unregister: {err}")
-        settings_mod.set_value("file_associations_registered", want_assoc)
+        if getattr(self, "_win_features", False):
+            from .file_assoc import is_registered, register, unregister
+            want_assoc = self.file_assoc_cb.isChecked()
+            currently = is_registered()
+            if want_assoc and not currently:
+                err = register()
+                if err:
+                    QMessageBox.warning(self, "File Association", f"Failed to register: {err}")
+            elif not want_assoc and currently:
+                err = unregister()
+                if err:
+                    QMessageBox.warning(self, "File Association", f"Failed to unregister: {err}")
+            settings_mod.set_value("file_associations_registered", want_assoc)
 
         self.accept()

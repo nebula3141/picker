@@ -36,7 +36,7 @@ class _RootRow(QFrame):
             QFrame#rootRow:hover { border-color: #3a3a3a; }
             QLabel#label { font-size: 14px; font-weight: 600; color: #eaeaea; }
             QLabel#path  { color: #8a8a8a; font-size: 11px; }
-            QLabel#count { color: #6a9eff; font-size: 11px; }
+            QLabel#count { color: #5a9bff; font-size: 11px; }
             QPushButton {
                 background: #2a2a2a; color: #ddd; border: 1px solid #3a3a3a;
                 border-radius: 4px; padding: 5px 12px; font-size: 11px;
@@ -178,7 +178,7 @@ class LibraryManagerDialog(QDialog):
             QLabel#hint   { color: #8a8a8a; font-size: 11px; }
             QScrollArea { background: #121212; border: 0; }
             QPushButton#primary {
-                background: #2a82da; color: #fff; border: 0;
+                background: #3b82f6; color: #fff; border: 0;
                 border-radius: 4px; padding: 8px 20px; font-weight: 600;
             }
             QPushButton#primary:hover { background: #3b93eb; }

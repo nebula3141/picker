@@ -1335,7 +1335,7 @@ class AlbumBrowserView(QWidget):
             "#scanStrip { background: #16203a; }"
             "QLabel#scanLbl { color: #cfd8e8; font-size: 11px; padding: 4px 12px; }"
             "QProgressBar#scanBar { background: #0f1729; border: none; }"
-            "QProgressBar#scanBar::chunk { background: #2a82da; }"
+            "QProgressBar#scanBar::chunk { background: #3b82f6; }"
         )
         scan_lay = QHBoxLayout(self._scan_strip)
         scan_lay.setContentsMargins(0, 0, 0, 0)

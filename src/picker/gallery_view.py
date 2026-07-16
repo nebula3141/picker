@@ -512,7 +512,7 @@ class _GalleryCanvas(QWidget):
 
         # Icon — folder with down arrow
         p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QColor(42, 130, 218, 180))
+        p.setBrush(QColor(59, 130, 246, 180))
         icon_size = 56
         ix = cx - icon_size // 2
         iy = by + 32
@@ -774,7 +774,7 @@ class _LoadingOverlay(QWidget):
         rect = QRect(cx - r, cy - r - 40, 2 * r, 2 * r)
         p.setPen(QPen(QColor(60, 60, 60), 4))
         p.drawEllipse(rect)
-        pen = QPen(QColor(42, 130, 218), 4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
+        pen = QPen(QColor(59, 130, 246), 4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
         p.setPen(pen)
         p.drawArc(rect, -self._angle * 16, 90 * 16)
 
@@ -808,7 +808,7 @@ class _LoadingOverlay(QWidget):
         p.drawRoundedRect(bx, by, bar_w, bar_h, 2, 2)
         if self._total > 0:
             fill = int(bar_w * self._done / self._total)
-            p.setBrush(QColor(42, 130, 218))
+            p.setBrush(QColor(59, 130, 246))
             p.drawRoundedRect(bx, by, fill, bar_h, 2, 2)
         p.end()
 

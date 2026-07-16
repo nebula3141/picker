@@ -7,6 +7,7 @@ from PyQt6.QtCore import Qt
 
 from . import recent as recent_mod
 from . import settings as settings_mod
+from . import theme as theme_mod
 
 
 DEST_ACCENTS = [
@@ -79,133 +80,30 @@ class DestinationRow(QFrame):
         return None
 
 
-DIALOG_QSS = """
-QDialog { background: #1a1a1a; }
-QGroupBox {
-    color: #ccc;
-    font-weight: 600;
-    border: 1px solid #2e2e2e;
-    border-radius: 10px;
-    margin-top: 14px;
-    padding: 18px 14px 14px 14px;
-    background: #202020;
-}
-QGroupBox::title {
-    subcontrol-origin: margin;
-    subcontrol-position: top left;
-    left: 14px;
-    padding: 0 6px;
-    color: #9ca3af;
-    font-size: 11px;
-    text-transform: uppercase;
-    letter-spacing: 1px;
-}
-QLineEdit {
-    background: #151515;
-    color: #e5e5e5;
-    border: 1px solid #333;
-    border-radius: 6px;
-    padding: 7px 10px;
-    selection-background-color: #2a82da;
-}
-QLineEdit:focus { border: 1px solid #2a82da; background: #181818; }
-QLineEdit::placeholder { color: #555; }
-QPushButton {
-    background: #2a2a2a;
-    color: #e5e5e5;
-    border: 1px solid #3a3a3a;
-    border-radius: 6px;
-    padding: 7px 14px;
-}
-QPushButton:hover { background: #353535; border-color: #505050; }
-QPushButton:pressed { background: #232323; }
-QPushButton#primary {
-    background: #2a82da;
-    border: 1px solid #2a82da;
-    color: white;
-    font-weight: 600;
-}
-QPushButton#primary:hover { background: #3a92ea; }
-QPushButton#primary:pressed { background: #1f6fbf; }
+# Only the rules unique to this dialog; the base (QDialog, QGroupBox, inputs,
+# buttons, #primary, radios) comes from theme.dialog_qss().
+_EXTRA_QSS = """
+QLabel#tagline { color: #6f6f78; font-style: italic; }
 QPushButton#recent {
-    background: #252525;
-    color: #bbb;
-    padding: 4px 10px;
-    border: 1px solid #333;
-    border-radius: 12px;
-    font-size: 11px;
+    background: #1c1c20; color: #bbb; padding: 5px 12px;
+    border: 1px solid #2a2a30; border-radius: 13px; font-size: 11px; font-weight: 500;
 }
-QPushButton#recent:hover { background: #303030; color: #fff; border-color: #2a82da; }
-QComboBox {
-    background: #151515;
-    color: #e5e5e5;
-    border: 1px solid #333;
-    border-radius: 6px;
-    padding: 6px 10px;
-}
-QComboBox:hover { border-color: #505050; }
-QComboBox::drop-down { border: none; width: 22px; }
-QComboBox QAbstractItemView {
-    background: #202020;
-    color: #e5e5e5;
-    border: 1px solid #333;
-    selection-background-color: #2a82da;
-}
-QRadioButton { color: #ddd; spacing: 6px; }
-QRadioButton::indicator {
-    width: 14px; height: 14px;
-    border-radius: 7px;
-    border: 1px solid #555;
-    background: #151515;
-}
-QRadioButton::indicator:checked {
-    border: 1px solid #2a82da;
-    background: qradialgradient(cx:0.5, cy:0.5, radius:0.5,
-        stop:0 #2a82da, stop:0.55 #2a82da, stop:0.6 #151515);
-}
+QPushButton#recent:hover { background: #26262c; color: #fff; border-color: #3b82f6; }
 QFrame#destRow {
-    background: transparent;
-    border: 1px solid transparent;
-    border-radius: 6px;
+    background: transparent; border: 1px solid transparent; border-radius: 9px;
 }
-QFrame#destRow:hover { background: #1e1e1e; border: 1px solid #2a2a2a; }
+QFrame#destRow:hover { background: #1c1c20; border: 1px solid #2a2a30; }
 QPushButton#rowIcon {
-    background: transparent;
-    color: #777;
-    border: 1px solid transparent;
-    border-radius: 5px;
-    padding: 0;
-    font-size: 15px;
+    background: transparent; color: #777; border: 1px solid transparent;
+    border-radius: 7px; padding: 0; font-size: 15px;
 }
-QPushButton#rowIcon:hover { background: #2a2a2a; color: #ddd; border-color: #3a3a3a; }
+QPushButton#rowIcon:hover { background: #2a2a30; color: #ddd; border-color: #3a3a42; }
 QPushButton#addDest {
-    background: transparent;
-    color: #7a7a7a;
-    border: 1px dashed #3a3a3a;
-    border-radius: 6px;
-    padding: 6px 12px;
-    font-size: 12px;
+    background: transparent; color: #7a7a7a; border: 1px dashed #3a3a42;
+    border-radius: 9px; padding: 8px 14px; font-size: 12px;
 }
-QPushButton#addDest:hover { color: #cfcfcf; border-color: #505050; background: #1c1c1c; }
-QPushButton#addDest:disabled { color: #444; border-color: #2a2a2a; }
-QPushButton#gear {
-    background: #2a82da;
-    color: #ffffff;
-    border: 1px solid #2a82da;
-    border-radius: 22px;
-    padding: 0 16px 0 14px;
-    font-size: 13px;
-    font-weight: 600;
-    letter-spacing: 0.3px;
-}
-QPushButton#gear:hover {
-    background: #3a92ea;
-    border-color: #3a92ea;
-}
-QPushButton#gear:pressed { background: #1f6fbf; border-color: #1f6fbf; }
-QLabel#title { color: #fff; }
-QLabel#subtitle { color: #888; }
-QLabel#tagline { color: #6b7280; font-style: italic; }
+QPushButton#addDest:hover { color: #cfcfcf; border-color: #55555f; background: #1a1a1e; }
+QPushButton#addDest:disabled { color: #444; border-color: #2a2a30; }
 """
 
 
@@ -217,7 +115,7 @@ class StartupDialog(QDialog):
         self.setWindowIcon(app_icon())
         self.setMinimumWidth(640)
         self.setModal(True)
-        self.setStyleSheet(DIALOG_QSS)
+        self.setStyleSheet(theme_mod.dialog_qss() + _EXTRA_QSS)
         self._result_data: dict | None = None
         self._build_ui()
 

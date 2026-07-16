@@ -1,0 +1,6 @@
+# Large media binaries — kept on disk, not committed (avoids ~224 MB of git bloat).
+# See README.md. Use Git LFS if you want these versioned.
+*.exe
+*.dll
+!README.md
+!.gitignore

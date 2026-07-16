@@ -89,7 +89,7 @@ class _Section(QFrame):
 
         head = QLabel(title.upper())
         head.setStyleSheet(
-            "color: #6a9eff; font-size: 10px; font-weight: 700;"
+            "color: #5a9bff; font-size: 10px; font-weight: 700;"
             "letter-spacing: 1.2px; padding: 4px 0 4px 0;"
         )
         self._layout.addWidget(head)

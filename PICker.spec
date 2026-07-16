@@ -2,22 +2,32 @@
 
 # Single source of truth for the version string
 import os, sys
-sys.path.insert(0, os.path.abspath(os.path.dirname(SPEC if 'SPEC' in dir() else '.')))
+_root = os.path.abspath(os.path.dirname(SPEC if 'SPEC' in dir() else '.'))
+_src = os.path.join(_root, 'src')
+sys.path.insert(0, _src)
 from picker import __version__ as APP_VERSION
 
-# Bundle ffmpeg.exe / ffprobe.exe alongside the EXE if they sit next to this
-# spec file. Distributing them is optional — the app degrades gracefully when
-# missing (no video thumbnails, no codec info), so we don't fail the build.
-_root = os.path.abspath(os.path.dirname(SPEC if 'SPEC' in dir() else '.'))
+# Bundle the whole bin/ folder (ffmpeg + ffprobe + their av*/sw* DLLs) into a
+# "bin" subfolder of the app so video thumbnails / metadata work in the packaged
+# build. The exes are dynamically linked, so the DLLs must ship alongside them.
+# Missing bin/ → skipped; the app still runs (video features degrade gracefully).
 _extra_binaries = []
-for _name in ('ffmpeg.exe', 'ffprobe.exe'):
-    _p = os.path.join(_root, _name)
-    if os.path.isfile(_p):
-        _extra_binaries.append((_p, '.'))
+_bin_dir = os.path.join(_root, 'bin')
+if os.path.isdir(_bin_dir):
+    for _f in sorted(os.listdir(_bin_dir)):
+        _p = os.path.join(_bin_dir, _f)
+        if os.path.isfile(_p) and _f.lower().endswith(('.exe', '.dll')):
+            _extra_binaries.append((_p, 'bin'))
+
+# Optional assets — tolerate their absence so the spec still builds.
+_ver_file = os.path.join(_src, 'version_info.txt')
+_version = _ver_file if os.path.isfile(_ver_file) else None
+_icon_file = os.path.join(_root, 'icon.ico')
+_icon = _icon_file if os.path.isfile(_icon_file) else None
 
 a = Analysis(
-    ['main.py'],
-    pathex=[],
+    [os.path.join(_src, 'main.py')],
+    pathex=[_src],
     binaries=_extra_binaries,
     datas=[],
     hiddenimports=[
@@ -97,7 +107,7 @@ exe = EXE(
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
-    upx_exclude=['vcruntime140.dll', 'python3*.dll', 'Qt6Core.dll', 'Qt6Gui.dll', 'Qt6Widgets.dll'],
+    upx_exclude=['vcruntime140.dll', 'python3*.dll', 'Qt6Core.dll', 'Qt6Gui.dll', 'Qt6Widgets.dll', 'ffmpeg.exe', 'ffprobe.exe', 'av*.dll', 'sw*.dll'],
     runtime_tmpdir=None,
     console=False,
     disable_windowed_traceback=False,
@@ -105,6 +115,6 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['E:\\Proj\\Self\\Picker\\icon.ico'],
-    version='version_info.txt',
+    icon=_icon,
+    version=_version,
 )

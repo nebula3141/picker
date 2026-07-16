@@ -92,8 +92,8 @@ class LoadingScreen(QDialog):
         p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
 
         # Card background
-        p.fillRect(self.rect(), QColor(18, 18, 18))
-        p.setPen(QPen(QColor(42, 130, 218), 2))
+        p.fillRect(self.rect(), QColor(21, 21, 24))
+        p.setPen(QPen(QColor(59, 130, 246), 2))
         p.setBrush(Qt.BrushStyle.NoBrush)
         p.drawRoundedRect(1, 1, self.width() - 2, self.height() - 2, 12, 12)
 
@@ -132,7 +132,7 @@ class LoadingScreen(QDialog):
             f.setPointSize(8)
             f.setBold(True)
             p.setFont(f)
-            p.setPen(QColor(106, 158, 255))
+            p.setPen(QColor(90, 155, 255))
             p.drawText(QRect(0, row_y + self.LOGO_SIZE + 34, self.width(), 14),
                        Qt.AlignmentFlag.AlignCenter, f"VERSION {self._version}")
 
@@ -142,7 +142,7 @@ class LoadingScreen(QDialog):
         cx = self.width() // 2
         p.setPen(QPen(QColor(55, 55, 55), 3))
         p.drawEllipse(cx - r, spinner_cy - r, 2 * r, 2 * r)
-        p.setPen(QPen(QColor(42, 130, 218), 3, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        p.setPen(QPen(QColor(59, 130, 246), 3, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
         p.drawArc(cx - r, spinner_cy - r, 2 * r, 2 * r, -self._angle * 16, 100 * 16)
 
         # Sub text
@@ -163,7 +163,7 @@ class LoadingScreen(QDialog):
         p.setBrush(QColor(40, 40, 40))
         p.drawRoundedRect(bx, by, bar_w, bar_h, 3, 3)
 
-        p.setBrush(QColor(42, 130, 218))
+        p.setBrush(QColor(59, 130, 246))
         if self._progress < 0:
             seg_w = bar_w // 3
             span = bar_w + seg_w

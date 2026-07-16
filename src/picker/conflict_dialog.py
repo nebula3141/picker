@@ -9,27 +9,14 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QSize
 from PyQt6.QtGui import QPixmap, QImageReader
 
+from . import theme as theme_mod
 
-DIALOG_QSS = """
-QDialog { background: #1a1a1a; }
-QLabel { color: #e5e5e5; }
-QLabel#title { color: #fff; font-size: 16px; font-weight: 700; }
-QLabel#subtitle { color: #9ca3af; font-size: 11px; }
-QLabel#caption { color: #bbb; font-size: 12px; font-weight: 600; }
-QLabel#meta { color: #6b7280; font-size: 11px; }
-QLabel#preview { background: #0d0d0d; border: 1px solid #2a2a2a; border-radius: 6px; }
-QPushButton {
-    background: #2a2a2a; color: #e5e5e5;
-    border: 1px solid #3a3a3a; border-radius: 6px;
-    padding: 8px 16px;
-}
-QPushButton:hover { background: #353535; border-color: #505050; }
-QPushButton#primary {
-    background: #2a82da; color: white; border: 1px solid #2a82da; font-weight: 600;
-}
-QPushButton#primary:hover { background: #3a92ea; }
-QPushButton#danger { background: #c0392b; border: 1px solid #c0392b; color: white; }
-QPushButton#danger:hover { background: #d44638; }
+
+# Only the rules unique to this dialog; the base comes from theme.dialog_qss().
+_EXTRA_QSS = """
+QLabel#caption { color: #cfcfd6; font-size: 12px; font-weight: 600; }
+QLabel#meta { color: #6f6f78; font-size: 11px; }
+QLabel#preview { background: #0d0d0f; border: 1px solid #26262c; border-radius: 10px; }
 """
 
 
@@ -40,7 +27,7 @@ class ConflictDialog(QDialog):
         super().__init__(parent)
         self._choice = "cancel"
         self.setWindowTitle("File already exists")
-        self.setStyleSheet(DIALOG_QSS)
+        self.setStyleSheet(theme_mod.dialog_qss() + _EXTRA_QSS)
         self.setModal(True)
         self.setMinimumWidth(780)
         self._build(src_path, dest_path)

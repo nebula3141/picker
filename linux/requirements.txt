@@ -1,0 +1,17 @@
+# PICker — Python dependencies (Linux)
+# Install into a virtualenv:  pip install -r requirements.txt
+# System packages (Qt libs, ffmpeg, gstreamer) are installed via apt — see README.md.
+
+# ── Hard requirements (app won't start without these) ─────────────────────────
+PyQt6>=6.5,<7            # GUI toolkit. The wheel bundles Qt6 (Widgets/Gui/Core/
+                         # Network/Multimedia). Needs system Qt runtime libs via apt.
+Pillow>=10.0             # EXIF reading
+numpy>=1.24              # image arrays, histogram, focus peaking
+
+# ── Soft requirement (RAW decode disabled gracefully if missing) ──────────────
+rawpy>=0.18              # RAW decode via LibRaw. Linux wheels bundle LibRaw, so no
+                         # apt package is normally required.
+
+# ── NOT pip packages — install via apt (see README.md) ───────────────────────
+#   ffmpeg / ffprobe   → video thumbnails + video metadata   (apt install ffmpeg)
+#   GStreamer plugins  → in-app video PLAYBACK                (apt install gstreamer1.0-*)

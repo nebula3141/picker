@@ -705,7 +705,7 @@ class ImageCanvas(QWidget):
             p.setBrush(Qt.BrushStyle.NoBrush)
             p.drawEllipse(sx, sy, 16, 16)
             angle = int((self._clip_pulse_phase / (2 * math.pi)) * 360)
-            p.setPen(QPen(QColor(42, 130, 218), 2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            p.setPen(QPen(QColor(59, 130, 246), 2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
             p.drawArc(sx, sy, 16, 16, -angle * 16, 90 * 16)
             # Text
             p.setPen(QColor(230, 230, 230))
@@ -1007,7 +1007,7 @@ class ToastWidget(QWidget):
 
         self._action_btn = QLabel()
         self._action_btn.setStyleSheet(
-            "color: #6aa0ff; font-size: 13px; font-weight: 700;"
+            "color: #5a9bff; font-size: 13px; font-weight: 700;"
             " background: rgba(255,255,255,0.08); border-radius: 4px;"
             " padding: 4px 12px;"
         )
@@ -1474,9 +1474,9 @@ class FilmstripBar(QWidget):
             inset = 1
             p.drawRect(rect.adjusted(inset, inset, -inset, -inset))
 
-        # Highlight current
+        # Highlight current — accent ring reads more modern than a plain white box.
         if is_current:
-            pen = QPen(QColor(255, 255, 255), self.CURRENT_BORDER)
+            pen = QPen(theme_mod.c("accent"), self.CURRENT_BORDER)
             p.setPen(pen)
             inset = self.CURRENT_BORDER // 2
             p.drawRect(rect.adjusted(inset, inset, -inset, -inset))
@@ -1757,7 +1757,7 @@ class SlideshowView(QWidget):
         self._scan_progress.setTextVisible(False)
         self._scan_progress.setStyleSheet(
             "QProgressBar { background: transparent; border: 0; }"
-            "QProgressBar::chunk { background: #2a82da; }"
+            "QProgressBar::chunk { background: #3b82f6; }"
         )
         self._scan_progress.setRange(0, 0)
         self._scan_progress.setVisible(self._filmstrip_deferred)
@@ -1808,8 +1808,9 @@ class SlideshowView(QWidget):
         fg = theme_mod.c("hint_bar_fg")
         self._title.setStyleSheet(
             f"background: {bg}; color: {fg};"
-            f" padding: 7px 12px; font-size: 13px; font-weight: 600;"
-            f" letter-spacing: 0.3px;"
+            f" padding: 9px 14px; font-size: 13px; font-weight: 600;"
+            f" letter-spacing: 0.2px;"
+            f" border-bottom: 1px solid rgba(255,255,255,0.06);"
         )
 
     def _apply_status_qss(self):
@@ -2252,7 +2253,7 @@ class SlideshowView(QWidget):
         title_html = f'{rec.filename}'
         if _is_video(rec.path):
             title_html = (
-                '<span style="background:#2a82da; color:#fff; font-size:9px;'
+                '<span style="background:#3b82f6; color:#fff; font-size:9px;'
                 ' font-weight:700; padding:2px 7px; border-radius:3px;'
                 ' letter-spacing:1px;">VIDEO</span>&nbsp;&nbsp;'
                 + title_html

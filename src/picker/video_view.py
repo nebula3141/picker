@@ -164,7 +164,7 @@ class VideoView(QWidget):
                 min-width: 38px;
             }
             QPushButton:hover { background: #353535; border-color: #4a4a4a; }
-            QPushButton:checked { background: #2a6ab5; border-color: #3a82da; }
+            QPushButton:checked { background: #2f6fe0; border-color: #3b82f6; }
             QPushButton:disabled { color: #666; background: #1f1f1f; }
             QLabel { color: #d0d0d0; font-size: 12px; }
             QComboBox {
@@ -176,7 +176,7 @@ class VideoView(QWidget):
             QSlider::groove:horizontal {
                 height: 6px; background: #2a2a2a; border-radius: 3px;
             }
-            QSlider::sub-page:horizontal { background: #3a82da; border-radius: 3px; }
+            QSlider::sub-page:horizontal { background: #3b82f6; border-radius: 3px; }
             QSlider::handle:horizontal {
                 background: #ffffff; width: 12px; margin: -4px 0;
                 border-radius: 6px;

@@ -36,14 +36,14 @@ class _RootCard(QFrame):
         self.setObjectName("rootCard")
         self.setStyleSheet("""
             QFrame#rootCard {
-                background: #1a1a1a;
-                border: 1px solid #262626;
-                border-radius: 10px;
+                background: #17171a;
+                border: 1px solid #26262c;
+                border-radius: 14px;
             }
-            QFrame#rootCard:hover { border-color: #3a82da; }
-            QLabel#cover { background: #0b0b0b; border-top-left-radius: 10px; border-top-right-radius: 10px; }
-            QLabel#label { font-size: 14px; font-weight: 600; color: #eaeaea; }
-            QLabel#meta  { color: #8a8a8a; font-size: 11px; }
+            QFrame#rootCard:hover { border-color: #3b82f6; background: #1b1b20; }
+            QLabel#cover { background: #0d0d0f; border-top-left-radius: 14px; border-top-right-radius: 14px; }
+            QLabel#label { font-size: 14px; font-weight: 600; color: #eaeaef; }
+            QLabel#meta  { color: #8a8a93; font-size: 11px; }
         """)
 
         root_layout = QVBoxLayout(self)
@@ -131,11 +131,11 @@ class _RecentTile(QPushButton):
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setStyleSheet("""
             QPushButton {
-                background: #1a1a1a; color: #d0d0d0;
-                border: 1px solid #262626; border-radius: 14px;
+                background: #17171a; color: #cfcfd6;
+                border: 1px solid #26262c; border-radius: 14px;
                 padding: 6px 14px; font-size: 11px;
             }
-            QPushButton:hover { border-color: #3a82da; color: #fff; }
+            QPushButton:hover { border-color: #3b82f6; color: #fff; background: #1b1b20; }
         """)
 
 
@@ -149,22 +149,23 @@ class LibraryView(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setStyleSheet("""
-            QWidget { background: #0f0f0f; color: #eaeaea; }
-            QLabel#title    { font-size: 28px; font-weight: 700; color: #fff; }
-            QLabel#subtitle { color: #8a8a8a; font-size: 12px; }
-            QLabel#section  { font-size: 11px; font-weight: 700; color: #6a6a6a;
-                              text-transform: uppercase; letter-spacing: 1px; }
+            QWidget { background: #0b0b0d; color: #eaeaef; }
+            QLabel#title    { font-size: 28px; font-weight: 700; color: #fff; letter-spacing: -0.5px; }
+            QLabel#subtitle { color: #8a8a93; font-size: 12px; }
+            QLabel#section  { font-size: 11px; font-weight: 700; color: #6f6f78;
+                              text-transform: uppercase; letter-spacing: 1.2px; }
             QPushButton#primary {
-                background: #2a82da; color: #fff; border: 0;
-                border-radius: 4px; padding: 8px 18px; font-weight: 600;
+                background: #3b82f6; color: #fff; border: 0;
+                border-radius: 9px; padding: 9px 20px; font-weight: 600;
             }
-            QPushButton#primary:hover { background: #3b93eb; }
+            QPushButton#primary:hover { background: #5a9bff; }
+            QPushButton#primary:pressed { background: #2f6fe0; }
             QPushButton#ghost {
-                background: transparent; color: #c0c0c0; border: 1px solid #2a2a2a;
-                border-radius: 4px; padding: 8px 14px;
+                background: transparent; color: #c8c8d0; border: 1px solid #2a2a30;
+                border-radius: 9px; padding: 9px 16px;
             }
-            QPushButton#ghost:hover { border-color: #3a3a3a; color: #fff; }
-            QScrollArea { background: #0f0f0f; border: 0; }
+            QPushButton#ghost:hover { border-color: #45454f; color: #fff; background: #16161a; }
+            QScrollArea { background: #0b0b0d; border: 0; }
         """)
 
         outer = QVBoxLayout(self)

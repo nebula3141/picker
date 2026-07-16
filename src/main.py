@@ -486,8 +486,12 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"PICker {__version__}")
         if self._opened_from_explorer:
             self._opened_from_explorer = False
-            self.close()
-            return
+            # Configurable: on Esc from an Explorer-opened photo, either quit
+            # (one-shot viewer) or drop into the folder's mosaic to keep browsing.
+            if (settings_mod.get("explorer_escape_action") or "mosaic") == "close":
+                self.close()
+                return
+            # else fall through → _show_album_browser() below (mosaic)
         if self._current_folder is not None and self._source_folder is not None:
             self._show_album_browser()
         else:
@@ -986,7 +990,7 @@ class MainWindow(QMainWindow):
         box.setText(
             "<div style='text-align:center;'>"
             "<h2 style='margin:0;'>PICker</h2>"
-            f"<p style='color:#6a9eff; margin:2px 0 8px 0; font-size:11px; letter-spacing:1px;'>"
+            f"<p style='color:#5a9bff; margin:2px 0 8px 0; font-size:11px; letter-spacing:1px;'>"
             f"VERSION {__version__}</p>"
             "<p style='color:#aaa; margin:4px 0 14px 0;'>"
             "capturing moments, minus the noise."

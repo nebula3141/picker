@@ -7,11 +7,21 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(SPEC if 'SPEC' i
 from picker import __version__ as APP_VERSION
 
 _root = os.path.abspath(os.path.dirname(SPEC if 'SPEC' in dir() else '.'))
+
+# Bundle the whole bin/ folder (ffmpeg + ffprobe + their av*/sw* DLLs) into a
+# "bin" subfolder so video works in the packaged app. The exes are dynamically
+# linked, so their DLLs must ship alongside. Missing bin/ → skipped.
 _extra_binaries = []
-for _name in ('ffmpeg.exe', 'ffprobe.exe'):
-    _p = os.path.join(_root, _name)
-    if os.path.isfile(_p):
-        _extra_binaries.append((_p, '.'))
+_bin_dir = os.path.join(_root, 'bin')
+if os.path.isdir(_bin_dir):
+    for _f in sorted(os.listdir(_bin_dir)):
+        _p = os.path.join(_bin_dir, _f)
+        if os.path.isfile(_p) and _f.lower().endswith(('.exe', '.dll')):
+            _extra_binaries.append((_p, 'bin'))
+
+# Optional version resource — tolerate its absence so the spec still builds.
+_ver_file = os.path.join(_root, 'src', 'version_info.txt')
+_version = _ver_file if os.path.isfile(_ver_file) else None
 
 a = Analysis(
     [os.path.join(_root, 'src', 'main.py')],
@@ -92,7 +102,7 @@ exe = EXE(
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
-    upx_exclude=['vcruntime140.dll', 'python3*.dll', 'Qt6Core.dll', 'Qt6Gui.dll', 'Qt6Widgets.dll'],
+    upx_exclude=['vcruntime140.dll', 'python3*.dll', 'Qt6Core.dll', 'Qt6Gui.dll', 'Qt6Widgets.dll', 'ffmpeg.exe', 'ffprobe.exe', 'av*.dll', 'sw*.dll'],
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
@@ -100,7 +110,7 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon=[os.path.join(_root, 'icon.ico')],
-    version=os.path.join(_root, 'src', 'version_info.txt'),
+    version=_version,
 )
 
 coll = COLLECT(
@@ -109,6 +119,6 @@ coll = COLLECT(
     a.datas,
     strip=False,
     upx=True,
-    upx_exclude=['vcruntime140.dll', 'python3*.dll', 'Qt6Core.dll', 'Qt6Gui.dll', 'Qt6Widgets.dll'],
+    upx_exclude=['vcruntime140.dll', 'python3*.dll', 'Qt6Core.dll', 'Qt6Gui.dll', 'Qt6Widgets.dll', 'ffmpeg.exe', 'ffprobe.exe', 'av*.dll', 'sw*.dll'],
     name=f'PICker-{APP_VERSION}',
 )

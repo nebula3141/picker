@@ -8,30 +8,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt
 
 from . import settings as settings_mod
-
-
-DIALOG_QSS = """
-QDialog { background: #141414; }
-QLabel { color: #d4d4d4; font-size: 13px; }
-QLabel#title { color: #fff; font-size: 16px; font-weight: 700; }
-QLabel#hint  { color: #6b7280; font-size: 11px; }
-QRadioButton { color: #e5e5e5; font-size: 13px; padding: 4px 0; spacing: 10px; }
-QRadioButton::indicator { width: 14px; height: 14px; }
-QCheckBox { color: #c0c0c0; font-size: 12px; spacing: 8px; }
-QCheckBox::indicator { width: 14px; height: 14px; border-radius: 3px; border: 1px solid #3a3a3a; background: #0f0f0f; }
-QCheckBox::indicator:checked { background: #2a82da; border-color: #2a82da; }
-QFrame#divider { background: #262626; max-height: 1px; }
-QPushButton {
-    background: #262626; color: #e5e5e5; border: 1px solid #353535;
-    border-radius: 6px; padding: 7px 16px; font-size: 12px;
-}
-QPushButton:hover { background: #2f2f2f; border-color: #4a4a4a; }
-QPushButton#primary {
-    background: #2a82da; border: 1px solid #2a82da; color: white;
-    font-weight: 600; padding: 8px 22px;
-}
-QPushButton#primary:hover { background: #3a92ea; }
-"""
+from . import theme as theme_mod
 
 
 class SaveModeDialog(QDialog):
@@ -42,7 +19,7 @@ class SaveModeDialog(QDialog):
         self._source = Path(source_path)
         self._choice: str | None = None
         self.setWindowTitle("Save changes")
-        self.setStyleSheet(DIALOG_QSS)
+        self.setStyleSheet(theme_mod.dialog_qss())
         self.setModal(True)
         self.setMinimumWidth(460)
         self._build()

@@ -1,5 +1,34 @@
 # Changelog
 
+## Unreleased
+
+### Modern UI
+- App-wide visual refresh: new accent (#3b82f6), deeper neutral dark palette, modern rounded
+  menus + right-click menus, restyled menu bar / status bar / tooltips / scrollbars
+- All dialogs (Settings, Sort Photos, Conflict, Save) unified on one shared modern stylesheet —
+  rounded cards, roomier spacing, accent focus rings, modern toggles
+- Slideshow chrome: cleaner title bar, accent filmstrip ring; library cards, loading screen and
+  empty states refreshed
+
+### Linux support
+- Cross-platform launcher (`linux/launch.py`) — detects the OS on boot, writes a platform flag
+  in the launching directory, and disables Windows-only integrations off-Windows
+- `linux/` folder with apt setup, pip requirements, helper scripts and a full guide
+- Settings hides Windows-only "System Integration" on other platforms (`picker/sysfeatures.py`)
+
+### Behavior
+- New setting: **Esc on a photo opened from Explorer** → open the folder mosaic (default) or
+  close PICker (the old behavior)
+
+### Build
+- `bin/` folder holds ffmpeg/ffprobe + their DLLs; both PyInstaller specs bundle it so packaged
+  builds have working video thumbnails/metadata; UPX excludes the codec DLLs
+- Specs now build from the repo's `src/` layout with no hardcoded paths
+
+### Docs
+- `APPLICATION.md` — the complete feature specification
+- CI workflow (Windows + Linux), CONTRIBUTING.md, issue templates
+
 ## v4.7.0 (2026-06-09)
 
 ### Right-Click Menus
