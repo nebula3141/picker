@@ -45,3 +45,6 @@ venv/
 
 # Release staging
 dist_multi/
+
+# Build logs
+*.log
