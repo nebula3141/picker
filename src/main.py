@@ -130,7 +130,45 @@ class MainWindow(QMainWindow):
         elif not skip_library:
             self._show_library_view()
 
-        self.showMaximized()
+        self._restore_window_geometry()
+
+    def _restore_window_geometry(self):
+        """Restore last window size/position, then SHOW the window.
+
+        restoreGeometry() only sets geometry — it never shows — so the window
+        must be shown explicitly or the app starts up invisible. We also verify
+        the restored frame actually lands on a connected screen (a saved
+        position from an unplugged monitor would otherwise be off-screen)."""
+        from PyQt6.QtCore import QByteArray
+        geo = settings_mod.get("window_geometry") or ""
+        restored = False
+        if geo:
+            try:
+                restored = self.restoreGeometry(QByteArray.fromHex(geo.encode("ascii")))
+            except Exception:
+                restored = False
+        if restored and not self._geometry_on_screen():
+            restored = False
+        if restored:
+            self.show()
+        else:
+            self.showMaximized()
+
+    def _geometry_on_screen(self) -> bool:
+        """True if the window's frame intersects some available screen area."""
+        try:
+            app = QApplication.instance()
+            frame = self.frameGeometry()
+            return any(s.availableGeometry().intersects(frame) for s in app.screens())
+        except Exception:
+            return True
+
+    def _save_window_geometry(self):
+        try:
+            geo = bytes(self.saveGeometry().toHex()).decode("ascii")
+            settings_mod.set_value("window_geometry", geo)
+        except Exception:
+            pass
 
     _opened_from_explorer = False
 
@@ -1012,11 +1050,19 @@ class MainWindow(QMainWindow):
     def keyPressEvent(self, event):
         key = event.key()
         mods = event.modifiers()
+        ctrl = bool(mods & Qt.KeyboardModifier.ControlModifier)
         if key == Qt.Key.Key_F11:
             self._toggle_fullscreen()
+        elif ctrl and key == Qt.Key.Key_F:
+            if self._album_browser is not None and self._slideshow is None:
+                self._album_browser.focus_search()
         elif key == Qt.Key.Key_Question or (key == Qt.Key.Key_Slash and mods & Qt.KeyboardModifier.ShiftModifier):
             self._show_shortcuts()
         elif key == Qt.Key.Key_Escape:
+            # An active search is the innermost thing Esc should undo.
+            if (self._album_browser is not None and self._slideshow is None
+                    and self._album_browser.clear_search()):
+                return
             # In gallery (album opened), ESC returns to album browser.
             # Slideshow handles its own ESC; album browser routes ESC → library.
             if self._gallery is not None and self._slideshow is None and self._current_folder is not None:
@@ -1029,6 +1075,19 @@ class MainWindow(QMainWindow):
             super().keyPressEvent(event)
 
     def closeEvent(self, event):
+        # Only confirm when there's still work in flight (a big folder mid-scan) —
+        # a quit prompt on an idle app is just friction.
+        mgr = self._manager
+        if mgr is not None and hasattr(mgr, "scan_complete") and not mgr.scan_complete:
+            reply = QMessageBox.question(
+                self, "Quit PICker",
+                "PICker is still loading this folder. Quit anyway?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if reply != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
+        self._save_window_geometry()
         if self._gallery:
             self._gallery.cleanup()
         if self._album_browser:

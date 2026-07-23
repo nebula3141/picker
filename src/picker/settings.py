@@ -58,7 +58,7 @@ DEFAULTS = {
     # ── Source scan
     "include_subfolders": True,
     "exclude_hidden": True,
-    "file_types": ["jpeg", "png", "tiff", "webp", "bmp", "raw"],
+    "file_types": ["jpeg", "png", "tiff", "webp", "bmp", "svg", "raw"],
     "include_videos": True,              # show .mp4/.mov/etc alongside images
 
     # ── Appearance
@@ -76,7 +76,11 @@ DEFAULTS = {
     "auto_scan_on_launch": False,        # rescan only when user clicks Rescan; folders cached in-memory after first visit
     "scan_recursive": True,              # walk subfolders under each root
     "last_folder": "",                   # remember last viewed folder in gallery
+    "window_geometry": "",               # hex-encoded QMainWindow.saveGeometry() — restored on launch
     "recent_target_folders": [],         # last ≤3 move/copy destinations (album view right-click)
+    "send_locations": [],                # [{name,path,action:"move"|"copy"}] — viewer "Selection" targets
+    "confirm_delete": True,              # ask before sending a file to the Recycle Bin
+    "send_feedback": True,               # subtle accent flash on move/copy/send
     "group_by": "flat",                  # "flat"|"date"|"folder"|"camera"
     "date_group_granularity": "day",     # "year"|"month"|"day"
     "sort_order": "date_taken",          # filename|date_taken|mtime|size|rating|random

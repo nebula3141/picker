@@ -5,11 +5,15 @@ scans. Supports indeterminate (pulsing segment) and determinate (0..1 fill)
 modes via set_progress()."""
 import time
 
-from PyQt6.QtWidgets import QDialog, QApplication
+from PyQt6.QtWidgets import QDialog, QApplication, QPushButton
 from PyQt6.QtCore import Qt, QTimer, QRect, QSize
 from PyQt6.QtGui import QPainter, QColor, QFont, QPen, QFontMetrics
 
 from picker.icon import app_icon
+
+
+class ScanCancelled(Exception):
+    """Raised out of a scan's progress callback when the user hits Cancel."""
 
 
 class LoadingScreen(QDialog):
@@ -17,7 +21,8 @@ class LoadingScreen(QDialog):
     HEIGHT = 260
     LOGO_SIZE = 48
 
-    def __init__(self, title: str = "PICker", sub: str = "Loading…", parent=None):
+    def __init__(self, title: str = "PICker", sub: str = "Loading…", parent=None,
+                 cancellable: bool = False):
         super().__init__(
             parent,
             Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint,
@@ -44,7 +49,35 @@ class LoadingScreen(QDialog):
         self._timer.start()
         self._shown_at = time.perf_counter()
 
+        # Escape hatch for long scans — the caller checks `cancelled` in its
+        # progress callback and aborts.
+        self._cancelled = False
+        self._cancel_btn = None
+        if cancellable:
+            self._cancel_btn = QPushButton("Cancel", self)
+            self._cancel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            self._cancel_btn.setStyleSheet(
+                "QPushButton { background:#1f1f25; color:#cfcfd6;"
+                " border:1px solid #2a2a30; border-radius:8px;"
+                " padding:6px 16px; font-size:12px; }"
+                "QPushButton:hover { border-color:#ef6b6b; color:#fff; }"
+            )
+            self._cancel_btn.adjustSize()
+            self._cancel_btn.move(self.WIDTH - self._cancel_btn.width() - 22,
+                                  self.HEIGHT - self._cancel_btn.height() - 16)
+            self._cancel_btn.clicked.connect(self._on_cancel)
+
         self._center_on_screen()
+
+    def _on_cancel(self):
+        self._cancelled = True
+        if self._cancel_btn:
+            self._cancel_btn.setEnabled(False)
+            self._cancel_btn.setText("Cancelling…")
+
+    @property
+    def cancelled(self) -> bool:
+        return self._cancelled
 
     def _center_on_screen(self):
         scr = QApplication.primaryScreen().availableGeometry()

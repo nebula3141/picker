@@ -26,7 +26,8 @@ bin, taskbar integration), but nothing is conceptually Windows-only except those
 
 ## 2. Supported media
 
-- **Images:** JPEG, PNG, TIFF, BMP, WEBP.
+- **Images:** JPEG, PNG, TIFF, BMP, WEBP, **SVG/SVGZ** (vector — rendered crisp at screen
+  resolution; a destructive edit on one writes a PNG sibling).
 - **RAW:** Canon CR2/CR3, Nikon NEF, Sony ARW, Adobe DNG, Fuji RAF, Olympus ORF, Panasonic
   RW2, Pentax PEF, Samsung SRW.
 - **Video:** MP4, M4V, MOV, MKV, WEBM, AVI, MTS, M2TS, WMV, 3GP, OGV.
@@ -64,7 +65,15 @@ Browse into a folder tree. Shows:
 - An **Images** section: the images directly in the current folder, laid out as a
   **justified mosaic** (variable-width tiles that keep their real aspect ratio, packed into
   centered rows).
-- A clickable **breadcrumb** path, an item count, and a **Rescan** button.
+- A clickable **breadcrumb** path, a labelled **"‹ Back"** button, an item count, and a
+  **Rescan** button.
+- A **search box** (`Ctrl+F`; `Esc` clears) with a **scope toggle**:
+  - *This folder* — filters the current folder by filename live as you type.
+  - *Whole library* — pressing Enter searches every indexed photo and shows the matches.
+  The header switches to a result count, and folders are hidden while searching.
+- A **bulk-action bar** appears whenever tiles are selected: it shows how many are selected
+  and offers **Move to… / Copy to… / Delete / Clear**.
+- Long scans show progress with a **Cancel** button.
 - Hidden/system folders and the app's own cache folders are skipped.
 
 ### 3.3 Gallery
@@ -139,12 +148,22 @@ releases the file when leaving so the file can be moved/renamed/deleted.)
   to the "active" destination; a key cycles the active destination; and there's **undo**.
 - After sending, the viewer can auto-advance to the next unreviewed image.
 - A status bar shows counts: current status, selected, remaining.
-- **Move/Copy to recent folders**: right-click menus offer the last few destination folders
-  plus "Choose Folder…". Recent destinations are remembered.
+- **Selection locations** (the other half of the workflow): the viewer's right-click menu has
+  a single **Selection** submenu listing folders you've saved. Each entry shows its name, its
+  action (Copy or Move) and its shortcut; clicking it sends the current photo there
+  **instantly** — no confirmation, just a toast with one-tap **Undo**. An **✕** on the row
+  removes it. Two entries at the bottom, **"Copy to a new folder…"** and **"Move to a new
+  folder…"**, choose the method inline and then the folder, and remember it as a new location.
+  Up to 9 locations; the first is on **Ctrl+Space** and each is on **Ctrl+1…Ctrl+9**.
+- The current **mode and active target** are always visible in the viewer's status bar
+  (e.g. `Copy → Best`).
 - **Filename conflicts** on send/move/copy are handled by a configurable policy: ask, keep
   both (rename), replace, or skip. "Ask" shows a side-by-side comparison (existing vs
   incoming, with previews and file metadata) so the user can choose.
-- **Delete** sends the file to the OS Recycle Bin (recoverable), not a permanent delete.
+- **Delete** sends the file to the OS Recycle Bin (recoverable), not a permanent delete. An
+  **"ask before deleting"** setting (on by default) controls whether it confirms first.
+- Destinations can be **reordered by dragging** their grip in the Sort Photos dialog — the
+  order is what the 1 / 2 / 3 keys map to — and renamed inline.
 - Move operations are remembered so they can be recovered even after restarting the app.
 - Read-only / locked files are handled gracefully (cleared and retried, with a clear error
   if it still fails).
@@ -157,11 +176,13 @@ releases the file when leaving so the file can be moved/renamed/deleted.)
 - **Rotate** → 90° clockwise · 90° counter-clockwise · 180° · reset.
   (In the mosaic, where there's no live preview, rotate writes to disk immediately using the
   configured save mode; selecting multiple images rotates them all.)
-- **Move to** / **Copy to** → recent destination folders + "Choose Folder…".
+- **Selection** → your saved send locations (click to send instantly, ✕ to remove) plus
+  "Copy/Move to a new folder…". This replaces the old "Move to" / "Copy to" submenus.
 - **Copy Path**, **Reveal in file manager**.
 - In the mosaic: **Open in Slideshow**, **Select All / Clear Selection**.
 - **Delete (Recycle Bin)**.
 - Acts on the whole selection when multiple images are selected.
+- Rows show their **keyboard shortcut**, so the menu teaches the keys as you use it.
 
 ---
 
@@ -243,7 +264,10 @@ releases the file when leaving so the file can be moved/renamed/deleted.)
 - Auto-advance to next unreviewed after a send.
 - Show filmstrip.
 - Animate transitions (cross-fades, view transitions).
+- Ask before deleting (off = straight to the Recycle Bin, no dialog).
+- Flash a subtle accent glow when you send / move / copy.
 - Filename-conflict policy (ask / keep both / replace / skip).
+- What `Esc` does on a photo opened from the file manager: open the folder mosaic, or quit.
 
 **Editing**
 - Save mode for edits (ask / always new file / always overwrite).
@@ -325,7 +349,9 @@ All local and disposable:
 - User **settings**.
 - **Library** definition: folders (with labels/covers), pinned folders, recent folders.
 - **Recent source folders** (for the open dialog).
-- Per-folder **last-viewed position** (so reopening a folder returns to where you were).
+- **Selection locations** (saved send targets with their copy/move action).
+- Per-folder **last-viewed position** (so reopening a folder returns to where you were), and
+  the **window size/position**.
 - The **metadata index** of all library files.
 - A **move journal** (recoverable moves).
 - **Update-check** timestamp.
@@ -351,6 +377,12 @@ All local and disposable:
 
 **Slideshow — sorting (when destinations exist)**
 - Send to destination 1/2/3; send to active destination; cycle active destination; undo.
+
+**Slideshow — Selection locations**
+- Send to the first saved location; send to a specific location by number; undo the last send.
+
+**Folder browser**
+- Focus search; clear search; back one level.
 
 **Compare mode**
 - Left/right move the active side; switch active side; swap the two images; zoom active;

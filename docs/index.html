@@ -143,7 +143,7 @@ footer a:hover{color:var(--fg)}
   <h1>Your photos.<br>Lightning fast.</h1>
   <p>A fast, no-nonsense photo viewer and culler for photographers who shoot thousands of files. Opens 60MP RAW instantly — no catalog, no cloud, no waiting.</p>
   <div class="buttons">
-    <a href="https://github.com/nebula3141/picker/releases/download/v4.8.0/PICker-4.8.0-setup.exe" class="btn btn-primary" target="_blank" rel="noopener">
+    <a href="https://github.com/nebula3141/picker/releases/download/v4.9.0/PICker-4.9.0-setup.exe" class="btn btn-primary" target="_blank" rel="noopener">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg>
       Download for Windows
     </a>
@@ -184,7 +184,7 @@ footer a:hover{color:var(--fg)}
     <div class="card">
       <div class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h11"/></svg></div>
       <h3>Sort &amp; cull fast</h3>
-      <p>Send picks to destination folders, move, copy, or recycle — with one-key undo and a full right-click menu everywhere. Tear through a 3,000-image shoot.</p>
+      <p>Save your sorting folders in <b>Selection</b>, then one key files each photo — copy or move, instantly, with one-tap undo. Plus <b>Ctrl+F</b> search across the whole library. Tear through a 3,000-image shoot.</p>
     </div>
 
     <div class="card">
@@ -205,14 +205,15 @@ footer a:hover{color:var(--fg)}
 <section id="whatsnew">
   <div class="features-head">
     <div class="eyebrow">What's new</div>
-    <h2>v4.8.0 — Modern UI &amp; Linux</h2>
+    <h2>v4.9.0 — Selection, Search &amp; a friendlier app</h2>
   </div>
   <ul class="newlist">
-    <li><b>Modern interface</b> — refreshed accent and dark palette, rounded menus and right-click menus everywhere, unified dialogs, fluid transitions.</li>
-    <li><b>Linux support</b> — run from source with a one-shot setup script and a cross-platform launcher; Windows-only integrations switch off automatically.</li>
-    <li><b>Video bundled</b> — ffmpeg and its codecs now ship inside the installer and portable exe, so thumbnails and metadata just work.</li>
-    <li><b>Smarter Escape</b> — Esc on a photo opened from Explorer now drops you into that folder's mosaic to keep browsing (configurable).</li>
-    <li><b>Open project</b> — CI on Windows + Linux, contribution guide, and a complete <a href="https://github.com/nebula3141/picker/blob/master/APPLICATION.md" target="_blank" rel="noopener" style="color:var(--accent)">feature spec</a>.</li>
+    <li><b>Selection</b> — save your sorting folders once, then one click (or <b>Ctrl+Space</b> / <b>Ctrl+1…9</b>) files a photo there, copy or move, instantly — with one-tap Undo. Replaces the old Move&nbsp;to / Copy&nbsp;to menus.</li>
+    <li><b>Search</b> — <b>Ctrl+F</b> filters the current folder as you type, or switch the scope to <i>Whole library</i> and search every indexed photo.</li>
+    <li><b>Friendlier everywhere</b> — shortcuts shown right in the menus, a real Back button, a bulk-action bar for multi-select, plain-language errors, Cancel on long scans, and teaching empty states.</li>
+    <li><b>Drag to reorder destinations</b> — the order sets your 1 / 2 / 3 keys; names stay inline-editable.</li>
+    <li><b>SVG support</b> — view, browse and index <code>.svg</code> / <code>.svgz</code> alongside your photos.</li>
+    <li><b>Reads better</b> — bigger minimum type, roomier panels, focus rings, and your window size is remembered. Full list in the <a href="https://github.com/nebula3141/picker/blob/master/CHANGELOG.md" target="_blank" rel="noopener" style="color:var(--accent)">changelog</a>.</li>
   </ul>
 </section>
 
@@ -221,10 +222,10 @@ footer a:hover{color:var(--fg)}
   <h2>Free, open source, no install required.</h2>
   <p>Grab the installer, or the single portable .exe — drop it anywhere and run.</p>
   <div class="buttons">
-    <a href="https://github.com/nebula3141/picker/releases/download/v4.8.0/PICker-4.8.0-setup.exe" class="btn btn-primary" target="_blank" rel="noopener">Installer (.exe)</a>
-    <a href="https://github.com/nebula3141/picker/releases/download/v4.8.0/PICker-4.8.0.exe" class="btn btn-ghost" target="_blank" rel="noopener">Portable (.exe)</a>
+    <a href="https://github.com/nebula3141/picker/releases/download/v4.9.0/PICker-4.9.0-setup.exe" class="btn btn-primary" target="_blank" rel="noopener">Installer (.exe)</a>
+    <a href="https://github.com/nebula3141/picker/releases/download/v4.9.0/PICker-4.9.0.exe" class="btn btn-ghost" target="_blank" rel="noopener">Portable (.exe)</a>
   </div>
-  <p class="meta">Latest release: v4.8.0 &middot; <a href="https://github.com/nebula3141/picker/releases" target="_blank" rel="noopener" style="color:var(--accent)">all releases &amp; changelog</a></p>
+  <p class="meta">Latest release: v4.9.0 &middot; <a href="https://github.com/nebula3141/picker/releases" target="_blank" rel="noopener" style="color:var(--accent)">all releases &amp; changelog</a></p>
   <div class="linuxbox">
     <div class="linuxbox-title">🐧 On Linux? Run it from source:</div>
     <pre>git clone https://github.com/nebula3141/picker.git
@@ -235,7 +236,7 @@ cd picker/linux &amp;&amp; ./setup.sh &amp;&amp; ./run.sh</pre>
 </section>
 
 <footer>
-  <p>Built by <a href="https://github.com/nebula3141" target="_blank" rel="noopener">nebula3141</a> &middot; PICker v4.8.0 &middot; GPL-3.0 &middot; Python + Qt</p>
+  <p>Built by <a href="https://github.com/nebula3141" target="_blank" rel="noopener">nebula3141</a> &middot; PICker v4.9.0 &middot; GPL-3.0 &middot; Python + Qt</p>
 </footer>
 
 </body>

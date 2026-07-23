@@ -3,7 +3,7 @@ from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton,
     QGroupBox, QFileDialog, QMessageBox, QFrame
 )
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QEvent, pyqtSignal
 
 from . import recent as recent_mod
 from . import settings as settings_mod
@@ -18,13 +18,25 @@ MAX_DESTS = 9
 
 
 class DestinationRow(QFrame):
+    # (row, global_y) while the grip is dragged — the dialog does the reordering.
+    drag_move = pyqtSignal(object, int)
+
     def __init__(self, name: str = "", path: str = "", on_remove=None, parent=None):
         super().__init__(parent)
         self.setObjectName("destRow")
         self._on_remove = on_remove
+        self._dragging = False
         layout = QHBoxLayout(self)
         layout.setContentsMargins(10, 4, 8, 4)
         layout.setSpacing(8)
+
+        self._grip = QLabel("⠿")
+        self._grip.setObjectName("grip")
+        self._grip.setFixedWidth(14)
+        self._grip.setCursor(Qt.CursorShape.OpenHandCursor)
+        self._grip.setToolTip("Drag to reorder — order sets the 1 / 2 / 3 keys")
+        self._grip.installEventFilter(self)
+        layout.addWidget(self._grip)
 
         self._dot = QLabel()
         self._dot.setFixedSize(6, 6)
@@ -57,9 +69,27 @@ class DestinationRow(QFrame):
         self._remove_btn.clicked.connect(self._remove)
         layout.addWidget(self._remove_btn)
 
+    def eventFilter(self, obj, ev):
+        if obj is self._grip:
+            et = ev.type()
+            if et == QEvent.Type.MouseButtonPress:
+                self._dragging = True
+                self._grip.setCursor(Qt.CursorShape.ClosedHandCursor)
+                return True
+            if et == QEvent.Type.MouseMove and self._dragging:
+                self.drag_move.emit(self, ev.globalPosition().toPoint().y())
+                return True
+            if et == QEvent.Type.MouseButtonRelease:
+                self._dragging = False
+                self._grip.setCursor(Qt.CursorShape.OpenHandCursor)
+                return True
+        return super().eventFilter(obj, ev)
+
     def set_accent_index(self, idx: int):
         c = DEST_ACCENTS[idx % len(DEST_ACCENTS)]
         self._dot.setStyleSheet(f"background:{c}; border-radius:3px;")
+        # Order drives the number-key shortcut, so show it.
+        self._grip.setToolTip(f"Drag to reorder — currently key {idx + 1}")
 
     def _browse(self):
         folder = QFileDialog.getExistingDirectory(self, "Select folder")
@@ -93,6 +123,8 @@ QFrame#destRow {
     background: transparent; border: 1px solid transparent; border-radius: 9px;
 }
 QFrame#destRow:hover { background: #1c1c20; border: 1px solid #2a2a30; }
+QLabel#grip { color: #55555f; font-size: 14px; }
+QFrame#destRow:hover QLabel#grip { color: #8a8a93; }
 QPushButton#rowIcon {
     background: transparent; color: #777; border: 1px solid transparent;
     border-radius: 7px; padding: 0; font-size: 15px;
@@ -179,6 +211,9 @@ class StartupDialog(QDialog):
         add_row.setContentsMargins(10, 4, 10, 0)
         add_row.addWidget(self._add_dest_btn)
         add_row.addStretch()
+        hint = QLabel("Drag ⠿ to reorder — order sets the 1 / 2 / 3 keys")
+        hint.setObjectName("hint")
+        add_row.addWidget(hint)
         dest_outer.addLayout(add_row)
 
         self._add_dest_row(name="Best")
@@ -206,10 +241,34 @@ class StartupDialog(QDialog):
         if len(self.dest_rows) >= MAX_DESTS:
             return
         row = DestinationRow(name=name, path=path, on_remove=self._remove_dest_row)
+        row.drag_move.connect(self._on_row_drag)
         self._dest_rows_layout.addWidget(row)
         self.dest_rows.append(row)
         self._refresh_dest_accents()
         self._update_add_btn()
+
+    def _on_row_drag(self, row, global_y: int):
+        """Live-reorder rows as the grip is dragged past neighbours."""
+        if row not in self.dest_rows or len(self.dest_rows) < 2:
+            return
+        cur = self.dest_rows.index(row)
+        target = cur
+        for i, r in enumerate(self.dest_rows):
+            if r is row:
+                continue
+            centre = r.mapToGlobal(r.rect().center()).y()
+            if i < cur and global_y < centre:
+                target = min(target, i)
+            elif i > cur and global_y > centre:
+                target = max(target, i)
+        if target == cur:
+            return
+        self.dest_rows.insert(target, self.dest_rows.pop(cur))
+        for r in self.dest_rows:                 # re-stack in the new order
+            self._dest_rows_layout.removeWidget(r)
+        for r in self.dest_rows:
+            self._dest_rows_layout.addWidget(r)
+        self._refresh_dest_accents()
 
     def _remove_dest_row(self, row: DestinationRow):
         if row not in self.dest_rows:

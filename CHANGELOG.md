@@ -1,5 +1,58 @@
 # Changelog
 
+## v4.9.0 (2026-07-23)
+
+### Search
+- A **search box** in the folder browser (`Ctrl+F`, `Esc` clears) with a **scope toggle**:
+  - **This folder** — instant live filename filter as you type
+  - **Whole library** — press Enter to run a real search across the metadata index
+- Result count in the header ("42 results in library"); a helpful empty state when nothing matches
+
+### Destinations
+- **Drag ⠿ to reorder** sort destinations — the order sets the 1 / 2 / 3 keys, and the colour
+  dots and tooltips update live
+- Names stay inline-editable, so renaming is just typing
+
+### One "Selection" menu instead of Move to / Copy to
+- The right-click menu now has a single **Selection** submenu holding all your saved send
+  locations. The old nested "Move to" / "Copy to" submenus are gone.
+- Each location shows its **name · Copy/Move · shortcut**, sends the photo **instantly** on
+  click (no confirm — a toast with one-tap **Undo**, also `Ctrl+Z`), and has an **✕** to remove it
+- Add as many as you like (up to 9): **"Copy to a new folder…"** / **"Move to a new folder…"**
+  picks the method inline, then the folder — and remembers it
+- Shortcuts: **Ctrl+Space** with a single location, **Ctrl+1…Ctrl+9** with more; listed in the
+  `?` panel
+- The viewer status bar always shows the current **mode + active target** (e.g. `Copy → Best`)
+
+### Easier to learn
+- Context-menu rows display their **keyboard shortcut** (Z, C, H, P, V, I, F, Del, R…)
+- Proper icons for Rotate / Crop / Zoom / Info / Compare / Fullscreen / Histogram — no more
+  borrowed, misleading glyphs
+- Folder browser gets a real **"‹ Back"** button (label + "Back (Esc)" tooltip)
+- **Bulk-action bar** in the mosaic — selecting tiles reveals Move / Copy / Delete / Clear
+- Empty states now teach ("Drop images or a folder in, or press Esc to go back")
+
+### Safer & calmer
+- **Ask before deleting** setting (default on); off = straight to the Recycle Bin, no modal
+- Plain-language errors — no more `WinError 5` / `QImage.save failed` leaking through
+- **Cancel** button on long folder scans
+- Quit only confirms when a folder is still loading
+- Optional subtle accent **flash on send** (settings toggle)
+
+### Readability
+- Bigger minimum type (VIDEO badge, info-panel headings); roomier info panel and shortcut
+  panel; better-spaced status legend
+- Middle-ellipsis for long folder names + full-path tooltips
+- Consistent thousands separators (`1,739 images`)
+- Visible keyboard **focus rings** in dialogs
+- Skeleton tiles use the theme placeholder colour at the correct aspect
+- Window size/position remembered between runs
+
+### SVG support
+- View, browse, thumbnail and index **.svg / .svgz** files (rendered crisp at screen
+  resolution); rotate/crop on an SVG writes a PNG sibling
+- New **SVG** file-type toggle in Settings → Scanning
+
 ## v4.8.0 (2026-07-17)
 
 ### Modern UI

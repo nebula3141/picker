@@ -543,7 +543,7 @@ class _GalleryCanvas(QWidget):
         p.setPen(theme_mod.c("empty_hint"))
         p.drawText(QRect(bx, iy + icon_size + 54, box_w, 22),
                    Qt.AlignmentFlag.AlignHCenter,
-                   "…or use File → Change Source Folder")
+                   "…or press Ctrl+O to open a folder")
         p.setPen(theme_mod.c("empty_footer"))
         p.drawText(QRect(bx, iy + icon_size + 80, box_w, 20),
                    Qt.AlignmentFlag.AlignHCenter,

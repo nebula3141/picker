@@ -7,7 +7,7 @@ from pathlib import Path
 from PyQt6.QtWidgets import (
     QLabel, QWidget, QVBoxLayout, QHBoxLayout, QFrame,
     QMessageBox, QApplication, QSizePolicy, QMenu, QStackedWidget,
-    QGraphicsOpacityEffect
+    QGraphicsOpacityEffect, QWidgetAction, QPushButton
 )
 from PyQt6.QtCore import (
     Qt, QSize, QRect, QRectF, QPointF, QPoint, QObject, QRunnable, QThreadPool,
@@ -34,6 +34,7 @@ from . import conflict_dialog
 from . import theme as theme_mod
 from . import edits as edits_mod
 from . import save_dialog as save_dialog_mod
+from . import send_locations as loc_mod
 from . import log
 from .icon import menu_icon
 
@@ -45,6 +46,33 @@ def _pixmap_bytes(pm) -> int:
     if pm is None or pm.isNull():
         return 0
     return pm.width() * pm.height() * pm.depth() // 8
+
+
+def _elide_middle(text: str, max_len: int = 34) -> str:
+    """Shorten with a middle ellipsis so the meaningful ends stay visible
+    (folder names, filenames) instead of chopping the tail."""
+    if len(text) <= max_len:
+        return text
+    keep = max_len - 1
+    head = (keep + 1) // 2
+    tail = keep - head
+    return text[:head] + "…" + (text[-tail:] if tail else "")
+
+
+def _friendly_error(msg: str) -> str:
+    """Turn a raw OS/Qt error into plain language for a toast."""
+    low = (msg or "").lower()
+    if "winerror 5" in low or "access is denied" in low or "permission" in low or "read-only" in low:
+        return "Couldn't do that — the file is read-only or open in another program."
+    if "winerror 32" in low or "being used by another process" in low or "in use" in low:
+        return "The file is open in another program. Close it and try again."
+    if "space" in low and ("disk" in low or "device" in low):
+        return "Not enough disk space at the destination."
+    if "qimage.save" in low or "could not decode" in low or "unsupported" in low:
+        return "Couldn't save the image — unsupported format or a read-only location."
+    if "no such file" in low or "cannot find" in low or "winerror 2" in low or "winerror 3" in low:
+        return "That file or folder no longer exists."
+    return msg.strip() or "Something went wrong."
 
 
 # ── Smart decode scaling ───────────────────────────────────────────────────────
@@ -135,7 +163,17 @@ class ImageLoadTask(QRunnable):
         reader = QImageReader(rec.path)
         reader.setAutoTransform(True)
         size = reader.size()
-        if size.isValid():
+        if os.path.splitext(rec.path)[1].lower() in (".svg", ".svgz"):
+            # Vector: rasterize crisp at the display floor (its intrinsic size is
+            # often tiny and would look blurry fit to a large window).
+            if size.isValid() and size.width() > 0 and size.height() > 0:
+                floor = _min_decode_edge()
+                long_edge = max(size.width(), size.height())
+                scale = floor / long_edge if long_edge else 1.0
+                if scale > 1.0:
+                    reader.setScaledSize(QSize(max(1, round(size.width() * scale)),
+                                               max(1, round(size.height() * scale))))
+        elif size.isValid():
             ssz = _smart_scaled_size(size.width(), size.height(), pct)
             if ssz is not None:
                 reader.setScaledSize(QSize(ssz[0], ssz[1]))
@@ -179,6 +217,12 @@ class ImageCanvas(QWidget):
         self._peaking_overlay: QImage | None = None
         self._double_click_enabled = False
         self._raw_loading = False
+
+        # "Sent" feedback — a brief accent edge-flash after move/copy/send.
+        self._flash_phase = 0.0
+        self._flash_timer = QTimer(self)
+        self._flash_timer.setInterval(16)
+        self._flash_timer.timeout.connect(self._flash_tick)
 
         # Crop mode — drag a rect on the canvas; stored in rotated-pixmap pixel coords.
         self._crop_mode = False
@@ -286,6 +330,18 @@ class ImageCanvas(QWidget):
             self._fade_timer.stop()
             self._fade_opacity = 1.0
             self._old_pixmap = None
+
+    def flash(self):
+        """Brief accent edge-glow confirming a send/move/copy."""
+        self._flash_phase = 1.0
+        self._flash_timer.start()
+        self.update()
+
+    def _flash_tick(self):
+        self._flash_phase = max(0.0, self._flash_phase - 0.09)
+        self.update()
+        if self._flash_phase <= 0.0:
+            self._flash_timer.stop()
 
     # ── Crop mode ──────────────────────────────────────────────────────────────
 
@@ -717,6 +773,15 @@ class ImageCanvas(QWidget):
                        Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
                        "Decoding RAW…")
 
+        # "Sent" edge-glow — a quick accent border pulse.
+        if self._flash_phase > 0.0:
+            p.setOpacity(1.0)
+            ac = theme_mod.c("accent")
+            pen = QPen(QColor(ac.red(), ac.green(), ac.blue(), int(220 * self._flash_phase)), 4)
+            p.setPen(pen)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawRect(2, 2, self.width() - 4, self.height() - 4)
+
         p.end()
 
     def _paint_histogram(self, p: QPainter):
@@ -1139,33 +1204,33 @@ class ShortcutPanel(QWidget):
         p.setBrush(Qt.BrushStyle.NoBrush)
         p.drawRoundedRect(1, 1, W - 2, H - 2, 14, 14)
 
-        y = 18
+        y = 20
         for section_title, pairs in self._sections:
             p.setPen(QColor(120, 165, 255))
             f = p.font()
-            f.setPointSize(9)
+            f.setPointSize(10)
             f.setBold(True)
             p.setFont(f)
-            p.drawText(QRect(16, y, W - 32, 18), Qt.AlignmentFlag.AlignLeft, section_title)
-            y += 22
+            p.drawText(QRect(18, y, W - 36, 18), Qt.AlignmentFlag.AlignLeft, section_title)
+            y += 27
 
             f.setBold(False)
-            f.setPointSize(9)
+            f.setPointSize(10)
             p.setFont(f)
             for key, desc in pairs:
                 p.setPen(QColor(220, 220, 220))
                 p.setBrush(QColor(255, 255, 255, 18))
                 fm = p.fontMetrics()
-                kw = fm.horizontalAdvance(key) + 14
-                p.drawRoundedRect(20, y, kw, 20, 4, 4)
+                kw = fm.horizontalAdvance(key) + 16
+                p.drawRoundedRect(22, y, kw, 22, 5, 5)
                 p.setPen(QColor(255, 255, 255))
-                p.drawText(QRect(20, y, kw, 20), Qt.AlignmentFlag.AlignCenter, key)
+                p.drawText(QRect(22, y, kw, 22), Qt.AlignmentFlag.AlignCenter, key)
                 p.setPen(QColor(190, 190, 190))
                 p.setBrush(Qt.BrushStyle.NoBrush)
-                p.drawText(QRect(20 + kw + 10, y, W - kw - 50, 20),
+                p.drawText(QRect(22 + kw + 12, y, W - kw - 54, 22),
                            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, desc)
-                y += 24
-            y += 8
+                y += 28
+            y += 14
 
         p.end()
 
@@ -1618,6 +1683,65 @@ class FilmstripBar(QWidget):
         self.update()
 
 
+# ── "Selection" menu row for a saved send location ────────────────────────────
+
+class _LocationRow(QWidget):
+    """One saved location in the Selection menu:
+    📁 name · Copy/Move · shortcut · ✕. Clicking sends; ✕ removes."""
+
+    send = pyqtSignal()
+    remove = pyqtSignal()
+
+    def __init__(self, loc: dict, key_label: str, parent=None):
+        super().__init__(parent)
+        self.setObjectName("locrow")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setStyleSheet("#locrow:hover { background:#26262c; border-radius:8px; }")
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip(f"{loc.get('action', 'copy').capitalize()} to {loc.get('path', '')}")
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(12, 5, 8, 5)
+        lay.setSpacing(8)
+
+        icon = QLabel()
+        icon.setPixmap(menu_icon("folder").pixmap(16, 16))
+        lay.addWidget(icon)
+
+        name = QLabel(_elide_middle(loc.get("name", "?"), 26))
+        name.setStyleSheet("color:#e6e6ea; font-size:13px; background:transparent;")
+        lay.addWidget(name)
+
+        is_move = loc.get("action") == "move"
+        tag = QLabel("Move" if is_move else "Copy")
+        tag.setStyleSheet(
+            f"color:{'#f0a868' if is_move else '#7bb2f7'}; font-size:11px;"
+            " font-weight:600; background:transparent;")
+        lay.addWidget(tag)
+
+        lay.addStretch(1)
+
+        key = QLabel(key_label)
+        key.setStyleSheet("color:#8a8a93; font-size:11px; font-weight:600; background:transparent;")
+        lay.addWidget(key)
+
+        x = QPushButton("✕")
+        x.setFixedSize(20, 20)
+        x.setCursor(Qt.CursorShape.PointingHandCursor)
+        x.setToolTip("Remove this location")
+        x.setStyleSheet(
+            "QPushButton { color:#8a8a93; border:0; background:transparent; font-size:12px; }"
+            "QPushButton:hover { color:#ef6b6b; }"
+        )
+        x.clicked.connect(self.remove.emit)
+        lay.addWidget(x)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.send.emit()
+        super().mousePressEvent(event)
+
+
 # ── Slideshow window ───────────────────────────────────────────────────────────
 
 class SlideshowView(QWidget):
@@ -1635,6 +1759,7 @@ class SlideshowView(QWidget):
         self._manager = manager
         self._idx = start_idx
         self._current_dest = 0
+        self._last_transfer: dict | None = None   # one-level undo for move/copy/delete
         self._pixmap_cache: "OrderedDict[int, QPixmap]" = OrderedDict()
         self._pixmap_cache_bytes = 0
         self._inflight: set[int] = set()
@@ -1911,16 +2036,18 @@ class SlideshowView(QWidget):
         # picks them out at a glance. Groups separated by a dim middle dot.
         def chip(key: str) -> str:
             return (
-                '<span style="background:#2a2a2a; color:#f0f0f0;'
-                ' font-weight:700; padding:2px 7px; border-radius:4px;'
-                ' border:1px solid #3a3a3a;">' + key + '</span>'
+                '<span style="background:#26262c; color:#f0f0f0;'
+                ' font-weight:700; padding:3px 9px; border-radius:5px;'
+                ' border:1px solid #3a3a42;">' + key + '</span>'
             )
 
         def pair(key: str, label: str) -> str:
-            return f'{chip(key)}&nbsp;<span style="color:#cfcfcf;">{label}</span>'
+            return f'{chip(key)}&nbsp;&nbsp;<span style="color:#cfcfd6;">{label}</span>'
 
-        sep = '&nbsp;&nbsp;&nbsp;&nbsp;<span style="color:#555;">·</span>&nbsp;&nbsp;&nbsp;&nbsp;'
-        gap = '&nbsp;&nbsp;'
+        # Wider gutters between groups than within them, so the eye parses the
+        # legend as a few chunks instead of one dense run.
+        sep = ('&nbsp;' * 6) + '<span style="color:#4a4a52;">·</span>' + ('&nbsp;' * 6)
+        gap = '&nbsp;' * 4
 
         # Adapt the hint to the current item type — image vs video.
         from .media import is_video as _is_video
@@ -2138,6 +2265,10 @@ class SlideshowView(QWidget):
         self._load_image(idx)
         self._preload_neighbors()
 
+    def _flash_if_enabled(self):
+        if bool(settings_mod.get("send_feedback")):
+            self._canvas.flash()
+
     def _cycle_dest(self):
         if len(self._manager.destinations) <= 1:
             return
@@ -2165,6 +2296,7 @@ class SlideshowView(QWidget):
             self._toast.show_message("Skipped")
             return
         verb = "Moved" if self._manager.mode == "move" else "Copied"
+        self._flash_if_enabled()
         self._toast.show_message(
             f"✓  {verb} to  {dest_name}", ms=3000,
             action="Undo", action_cb=self._undo,
@@ -2253,8 +2385,8 @@ class SlideshowView(QWidget):
         title_html = f'{rec.filename}'
         if _is_video(rec.path):
             title_html = (
-                '<span style="background:#3b82f6; color:#fff; font-size:9px;'
-                ' font-weight:700; padding:2px 7px; border-radius:3px;'
+                '<span style="background:#3b82f6; color:#fff; font-size:11px;'
+                ' font-weight:700; padding:2px 8px; border-radius:4px;'
                 ' letter-spacing:1px;">VIDEO</span>&nbsp;&nbsp;'
                 + title_html
             )
@@ -2275,9 +2407,17 @@ class SlideshowView(QWidget):
         else:
             status_str = self._manager.dest_name_for_status(rec.status)
             s = self._manager.stats()
+            # Always-visible mode + active target so "where does Enter send?" is
+            # answerable at a glance.
+            mode = "Move" if self._manager.mode == "move" else "Copy"
+            accent = theme_mod.c("accent").name()
+            active = self._manager.destinations[self._current_dest].get("name", "?") \
+                if 0 <= self._current_dest < len(self._manager.destinations) else "?"
+            chip = (f'<span style="color:{accent}; font-weight:700;">'
+                    f'{mode} → {active}</span>')
+            self._stats_label.setTextFormat(Qt.TextFormat.RichText)
             self._stats_label.setText(
-                f"Status: {status_str}   ·   "
-                f"Selected: {s['selected']}   ·   Remaining: {s['unreviewed']}"
+                f"{chip}   ·   Selected: {s['selected']}   ·   Remaining: {s['unreviewed']}"
             )
         # Mirror stats width into the left spacer so the centered legend stays
         # truly centered regardless of how wide the right-side stats grew.
@@ -2372,7 +2512,8 @@ class SlideshowView(QWidget):
         elif key == Qt.Key.Key_Delete and not ctrl:
             self._delete_current()
             return
-        elif key in (Qt.Key.Key_Right, Qt.Key.Key_D, Qt.Key.Key_Space):
+        elif key in (Qt.Key.Key_Right, Qt.Key.Key_D) or (key == Qt.Key.Key_Space and not ctrl):
+            # Plain Space advances; Ctrl+Space is the Selection send (handled below).
             self._go_next()
         elif key in (Qt.Key.Key_Left, Qt.Key.Key_A):
             self._go_prev()
@@ -2414,6 +2555,15 @@ class SlideshowView(QWidget):
             self._open_external("default")
         elif key == Qt.Key.Key_E and not ctrl:
             self._reveal_in_explorer()
+        elif ctrl and key == Qt.Key.Key_Space:
+            # Always sends to the first location (the only one, when there's one).
+            if loc_mod.load():
+                self._send_to_location(0)
+            else:
+                self._toast.show_message(
+                    "No Selection locations yet — right-click → Selection", ms=2500)
+        elif ctrl and Qt.Key.Key_1 <= key <= Qt.Key.Key_9:
+            self._send_to_location(key - Qt.Key.Key_1)    # Ctrl+1..9
         elif has_dest and key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
             self._send_to(self._current_dest)
         elif has_dest and key == Qt.Key.Key_1:
@@ -2424,8 +2574,11 @@ class SlideshowView(QWidget):
             self._send_to(2)
         elif has_dest and key == Qt.Key.Key_Tab:
             self._cycle_dest()
-        elif has_dest and key == Qt.Key.Key_Z and ctrl:
-            self._undo()
+        elif ctrl and key == Qt.Key.Key_Z:
+            if self._last_transfer is not None:
+                self._undo_last_transfer()
+            elif has_dest:
+                self._undo()
         elif key == Qt.Key.Key_V and not ctrl:
             if self._compare_view is not None:
                 self._exit_compare()
@@ -2519,6 +2672,14 @@ class SlideshowView(QWidget):
                 *dest_pairs,
                 ("Ctrl+Z", "Undo"),
             ]))
+        locs = loc_mod.load()
+        if locs:
+            n = len(locs)
+            sections.append(("SELECTION", [
+                (loc_mod.shortcut_label(i, n),
+                 f"{'Move' if l['action'] == 'move' else 'Copy'} → {l['name']}")
+                for i, l in enumerate(locs)
+            ] + [("Ctrl+Z", "Undo last send")]))
         self._shortcut_panel.set_shortcuts(sections)
 
     def _reposition_shortcut_panel(self):
@@ -2604,37 +2765,44 @@ class SlideshowView(QWidget):
         menu.addSeparator()
 
         if not video:
-            rot_menu = menu.addMenu(menu_icon("system"), "Rotate")
-            a = rot_menu.addAction(menu_icon("system"), "Rotate 90° Clockwise")
+            rot_menu = menu.addMenu(menu_icon("rotate"), "Rotate")
+            a = rot_menu.addAction(menu_icon("rotate"), "Rotate 90° Clockwise")
             a.setShortcut("R")
             a.triggered.connect(lambda: self._rotate_current(90))
-            a = rot_menu.addAction(menu_icon("system"), "Rotate 90° Anticlockwise")
+            a = rot_menu.addAction(menu_icon("rotate"), "Rotate 90° Anticlockwise")
             a.setShortcut("Shift+R")
             a.triggered.connect(lambda: self._rotate_current(270))
-            a = rot_menu.addAction(menu_icon("system"), "Rotate 180°")
+            a = rot_menu.addAction(menu_icon("rotate"), "Rotate 180°")
             a.triggered.connect(lambda: self._rotate_current(180))
             rot_menu.addSeparator()
             a = rot_menu.addAction("Reset Rotation")
             a.triggered.connect(self._reset_rotation)
-            act_zoom = menu.addAction(menu_icon("select_all"), "Zoom 1:1")
+            act_zoom = menu.addAction(menu_icon("zoom"), "Zoom 1:1")
+            act_zoom.setShortcut("Z")
             act_zoom.triggered.connect(lambda: (self._canvas.zoom_actual(),
                                                 self._toast.show_message("1:1", ms=800)))
-            act_crop = menu.addAction(menu_icon("move"), "Crop")
+            act_crop = menu.addAction(menu_icon("crop"), "Crop")
+            act_crop.setShortcut("C")
             act_crop.triggered.connect(lambda: (self._canvas.enter_crop_mode(),
                                                 self._toast.show_message("Crop mode — drag to select", ms=1200)))
-            act_hist = menu.addAction(menu_icon("system"), "Toggle Histogram")
+            act_hist = menu.addAction(menu_icon("histogram"), "Toggle Histogram")
+            act_hist.setShortcut("H")
             act_hist.triggered.connect(self._canvas.toggle_histogram)
-            act_peak = menu.addAction(menu_icon("system"), "Toggle Focus Peaking")
+            act_peak = menu.addAction(menu_icon("zoom"), "Toggle Focus Peaking")
+            act_peak.setShortcut("P")
             act_peak.triggered.connect(lambda: (self._canvas.toggle_peaking(),
                                                 self._toast.show_message("Focus peaking toggled", ms=800)))
             menu.addSeparator()
 
-        act_cmp = menu.addAction(menu_icon("copy"), "Compare")
+        act_cmp = menu.addAction(menu_icon("compare"), "Compare")
+        act_cmp.setShortcut("V")
         act_cmp.triggered.connect(
             lambda: self._exit_compare() if self._compare_view is not None else self._enter_compare())
-        act_info = menu.addAction(menu_icon("copy_path"), "Info Panel")
+        act_info = menu.addAction(menu_icon("info"), "Info Panel")
+        act_info.setShortcut("I")
         act_info.triggered.connect(self._toggle_info_panel)
-        act_fs = menu.addAction(menu_icon("select_all"), "Toggle Fullscreen")
+        act_fs = menu.addAction(menu_icon("fullscreen"), "Toggle Fullscreen")
+        act_fs.setShortcut("F")
         act_fs.triggered.connect(self.fullscreen_requested.emit)
 
         menu.addSeparator()
@@ -2646,41 +2814,44 @@ class SlideshowView(QWidget):
                 a = send_menu.addAction(menu_icon("folder"), d.get("name", f"Dest {i+1}"))
                 a.triggered.connect(lambda _=False, di=i: self._send_to(di))
 
-        recents = abv.recent_target_folders()
-
-        move_menu = menu.addMenu(menu_icon("move"), "Move to")
-        move_menu.setToolTipsVisible(True)
-        for folder in recents:
-            label = os.path.basename(folder.rstrip(os.sep)) or folder
-            a = move_menu.addAction(menu_icon("folder"), label)
-            a.setToolTip(folder)
-            a.triggered.connect(lambda _=False, f=folder: self._move_or_copy_current(f, move=True, confirm=True))
-        if recents:
-            move_menu.addSeparator()
-        a = move_menu.addAction(menu_icon("reveal"), "Choose Folder…")
-        a.triggered.connect(lambda: self._choose_transfer_current(move=True))
-
-        copy_menu = menu.addMenu(menu_icon("copy"), "Copy to")
-        copy_menu.setToolTipsVisible(True)
-        for folder in recents:
-            label = os.path.basename(folder.rstrip(os.sep)) or folder
-            a = copy_menu.addAction(menu_icon("folder"), label)
-            a.setToolTip(folder)
-            a.triggered.connect(lambda _=False, f=folder: self._move_or_copy_current(f, move=False, confirm=True))
-        if recents:
-            copy_menu.addSeparator()
-        a = copy_menu.addAction(menu_icon("reveal"), "Choose Folder…")
-        a.triggered.connect(lambda: self._choose_transfer_current(move=False))
+        # ── Selection: your saved send locations, plus a way to add more.
+        # Clicking a location sends this photo there instantly (toast + Undo);
+        # ✕ removes it. Adding picks the method inline, then the folder.
+        sel_menu = menu.addMenu(menu_icon("move"), "Selection")
+        sel_menu.setToolTipsVisible(True)
+        locs = loc_mod.load()
+        for i, loc in enumerate(locs):
+            row = _LocationRow(loc, loc_mod.shortcut_label(i, len(locs)))
+            row.send.connect(lambda l=loc: (sel_menu.close(), menu.close(),
+                                            self._transfer_current(l["path"],
+                                                                   move=l["action"] == "move")))
+            row.remove.connect(lambda l=loc: (sel_menu.close(), menu.close(),
+                                              self._remove_location(l)))
+            wa = QWidgetAction(sel_menu)
+            wa.setDefaultWidget(row)
+            sel_menu.addAction(wa)
+        if locs:
+            sel_menu.addSeparator()
+        if loc_mod.is_full():
+            a = sel_menu.addAction(f"Location list full (max {loc_mod.MAX})")
+            a.setEnabled(False)
+        else:
+            a = sel_menu.addAction(menu_icon("copy"), "Copy to a new folder…")
+            a.triggered.connect(lambda: self._add_location(move=False))
+            a = sel_menu.addAction(menu_icon("move"), "Move to a new folder…")
+            a.triggered.connect(lambda: self._add_location(move=True))
 
         menu.addSeparator()
 
         act_copy = menu.addAction(menu_icon("copy_path"), "Copy Path")
         act_copy.triggered.connect(lambda: QApplication.clipboard().setText(path))
         act_reveal = menu.addAction(menu_icon("reveal"), "Reveal in Explorer")
+        act_reveal.setShortcut("E")
         act_reveal.triggered.connect(self._reveal_in_explorer)
 
         menu.addSeparator()
         act_del = menu.addAction(menu_icon("delete"), "Delete (Recycle Bin)")
+        act_del.setShortcut("Del")
         act_del.triggered.connect(self._delete_current)
 
         menu.exec(event.globalPos())
@@ -2705,6 +2876,40 @@ class SlideshowView(QWidget):
         self._filmstrip.refresh()
         self._toast.show_message("Rotation reset", ms=800)
 
+    # ── Quick Folders (one-key send targets) ─────────────────────────────────
+
+    # ── Selection / saved send locations ─────────────────────────────────────
+
+    def _send_to_location(self, index: int):
+        """Ctrl+Space / Ctrl+N — send to saved location #index."""
+        locs = loc_mod.load()
+        if 0 <= index < len(locs):
+            loc = locs[index]
+            self._transfer_current(loc["path"], move=loc["action"] == "move")
+
+    def _add_location(self, *, move: bool):
+        """Pick a folder, remember it as a Selection location, and send there."""
+        from PyQt6.QtWidgets import QFileDialog
+        from . import album_browser_view as abv
+        if loc_mod.is_full():
+            self._toast.show_message(f"Location list full (max {loc_mod.MAX})", ms=2500)
+            return
+        start = abv.recent_target_folders()
+        verb = "Move" if move else "Copy"
+        dest = QFileDialog.getExistingDirectory(
+            self, f"{verb} to folder — it'll be saved in Selection",
+            start[0] if start else (self._manager.source_folder or ""))
+        if not dest:
+            return
+        loc_mod.add(dest, "move" if move else "copy")
+        self._transfer_current(dest, move=move)
+        self._update_hint()
+
+    def _remove_location(self, loc: dict):
+        loc_mod.remove(loc["path"], loc["action"])
+        self._toast.show_message(f"Removed “{loc['name']}” from Selection", ms=1500)
+        self._update_hint()
+
     def _choose_transfer_current(self, *, move: bool):
         from PyQt6.QtWidgets import QFileDialog
         from . import album_browser_view as abv
@@ -2714,36 +2919,30 @@ class SlideshowView(QWidget):
             self, f"{verb} image to folder",
             start[0] if start else (self._manager.source_folder or ""))
         if dest:
-            self._move_or_copy_current(dest, move=move, confirm=False)
+            self._transfer_current(dest, move=move)
 
-    def _move_or_copy_current(self, dest: str, *, move: bool, confirm: bool):
+    def _transfer_current(self, dest_dir: str, *, move: bool):
+        """Instant move/copy of the current image to a folder — no prompt, just a
+        toast with one-tap Undo (clashes keep both)."""
         if self._idx < 0 or self._idx >= len(self._manager.images):
             return
         from . import album_browser_view as abv
         rec = self._manager.images[self._idx]
-        name = os.path.basename(dest.rstrip(os.sep)) or dest
-        if confirm:
-            verb = "Move" if move else "Copy"
-            reply = QMessageBox.question(
-                self, f"{verb} File", f"{verb} to “{name}”?\n\n{os.path.basename(rec.path)}",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.Yes)
-            if reply != QMessageBox.StandardButton.Yes:
-                return
-        resolver = abv.make_conflict_resolver(self)
-        with log.timed("image.transfer", op="move" if move else "copy", dest=dest):
-            ok_sources, errors, cancelled = abv.transfer_files(
-                [rec.path], dest, move=move, conflict_cb=resolver)
-        abv.push_recent_target(dest)
-        abv.invalidate_scan_cache(dest)
-        if errors:
-            self._toast.show_message(f"Failed: {errors[0]}", ms=3000)
+        src = rec.path
+        idx = self._idx
+        name = _elide_middle(os.path.basename(dest_dir.rstrip(os.sep)) or dest_dir, 30)
+        dst, err = abv.transfer_one(src, dest_dir, move=move)
+        if err:
+            self._toast.show_message(_friendly_error(err), ms=3500)
             return
-        if cancelled:
-            return
-        if move and ok_sources:
-            self._toast.show_message(f"Moved → {name}", ms=1500)
-            self._manager.images.pop(self._idx)
+        abv.push_recent_target(dest_dir)
+        abv.invalidate_scan_cache(dest_dir)
+        self._flash_if_enabled()
+        self._last_transfer = {"op": "move" if move else "copy", "src": src,
+                               "dst": dst, "idx": idx, "rec": rec}
+        verb = "Moved" if move else "Copied"
+        if move:
+            self._manager.images.pop(idx)
             if not self._manager.images:
                 self.closed.emit(0)
                 return
@@ -2752,8 +2951,36 @@ class SlideshowView(QWidget):
             self._load_image(self._idx)
             self._filmstrip.refresh()
             self.status_changed.emit()
-        else:
-            self._toast.show_message(f"Copied → {name}", ms=1500)
+        self._toast.show_message(f"{verb} → {name}", ms=2200,
+                                 action="Undo", action_cb=self._undo_last_transfer)
+
+    def _undo_last_transfer(self):
+        """Reverse the most recent move / copy / delete."""
+        t = self._last_transfer
+        if not t:
+            self._toast.show_message("Nothing to undo", ms=1200)
+            return
+        self._last_transfer = None
+        import shutil
+        try:
+            if t["op"] == "copy":
+                # Just delete the copy we made; original untouched.
+                if os.path.isfile(t["dst"]):
+                    os.remove(t["dst"])
+            elif t["op"] == "move":
+                shutil.move(t["dst"], t["src"])
+                self._reinsert_record(t)
+            self._toast.show_message("Undone", ms=1200)
+        except Exception as e:
+            self._toast.show_message(_friendly_error(str(e)), ms=3000)
+
+    def _reinsert_record(self, t: dict):
+        idx = min(t["idx"], len(self._manager.images))
+        self._manager.images.insert(idx, t["rec"])
+        self._idx = idx
+        self._load_image(self._idx)
+        self._filmstrip.refresh()
+        self.status_changed.emit()
 
     # ── Delete to Recycle Bin ────────────────────────────────────────────────
 
@@ -2761,22 +2988,25 @@ class SlideshowView(QWidget):
         if self._idx < 0 or self._idx >= len(self._manager.images):
             return
         rec = self._manager.images[self._idx]
-        reply = QMessageBox.question(
-            self, "Delete File",
-            f"Move to Recycle Bin?\n\n{os.path.basename(rec.path)}",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        )
-        if reply != QMessageBox.StandardButton.Yes:
-            return
+        # "Ask before delete" (default on). When off, deletes go straight to the
+        # Recycle Bin — recoverable there, so no modal is needed.
+        if bool(settings_mod.get("confirm_delete")):
+            reply = QMessageBox.question(
+                self, "Delete File",
+                f"Move to Recycle Bin?\n\n{os.path.basename(rec.path)}",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
         try:
             from picker._recycle import send_to_recycle_bin
             if not send_to_recycle_bin(rec.path):
-                self._toast.show_message("Failed to delete", ms=2000)
+                self._toast.show_message("Couldn't delete — the file may be locked", ms=2500)
                 return
         except Exception as e:
-            self._toast.show_message(f"Delete failed: {e}", ms=3000)
+            self._toast.show_message(_friendly_error(str(e)), ms=3000)
             return
-        self._toast.show_message("Moved to Recycle Bin", ms=1500)
+        self._toast.show_message("→ Recycle Bin", ms=1500)
         self._manager.images.pop(self._idx)
         if not self._manager.images:
             self.closed.emit(0)

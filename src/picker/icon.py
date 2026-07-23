@@ -181,6 +181,57 @@ def _draw_glyph(p: QPainter, name: str, s: int) -> None:
         p.drawLine(QPointF(0.34 * s, 0.34 * s), QPointF(0.66 * s, 0.66 * s))
         p.drawLine(QPointF(0.66 * s, 0.34 * s), QPointF(0.34 * s, 0.66 * s))
 
+    elif name == "rotate":
+        # Circular arrow
+        p.setPen(pen); p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawArc(box(0.20, 0.20, 0.80, 0.80), 40 * 16, 280 * 16)
+        p.setBrush(_MENU_FG); p.setPen(Qt.PenStyle.NoPen)
+        p.drawPolygon(QPolygonF([
+            QPointF(0.78 * s, 0.16 * s), QPointF(0.86 * s, 0.42 * s),
+            QPointF(0.60 * s, 0.36 * s),
+        ]))
+
+    elif name == "crop":
+        p.setPen(pen); p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawLine(QPointF(0.28 * s, 0.10 * s), QPointF(0.28 * s, 0.72 * s))
+        p.drawLine(QPointF(0.28 * s, 0.72 * s), QPointF(0.90 * s, 0.72 * s))
+        p.drawLine(QPointF(0.10 * s, 0.28 * s), QPointF(0.72 * s, 0.28 * s))
+        p.drawLine(QPointF(0.72 * s, 0.28 * s), QPointF(0.72 * s, 0.90 * s))
+
+    elif name == "zoom":
+        p.setPen(pen); p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawEllipse(box(0.14, 0.14, 0.66, 0.66))
+        p.drawLine(QPointF(0.62 * s, 0.62 * s), QPointF(0.88 * s, 0.88 * s))
+
+    elif name == "info":
+        p.setPen(pen); p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawEllipse(box(0.14, 0.14, 0.86, 0.86))
+        p.setPen(QPen(_MENU_ACCENT, max(1.0, s * 0.11)))
+        p.drawPoint(QPointF(0.50 * s, 0.33 * s))
+        p.drawLine(QPointF(0.50 * s, 0.45 * s), QPointF(0.50 * s, 0.70 * s))
+
+    elif name == "compare":
+        # Two panes side by side
+        p.setPen(pen); p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRoundedRect(box(0.10, 0.22, 0.46, 0.78), s * 0.07, s * 0.07)
+        p.drawRoundedRect(box(0.54, 0.22, 0.90, 0.78), s * 0.07, s * 0.07)
+
+    elif name == "fullscreen":
+        p.setPen(pen); p.setBrush(Qt.BrushStyle.NoBrush)
+        for (x1, y1, x2, y2, hx, hy) in (
+            (0.14, 0.34, 0.14, 0.14, 0.34, 0.14),
+            (0.86, 0.34, 0.86, 0.14, 0.66, 0.14),
+            (0.14, 0.66, 0.14, 0.86, 0.34, 0.86),
+            (0.86, 0.66, 0.86, 0.86, 0.66, 0.86),
+        ):
+            p.drawLine(QPointF(x1 * s, y1 * s), QPointF(x2 * s, y2 * s))
+            p.drawLine(QPointF(x2 * s, y2 * s), QPointF(hx * s, hy * s))
+
+    elif name == "histogram":
+        p.setPen(Qt.PenStyle.NoPen); p.setBrush(_MENU_FG)
+        for (x, top) in ((0.20, 0.55), (0.36, 0.30), (0.52, 0.44), (0.68, 0.20)):
+            p.drawRect(box(x, top, x + 0.11, 0.84))
+
 
 _menu_icon_cache: dict[str, QIcon] = {}
 

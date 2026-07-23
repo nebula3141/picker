@@ -58,8 +58,8 @@ class _Row(QWidget):
     def __init__(self, label: str, value: str, value_color: str | None = None, parent=None):
         super().__init__(parent)
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(0, 2, 0, 2)
-        layout.setSpacing(8)
+        layout.setContentsMargins(0, 4, 0, 4)
+        layout.setSpacing(10)
 
         l = QLabel(label)
         muted = theme_mod.c("muted").name() if hasattr(theme_mod.c("muted"), "name") else "#888"
@@ -84,13 +84,13 @@ class _Section(QFrame):
         super().__init__(parent)
         self.setFrameShape(QFrame.Shape.NoFrame)
         self._layout = QVBoxLayout(self)
-        self._layout.setContentsMargins(0, 0, 0, 8)
-        self._layout.setSpacing(0)
+        self._layout.setContentsMargins(0, 0, 0, 14)
+        self._layout.setSpacing(1)
 
         head = QLabel(title.upper())
         head.setStyleSheet(
-            "color: #5a9bff; font-size: 10px; font-weight: 700;"
-            "letter-spacing: 1.2px; padding: 4px 0 4px 0;"
+            "color: #5a9bff; font-size: 11px; font-weight: 700;"
+            "letter-spacing: 1.2px; padding: 6px 0 6px 0;"
         )
         self._layout.addWidget(head)
 

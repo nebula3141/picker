@@ -12,6 +12,8 @@ from . import settings as settings_mod
 SUPPORTED_EXTENSIONS = {
     # Common raster
     ".jpg", ".jpeg", ".png", ".tiff", ".tif", ".bmp", ".webp",
+    # Vector
+    ".svg", ".svgz",
     # RAW
     ".cr2", ".cr3", ".nef", ".arw", ".dng", ".raf", ".orf", ".rw2", ".pef", ".srw",
 }
@@ -22,6 +24,7 @@ FILE_TYPE_MAP = {
     "tiff": {".tiff", ".tif"},
     "webp": {".webp"},
     "bmp":  {".bmp"},
+    "svg":  {".svg", ".svgz"},
     "raw":  {".cr2", ".cr3", ".nef", ".arw", ".dng", ".raf", ".orf", ".rw2", ".pef", ".srw"},
 }
 

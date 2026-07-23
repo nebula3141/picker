@@ -13,10 +13,15 @@ from . import raw_loader
 
 
 RAW_EXTS = {".cr2", ".cr3", ".nef", ".arw", ".dng", ".raf", ".orf", ".rw2", ".pef", ".srw"}
+SVG_EXTS = {".svg", ".svgz"}
 
 
 def _is_raw(path: str) -> bool:
     return Path(path).suffix.lower() in RAW_EXTS
+
+
+def _is_svg(path: str) -> bool:
+    return Path(path).suffix.lower() in SVG_EXTS
 
 
 def _load_full(path: str) -> QImage:
@@ -27,6 +32,16 @@ def _load_full(path: str) -> QImage:
             return img
     reader = QImageReader(path)
     reader.setAutoTransform(True)
+    if _is_svg(path):
+        # Vector — rasterize at a generous size so the edited output isn't tiny.
+        sz = reader.size()
+        if sz.isValid() and sz.width() > 0 and sz.height() > 0:
+            long_edge = max(sz.width(), sz.height())
+            target = 2048
+            if 0 < long_edge < target:
+                scale = target / long_edge
+                reader.setScaledSize(QSize(max(1, int(sz.width() * scale)),
+                                           max(1, int(sz.height() * scale))))
     return reader.read()
 
 
@@ -37,6 +52,10 @@ def _target_path(source: str, mode: str) -> Path:
         # Can't overwrite raw; write JPEG next to it.
         suffix = settings_mod.get("edit_new_suffix") or "_edit"
         return src.with_name(f"{src.stem}{suffix}.jpg")
+    if _is_svg(source):
+        # Vector can't hold a rasterized edit; write a PNG sibling.
+        suffix = settings_mod.get("edit_new_suffix") or "_edit"
+        return src.with_name(f"{src.stem}{suffix}.png")
     if mode == "overwrite":
         return src
     suffix = settings_mod.get("edit_new_suffix") or "_edit"

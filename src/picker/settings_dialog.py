@@ -27,6 +27,7 @@ FILE_TYPE_LABELS = [
     ("TIFF", "tiff"),
     ("WEBP", "webp"),
     ("BMP", "bmp"),
+    ("SVG", "svg"),
     ("RAW (CR2/NEF/ARW/DNG/…)", "raw"),
 ]
 
@@ -209,6 +210,8 @@ class SettingsDialog(QDialog):
             "auto_advance_cb": "Auto advance on send",
             "filmstrip_cb": "Show filmstrip",
             "animation_cb": "Slideshow animation",
+            "confirm_delete_cb": "Ask before deleting",
+            "send_feedback_cb": "Send feedback flash",
             "conflict_combo": "Conflict handling",
             "explorer_esc_combo": "Escape action for Explorer-opened photo",
             "edit_save_combo": "Edit save mode",
@@ -349,26 +352,32 @@ class SettingsDialog(QDialog):
         self.animation_cb = QCheckBox("Animate image transitions in fullscreen")
         g.addWidget(self.animation_cb, 3, 0, 1, 3)
 
-        g.addWidget(QLabel("On filename conflict"), 4, 0)
+        self.confirm_delete_cb = QCheckBox("Ask before deleting (otherwise sends straight to the Recycle Bin)")
+        g.addWidget(self.confirm_delete_cb, 4, 0, 1, 3)
+
+        self.send_feedback_cb = QCheckBox("Flash a subtle accent glow when you send / move / copy")
+        g.addWidget(self.send_feedback_cb, 8, 0, 1, 3)
+
+        g.addWidget(QLabel("On filename conflict"), 5, 0)
         self.conflict_combo = QComboBox()
         self.conflict_combo.addItem("Ask every time", "ask")
         self.conflict_combo.addItem("Keep both (rename)", "rename")
         self.conflict_combo.addItem("Replace", "replace")
         self.conflict_combo.addItem("Skip", "skip")
         self.conflict_combo.setFixedWidth(200)
-        g.addWidget(self.conflict_combo, 4, 1, Qt.AlignmentFlag.AlignLeft)
+        g.addWidget(self.conflict_combo, 5, 1, Qt.AlignmentFlag.AlignLeft)
 
-        g.addWidget(QLabel("Esc on a photo opened from Explorer"), 5, 0)
+        g.addWidget(QLabel("Esc on a photo opened from Explorer"), 6, 0)
         self.explorer_esc_combo = QComboBox()
         self.explorer_esc_combo.addItem("Open the folder (mosaic)", "mosaic")
         self.explorer_esc_combo.addItem("Close PICker", "close")
         self.explorer_esc_combo.setFixedWidth(200)
-        g.addWidget(self.explorer_esc_combo, 5, 1, Qt.AlignmentFlag.AlignLeft)
+        g.addWidget(self.explorer_esc_combo, 6, 1, Qt.AlignmentFlag.AlignLeft)
         hint = QLabel("When you double-click a photo in Explorer and press Esc: browse that "
                       "folder as a mosaic, or quit.")
         hint.setObjectName("hint")
         hint.setWordWrap(True)
-        g.addWidget(hint, 6, 0, 1, 3)
+        g.addWidget(hint, 7, 0, 1, 3)
         return grp
 
     # Editing
@@ -781,6 +790,8 @@ class SettingsDialog(QDialog):
         self.auto_advance_cb.setChecked(bool(data.get("auto_advance_on_send", True)))
         self.filmstrip_cb.setChecked(bool(data.get("show_filmstrip", True)))
         self.animation_cb.setChecked(bool(data.get("slideshow_animation", True)))
+        self.confirm_delete_cb.setChecked(bool(data.get("confirm_delete", True)))
+        self.send_feedback_cb.setChecked(bool(data.get("send_feedback", True)))
         self._select_data(self.conflict_combo, data.get("conflict_default", "ask"))
         self._select_data(self.explorer_esc_combo, data.get("explorer_escape_action", "mosaic"))
 
@@ -871,6 +882,8 @@ class SettingsDialog(QDialog):
             "auto_advance_on_send": bool(self.auto_advance_cb.isChecked()),
             "show_filmstrip": bool(self.filmstrip_cb.isChecked()),
             "slideshow_animation": bool(self.animation_cb.isChecked()),
+            "confirm_delete": bool(self.confirm_delete_cb.isChecked()),
+            "send_feedback": bool(self.send_feedback_cb.isChecked()),
             "conflict_default": self.conflict_combo.currentData() or "ask",
             "explorer_escape_action": self.explorer_esc_combo.currentData() or "mosaic",
 

@@ -27,7 +27,7 @@ from PyQt6.QtCore import QPointF
 from PyQt6.QtWidgets import (
     QWidget, QScrollArea, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
     QGridLayout, QSizePolicy, QApplication, QFrame, QMenu, QMessageBox,
-    QFileDialog, QProgressBar
+    QFileDialog, QProgressBar, QLineEdit
 )
 
 from . import theme as theme_mod
@@ -192,6 +192,36 @@ def _clear_readonly(path: str) -> None:
         os.chmod(path, stat.S_IWRITE)
     except OSError:
         pass
+
+
+def transfer_one(src: str, dest_dir: str, *, move: bool) -> tuple[str | None, str | None]:
+    """Move/copy a single file into dest_dir, non-interactively (name clashes are
+    resolved by keeping both — the ` (n)` rename). Returns (final_dest_path, error).
+
+    Used by the viewer's one-key Quick-Folder sends, where the exact written path
+    is needed so the action can be undone. Handles the read-only/WinError-5 retry
+    the same way as `transfer_files`."""
+    import shutil
+    base = os.path.basename(src)
+    try:
+        os.makedirs(dest_dir, exist_ok=True)
+        dst = os.path.join(dest_dir, base)
+        if os.path.normcase(os.path.abspath(src)) == os.path.normcase(os.path.abspath(dst)):
+            return None, "source and destination are the same folder"
+        if os.path.exists(dst):
+            dst = _unique_dest(dst)
+        try:
+            shutil.move(src, dst) if move else shutil.copy2(src, dst)
+        except PermissionError:
+            _clear_readonly(src)
+            if os.path.exists(dst):
+                _clear_readonly(dst)
+            shutil.move(src, dst) if move else shutil.copy2(src, dst)
+        return dst, None
+    except PermissionError:
+        return None, f"{base}: access denied — read-only or open in another program"
+    except Exception as e:
+        return None, f"{base}: {e}"
 
 
 def _draw_play_badge(p: QPainter, rect: QRect, *, size: int = 38) -> None:
@@ -370,7 +400,7 @@ class FolderTile(_BaseTile):
         n = self.item.image_count
         p.drawText(QRect(8, COVER_H + 24, TILE_W - 16, 18),
                    Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-                   f"{n} image{'s' if n != 1 else ''}")
+                   f"{n:,} image{'s' if n != 1 else ''}")
 
         if self._hover:
             p.setBrush(Qt.BrushStyle.NoBrush)
@@ -389,6 +419,7 @@ class _ImageMosaic(QWidget):
     scroll_to = pyqtSignal(int, int)     # (x, y) the parent scroll area should reveal
     load_progress = pyqtSignal(int, int) # (headers_done, total) — drives the load bar
     reload_requested = pyqtSignal()      # folder needs a rescan (e.g. rotate wrote new files)
+    selection_changed = pyqtSignal(int)  # number of selected tiles (drives the bulk bar)
 
     HEADER_DISPATCH_CHUNK = 150          # headers queued per event-loop tick
 
@@ -529,6 +560,7 @@ class _ImageMosaic(QWidget):
         self._header_dispatch_i = len(self._items)
         self._headers_done = len(self._items)
         self._selected = set()
+        self.selection_changed.emit(0)
         self._anchor = -1
         self._cursor = -1
         self._hover_idx = -1
@@ -696,7 +728,9 @@ class _ImageMosaic(QWidget):
             if pm and not pm.isNull():
                 p.drawPixmap(rect, pm)
             else:
-                p.fillRect(rect, QColor(28, 28, 28))
+                # Skeleton placeholder at the tile's real aspect (set from the
+                # header read), so nothing jumps when the thumbnail lands.
+                p.fillRect(rect, _qc("tile_placeholder"))
 
             if is_video(self._items[idx].path):
                 _draw_play_badge(p, rect)
@@ -782,6 +816,7 @@ class _ImageMosaic(QWidget):
         new = {i for i in indices if 0 <= i < len(self._items)}
         if new != self._selected:
             self._selected = new
+            self.selection_changed.emit(len(self._selected))
             self.update()
 
     def mousePressEvent(self, event):
@@ -1216,6 +1251,9 @@ class AlbumBrowserView(QWidget):
         self._nav_stack: list[str] = []   # paths from root → current
         self._folders: list[Folder] = []
         self._items: list[ImageItem] = []
+        self._filter_text = ""                       # live search text
+        self._search_scope = "folder"                # "folder" | "library"
+        self._search_results: list[ImageItem] | None = None
         self._tiles: list[QWidget] = []
         self._tile_by_cover: dict[str, QWidget] = {}
 
@@ -1283,14 +1321,14 @@ class AlbumBrowserView(QWidget):
         top_lay.setContentsMargins(14, 10, 14, 10)
         top_lay.setSpacing(12)
 
-        self._back_btn = QPushButton("←")
-        self._back_btn.setFixedWidth(40)
+        self._back_btn = QPushButton("‹  Back")
         self._back_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._back_btn.setToolTip("Back (Esc)")
         self._back_btn.setStyleSheet(
-            "QPushButton { background: #262626; color: #e5e5e5;"
-            " border: 1px solid #353535; border-radius: 6px;"
-            " padding: 6px 10px; font-size: 14px; font-weight: 700; }"
-            "QPushButton:hover { background: #2f2f2f; border-color: #4a4a4a; }"
+            "QPushButton { background: #1b1b20; color: #e6e6ea;"
+            " border: 1px solid #2a2a30; border-radius: 9px;"
+            " padding: 7px 16px 7px 12px; font-size: 13px; font-weight: 600; }"
+            "QPushButton:hover { background: #23232a; border-color: #3b82f6; }"
         )
         self._back_btn.clicked.connect(self.go_back)
         top_lay.addWidget(self._back_btn)
@@ -1304,6 +1342,33 @@ class AlbumBrowserView(QWidget):
         self._breadcrumb.setOpenExternalLinks(False)
         self._breadcrumb.linkActivated.connect(self._on_breadcrumb_clicked)
         top_lay.addWidget(self._breadcrumb, 1)
+
+        # ── Search: live filename filter for this folder, or a real index-backed
+        # search across the whole library (scope toggle).
+        self._search = QLineEdit()
+        self._search.setPlaceholderText("Filter this folder…")
+        self._search.setClearButtonEnabled(True)
+        self._search.setFixedWidth(230)
+        self._search.setToolTip("Search (Ctrl+F) — Esc clears")
+        self._search.setStyleSheet(
+            "QLineEdit { background:#131317; color:#e6e6ea; border:1px solid #2a2a30;"
+            " border-radius:9px; padding:6px 10px; font-size:12px; }"
+            "QLineEdit:focus { border-color:#3b82f6; background:#16161b; }"
+        )
+        self._search.textChanged.connect(self._on_search_text)
+        self._search.returnPressed.connect(self._on_search_submit)
+        top_lay.addWidget(self._search)
+
+        self._scope_btn = QPushButton("This folder")
+        self._scope_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._scope_btn.setToolTip("Toggle search scope")
+        self._scope_btn.setStyleSheet(
+            "QPushButton { background:#1b1b20; color:#cfcfd6; border:1px solid #2a2a30;"
+            " border-radius:9px; padding:6px 12px; font-size:12px; }"
+            "QPushButton:hover { border-color:#3b82f6; color:#fff; }"
+        )
+        self._scope_btn.clicked.connect(self._toggle_search_scope)
+        top_lay.addWidget(self._scope_btn)
 
         self._count_label = QLabel("")
         self._count_label.setStyleSheet(
@@ -1372,6 +1437,40 @@ class AlbumBrowserView(QWidget):
         scroll.setWidget(self._grid_host)
         outer.addWidget(scroll, 1)
 
+        # Bulk-action bar — appears only when tiles are selected, so "what can I
+        # do with a selection?" is visible instead of hidden behind right-click.
+        self._bulk_bar = QWidget()
+        self._bulk_bar.setObjectName("bulkBar")
+        self._bulk_bar.setStyleSheet(
+            "#bulkBar { background:#16161a; border-top:1px solid #26262c; }"
+            "QLabel { color:#e6e6ea; font-size:13px; font-weight:600; }"
+            "QPushButton { background:#1f1f25; color:#e6e6ea; border:1px solid #2a2a30;"
+            " border-radius:8px; padding:7px 14px; font-size:12px; }"
+            "QPushButton:hover { border-color:#3b82f6; background:#23232a; }"
+            "QPushButton#danger { color:#ef6b6b; border-color:#45272a; }"
+            "QPushButton#danger:hover { background:#2a1618; color:#fff; border-color:#ef6b6b; }"
+        )
+        bb = QHBoxLayout(self._bulk_bar)
+        bb.setContentsMargins(16, 8, 16, 8)
+        bb.setSpacing(10)
+        self._bulk_label = QLabel("0 selected")
+        bb.addWidget(self._bulk_label)
+        bb.addStretch(1)
+        for text, slot, obj in (
+            ("Move to…", lambda: self._bulk_transfer(move=True), None),
+            ("Copy to…", lambda: self._bulk_transfer(move=False), None),
+            ("Delete", self._bulk_delete, "danger"),
+            ("Clear", self._bulk_clear, None),
+        ):
+            b = QPushButton(text)
+            if obj:
+                b.setObjectName(obj)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.clicked.connect(slot)
+            bb.addWidget(b)
+        self._bulk_bar.hide()
+        outer.addWidget(self._bulk_bar)
+
         # Loading strip pinned at the BOTTOM, under the grid — unobtrusive while
         # thumbnails/dimensions stream in (shown only while work is pending).
         outer.addWidget(self._scan_strip)
@@ -1396,10 +1495,11 @@ class AlbumBrowserView(QWidget):
                      folders=len(self._folders), images=len(self._items))
             return
 
-        # Show full loading screen for heavy folders.
-        from .loading_screen import LoadingScreen
+        # Show full loading screen for heavy folders (with a Cancel escape hatch).
+        from .loading_screen import LoadingScreen, ScanCancelled
         folder_label = os.path.basename(path.rstrip(os.sep)) or path
-        loading = LoadingScreen(sub=f"Scanning {folder_label}…", parent=self.window())
+        loading = LoadingScreen(sub=f"Scanning {folder_label}…", parent=self.window(),
+                                cancellable=True)
         loading.show()
         QApplication.processEvents()
 
@@ -1415,9 +1515,21 @@ class AlbumBrowserView(QWidget):
                     f"Scanning {os.path.basename(child_path) or child_path}…"
                 )
                 QApplication.processEvents()
+                if loading.cancelled:
+                    raise ScanCancelled()
 
-        with log.timed("album.scan", path=path):
-            self._folders, self._items = scan_path(path, progress_cb=_cb)
+        try:
+            with log.timed("album.scan", path=path):
+                self._folders, self._items = scan_path(path, progress_cb=_cb)
+        except ScanCancelled:
+            log.info("album.scan cancelled by user", path=path)
+            loading.close_smoothly()
+            self._folders, self._items = [], []
+            self._was_cached = False
+            self._scan_strip.hide()
+            self._render_grid()
+            self._update_count()
+            return
         # Store in cache (LRU eviction on overflow).
         self._scan_cache[path] = (self._folders, self._items)
         self._scan_cache.move_to_end(path)
@@ -1437,6 +1549,105 @@ class AlbumBrowserView(QWidget):
         self._update_count()
         log.info("album.open", path=path, cached=False,
                  folders=len(self._folders), images=len(self._items))
+
+    # ── Search ────────────────────────────────────────────────────────────────
+
+    def _is_searching(self) -> bool:
+        return bool(self._filter_text.strip())
+
+    def _display_items(self) -> list:
+        """Items the grid should show: library results, folder filter, or all."""
+        if self._search_results is not None:
+            return self._search_results
+        t = self._filter_text.strip().lower()
+        if not t:
+            return self._items
+        return [it for it in self._items if t in it.name.lower()]
+
+    def _on_search_text(self, text: str):
+        self._filter_text = text
+        # Typing always filters the current folder live; library results are only
+        # produced on Enter, so drop any stale result set as soon as text changes.
+        self._search_results = None
+        self._render_grid()
+        self._update_count()
+        self._kick_mosaic_width()
+
+    def _on_search_submit(self):
+        """Enter — run a library-wide index search when that scope is active."""
+        text = self._filter_text.strip()
+        if not text or self._search_scope != "library":
+            return
+        try:
+            from . import index as index_mod
+            rows = index_mod.search(filename_like=text, order_by="date_taken", limit=2000)
+            self._search_results = [
+                ImageItem(path=r["path"], name=os.path.basename(r["path"]))
+                for r in rows if os.path.isfile(r["path"])
+            ]
+            log.info("library search", q=text, hits=len(self._search_results))
+        except Exception as e:
+            log.error("library search failed", err=str(e))
+            self._search_results = []
+        self._render_grid()
+        self._update_count()
+        self._kick_mosaic_width()
+
+    def _toggle_search_scope(self):
+        self._search_scope = "library" if self._search_scope == "folder" else "folder"
+        self._scope_btn.setText("Whole library" if self._search_scope == "library"
+                                else "This folder")
+        self._search.setPlaceholderText(
+            "Search the whole library… (Enter)" if self._search_scope == "library"
+            else "Filter this folder…")
+        self._search_results = None
+        if self._is_searching():
+            if self._search_scope == "library":
+                self._on_search_submit()
+            else:
+                self._render_grid()
+                self._update_count()
+                self._kick_mosaic_width()
+
+    def focus_search(self):
+        self._search.setFocus()
+        self._search.selectAll()
+
+    def clear_search(self) -> bool:
+        """Returns True if a search was actually cleared."""
+        if not self._is_searching() and self._search_results is None:
+            return False
+        self._search.clear()          # triggers _on_search_text
+        return True
+
+    # ── Bulk-action bar ───────────────────────────────────────────────────────
+
+    def _on_selection_changed(self, count: int):
+        self._bulk_label.setText(f"{count:,} selected")
+        self._bulk_bar.setVisible(count > 0)
+
+    def _selected_indices(self) -> list[int]:
+        m = getattr(self, "_mosaic", None)
+        return sorted(m._selected) if m is not None else []
+
+    def _bulk_transfer(self, *, move: bool):
+        m = getattr(self, "_mosaic", None)
+        idxs = self._selected_indices()
+        if m is None or not idxs:
+            return
+        paths = [m._items[i].path for i in idxs if 0 <= i < len(m._items)]
+        m._choose_and_transfer(paths, move=move)
+
+    def _bulk_delete(self):
+        m = getattr(self, "_mosaic", None)
+        idxs = self._selected_indices()
+        if m is not None and idxs:
+            m._delete_paths(idxs)
+
+    def _bulk_clear(self):
+        m = getattr(self, "_mosaic", None)
+        if m is not None:
+            m._set_selection(set())
 
     def _force_rescan(self):
         # Drop just the current folder from cache and rescan it.
@@ -1514,13 +1725,18 @@ class AlbumBrowserView(QWidget):
         self._scan_and_render()
 
     def _update_count(self):
+        if self._is_searching():
+            n = len(self._display_items())
+            where = "library" if self._search_scope == "library" else "folder"
+            self._count_label.setText(f"{n:,} result{'s' if n != 1 else ''} in {where}")
+            return
         nf = len(self._folders)
         ni = len(self._items)
         parts = []
         if nf:
-            parts.append(f"{nf} folder{'s' if nf != 1 else ''}")
+            parts.append(f"{nf:,} folder{'s' if nf != 1 else ''}")
         if ni:
-            parts.append(f"{ni} image{'s' if ni != 1 else ''}")
+            parts.append(f"{ni:,} image{'s' if ni != 1 else ''}")
         text = "  ·  ".join(parts) if parts else "empty"
         if self._was_cached:
             text += "  ·  cached"
@@ -1542,24 +1758,35 @@ class AlbumBrowserView(QWidget):
             except Exception:
                 pass
             self._mosaic = None
+        if hasattr(self, "_bulk_bar"):
+            self._bulk_bar.hide()
 
         cols = self._columns()
         self._last_cols = cols
         row = 0
         col = 0
 
+        items = self._display_items()
+        searching = self._is_searching()
+
         # Empty placeholder
-        if not self._folders and not self._items:
-            empty = QLabel("This folder is empty.")
+        if not self._folders and not items:
+            if searching:
+                msg = (f"No matches for “{self._filter_text}”.\n\n"
+                       "Try a different word, or switch the scope to Whole library.")
+            else:
+                msg = ("No photos or subfolders here.\n\n"
+                       "Drop images or a folder in, or press Esc to go back.")
+            empty = QLabel(msg)
             empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
             empty.setStyleSheet(
-                f"color: {_css_color('muted')}; font-size: 14px; padding: 40px;"
+                f"color: {_css_color('muted')}; font-size: 14px; padding: 40px; line-height: 150%;"
             )
             self._grid.addWidget(empty, 0, 0)
             return
 
-        # Section: Folders (uniform grid — folders need their name caption)
-        if self._folders:
+        # Section: Folders (hidden while searching — results are images)
+        if self._folders and not searching:
             header = self._make_section_header(f"FOLDERS ({len(self._folders)})")
             self._grid.addWidget(header, row, 0, 1, cols)
             row += 1
@@ -1576,17 +1803,20 @@ class AlbumBrowserView(QWidget):
                 col = 0; row += 1
 
         # Section: Images (justified mosaic — variable widths, no crop)
-        if self._items:
-            header = self._make_section_header(f"IMAGES ({len(self._items)})")
+        if items:
+            label = (f"RESULTS ({len(items):,})" if searching
+                     else f"IMAGES ({len(items):,})")
+            header = self._make_section_header(label)
             self._grid.addWidget(header, row, 0, 1, cols)
             row += 1
-            self._mosaic = _ImageMosaic(self._items, self._source, parent=self._grid_host)
+            self._mosaic = _ImageMosaic(items, self._source, parent=self._grid_host)
             self._mosaic.clicked.connect(self._on_image_clicked)
             self._mosaic.removed.connect(self._on_items_removed)
             self._mosaic.reload_requested.connect(self._force_rescan)
+            self._mosaic.selection_changed.connect(self._on_selection_changed)
             self._mosaic.scroll_to.connect(self._scroll_mosaic_to)
             self._mosaic.load_progress.connect(self._set_load_progress)
-            self._set_load_progress(0, len(self._items))
+            self._set_load_progress(0, len(items))
             self._grid.addWidget(self._mosaic, row, 0, 1, max(cols, 1))
             # Push the row's column stretch so the mosaic spans full width.
             for c in range(max(cols, 1)):

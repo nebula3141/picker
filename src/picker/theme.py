@@ -311,6 +311,10 @@ def dialog_qss() -> str:
     QPushButton#danger {{ background: transparent; color: #ef6b6b; border: 1px solid #45272a; }}
     QPushButton#danger:hover {{ background: #2a1618; border-color: #ef6b6b; color: #ffffff; }}
 
+    /* Keyboard focus — a visible accent ring so Tab is followable. */
+    QPushButton:focus {{ border: 2px solid {a}; }}
+    QCheckBox:focus::indicator, QRadioButton:focus::indicator {{ border: 1px solid {a}; }}
+
     QFrame#divider {{ background: #26262c; max-height: 1px; border: 0; }}
 
     QScrollBar:vertical {{ background: transparent; width: 12px; margin: 2px; }}

@@ -33,6 +33,7 @@ class _RootCard(QFrame):
         self._root = root
         self.setFixedSize(CARD_W, CARD_H)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip(root.get("path", ""))
         self.setObjectName("rootCard")
         self.setStyleSheet("""
             QFrame#rootCard {

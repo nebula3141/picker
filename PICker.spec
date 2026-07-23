@@ -50,7 +50,7 @@ a = Analysis(
         'PyQt6.Qt3DInput', 'PyQt6.Qt3DLogic', 'PyQt6.Qt3DAnimation',
         'PyQt6.Qt3DExtras', 'PyQt6.QtRemoteObjects', 'PyQt6.QtHelp',
         'PyQt6.QtOpenGL', 'PyQt6.QtOpenGLWidgets', 'PyQt6.QtSpatialAudio',
-        'PyQt6.QtDBus', 'PyQt6.QtXml', 'PyQt6.QtSvg', 'PyQt6.QtSvgWidgets',
+        'PyQt6.QtDBus', 'PyQt6.QtXml', 'PyQt6.QtSvgWidgets',
         'PyQt6.QtPrintSupport', 'PyQt6.QtConcurrent', 'PyQt6.QtStateMachine',
         'PyQt6.QtTextToSpeech', 'PyQt6.QtWebView',
         'tkinter', '_tkinter', 'Tkinter', 'unittest', 'test', 'tests',
