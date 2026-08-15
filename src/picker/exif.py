@@ -104,6 +104,10 @@ def read_exif(path: str) -> dict:
             sa = pick("SubjectArea", "SubjectLocation")
             if sa:
                 out["subject_area"] = tuple(sa) if isinstance(sa, (tuple, list)) else sa
+            # GPS — extracted here so it rides the same cache (one file read).
+            gps = _extract_gps(exif)
+            if gps is not None:
+                out["gps"] = gps
             _cache[key] = out
             _cache.move_to_end(key)
             while len(_cache) > _CACHE_MAX:
@@ -111,6 +115,50 @@ def read_exif(path: str) -> dict:
             return out
     except Exception:
         return {}
+
+
+def _gps_to_degrees(value) -> float | None:
+    """(deg, min, sec) rationals → signed decimal degrees magnitude."""
+    try:
+        d, m, s = value
+        return float(d) + float(m) / 60.0 + float(s) / 3600.0
+    except Exception:
+        return None
+
+
+def _extract_gps(exif) -> tuple[float, float] | None:
+    """Pull (lat, lon) from an already-open PIL Exif object, or None."""
+    try:
+        gps = exif.get_ifd(ExifTags.IFD.GPSInfo)
+        if not gps:
+            return None
+        lat = _gps_to_degrees(gps.get(2))   # GPSLatitude
+        lon = _gps_to_degrees(gps.get(4))   # GPSLongitude
+        if lat is None or lon is None:
+            return None
+        if str(gps.get(1, "N")).upper().startswith("S"):
+            lat = -lat
+        if str(gps.get(3, "E")).upper().startswith("W"):
+            lon = -lon
+        # Reject the null island / clearly-invalid coords.
+        if abs(lat) < 1e-6 and abs(lon) < 1e-6:
+            return None
+        if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+            return None
+        return (lat, lon)
+    except Exception:
+        return None
+
+
+def read_gps(path: str) -> tuple[float, float] | None:
+    """Return (latitude, longitude) in decimal degrees, via the cached EXIF read."""
+    return read_exif(path).get("gps")
+
+
+def map_url(lat: float, lon: float) -> str:
+    """OpenStreetMap link centred on the coordinate with a marker."""
+    return (f"https://www.openstreetmap.org/?mlat={lat:.6f}&mlon={lon:.6f}"
+            f"#map=15/{lat:.6f}/{lon:.6f}")
 
 
 def format_lines(exif: dict) -> list[str]:

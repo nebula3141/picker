@@ -28,11 +28,18 @@ bin, taskbar integration), but nothing is conceptually Windows-only except those
 
 - **Images:** JPEG, PNG, TIFF, BMP, WEBP, **SVG/SVGZ** (vector — rendered crisp at screen
   resolution; a destructive edit on one writes a PNG sibling).
+- **Modern (HEIC/AVIF):** HEIC, HEIF, HIF, AVIF — iPhone photos and modern formats open,
+  browse, thumbnail and sort like any other image. Decoded via pillow-heif (bundled in the
+  installer/portable build); if it's missing these files simply aren't decodable.
+- **Animated:** animated GIF, WEBP and APNG play in the viewer (rather than showing only the
+  first frame).
 - **RAW:** Canon CR2/CR3, Nikon NEF, Sony ARW, Adobe DNG, Fuji RAF, Olympus ORF, Panasonic
   RW2, Pentax PEF, Samsung SRW.
 - **Video:** MP4, M4V, MOV, MKV, WEBM, AVI, MTS, M2TS, WMV, 3GP, OGV.
 - Video support is optional at runtime — if the video backend/tools are missing, videos
   show a placeholder but everything else still works.
+- If a file can't be opened (corrupt or unsupported), the viewer shows a single-line error
+  instead of a blank frame.
 
 ---
 
@@ -178,6 +185,10 @@ releases the file when leaving so the file can be moved/renamed/deleted.)
   configured save mode; selecting multiple images rotates them all.)
 - **Selection** → your saved send locations (click to send instantly, ✕ to remove) plus
   "Copy/Move to a new folder…". This replaces the old "Move to" / "Copy to" submenus.
+- **Copy Image** (`Ctrl+C`) → copies the picture itself to the clipboard, so you can paste it
+  straight into a document, email, or chat. (Images only.)
+- **Show on Map** → opens the photo's GPS location in your browser (OpenStreetMap). Only shown
+  when the photo actually carries GPS EXIF data.
 - **Copy Path**, **Reveal in file manager**.
 - In the mosaic: **Open in Slideshow**, **Select All / Clear Selection**.
 - **Delete (Recycle Bin)**.
@@ -373,7 +384,7 @@ All local and disposable:
 **Slideshow — tools**
 - Rotate clockwise / counter-clockwise; save rotation; crop; histogram; focus peaking;
   info panel; compare; open with system default; open-with menu; reveal in file manager;
-  delete to recycle bin.
+  **copy image to clipboard (`Ctrl+C`)**; delete to recycle bin.
 
 **Slideshow — sorting (when destinations exist)**
 - Send to destination 1/2/3; send to active destination; cycle active destination; undo.
@@ -383,6 +394,8 @@ All local and disposable:
 
 **Folder browser**
 - Focus search; clear search; back one level.
+- Arrow keys move between folder tiles; Enter (or Space) opens the focused folder. Opening the
+  browser focuses the first tile, so it's drivable without the mouse.
 
 **Compare mode**
 - Left/right move the active side; switch active side; swap the two images; zoom active;

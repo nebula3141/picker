@@ -19,6 +19,25 @@ if os.path.isdir(_bin_dir):
         if os.path.isfile(_p) and _f.lower().endswith(('.exe', '.dll')):
             _extra_binaries.append((_p, 'bin'))
 
+# pillow-heif ships native HEIF/AVIF codec libraries; collect them so packaged
+# builds can open .heic/.avif. Tolerate its absence (HEIF is an optional feature).
+_heif_datas, _heif_binaries, _heif_hidden = [], [], []
+try:
+    from PyInstaller.utils.hooks import collect_all as _collect_all
+    _heif_datas, _heif_binaries, _heif_hidden = _collect_all('pillow_heif')
+except Exception:
+    pass
+
+# Bundle first-run coach-mark assets (screenshots) under picker/assets/coach.
+_assets_dir = os.path.join(_src, 'picker', 'assets')
+_asset_datas = []
+if os.path.isdir(_assets_dir):
+    for _dp, _dn, _fn in os.walk(_assets_dir):
+        for _f in _fn:
+            _full = os.path.join(_dp, _f)
+            _rel = os.path.relpath(os.path.dirname(_full), _src)
+            _asset_datas.append((_full, _rel))
+
 # Optional assets — tolerate their absence so the spec still builds.
 _ver_file = os.path.join(_src, 'version_info.txt')
 _version = _ver_file if os.path.isfile(_ver_file) else None
@@ -28,11 +47,12 @@ _icon = _icon_file if os.path.isfile(_icon_file) else None
 a = Analysis(
     [os.path.join(_src, 'main.py')],
     pathex=[_src],
-    binaries=_extra_binaries,
-    datas=[],
+    binaries=_extra_binaries + _heif_binaries,
+    datas=_heif_datas + _asset_datas,
     hiddenimports=[
         'PyQt6.QtMultimedia',
         'PyQt6.QtMultimediaWidgets',
+        *_heif_hidden,
     ],
     hookspath=[],
     hooksconfig={},

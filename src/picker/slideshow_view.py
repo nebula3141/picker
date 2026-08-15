@@ -29,6 +29,7 @@ from .gallery_view import cache_file as gallery_cache_file, THUMB_MAX_DIM
 from . import external
 from . import exif as exif_mod
 from . import raw_loader
+from . import heif_loader
 from . import settings as settings_mod
 from . import conflict_dialog
 from . import theme as theme_mod
@@ -160,6 +161,16 @@ class ImageLoadTask(QRunnable):
                                      Qt.TransformationMode.SmoothTransformation)
                 return img
 
+        if heif_loader.is_heif(rec.path) and heif_loader.available():
+            img = heif_loader.load_heif(rec.path)
+            if img is not None and not img.isNull():
+                ssz = _smart_scaled_size(img.width(), img.height(), pct)
+                if ssz is not None:
+                    img = img.scaled(ssz[0], ssz[1],
+                                     Qt.AspectRatioMode.KeepAspectRatio,
+                                     Qt.TransformationMode.SmoothTransformation)
+                return img
+
         reader = QImageReader(rec.path)
         reader.setAutoTransform(True)
         size = reader.size()
@@ -179,8 +190,9 @@ class ImageLoadTask(QRunnable):
                 reader.setScaledSize(QSize(ssz[0], ssz[1]))
         img = reader.read()
         if img.isNull():
-            img = QImage(400, 300, QImage.Format.Format_RGB32)
-            img.fill(QColor(60, 60, 60))
+            # Signal failure with a null image — the view shows a one-line error
+            # instead of a blank grey box.
+            return QImage()
         return img
 
 
@@ -217,6 +229,7 @@ class ImageCanvas(QWidget):
         self._peaking_overlay: QImage | None = None
         self._double_click_enabled = False
         self._raw_loading = False
+        self._error_text: str | None = None    # single-line load-failure message
 
         # "Sent" feedback — a brief accent edge-flash after move/copy/send.
         self._flash_phase = 0.0
@@ -439,7 +452,16 @@ class ImageCanvas(QWidget):
             (p.y() - self._offset.y()) / self._zoom,
         )
 
+    def set_error(self, message: str):
+        """Show a single-line failure message in place of the image."""
+        self._error_text = message
+        self._pixmap = None
+        self._base_pixmap = None
+        self._raw_loading = False
+        self.update()
+
     def set_pixmap(self, pm: QPixmap, key: object | None = None, rotation: int = 0):
+        self._error_text = None
         if self._animate and self._pixmap and not self._pixmap.isNull() and key is not None:
             self._start_fade()
         self._base_pixmap = pm
@@ -464,6 +486,16 @@ class ImageCanvas(QWidget):
             self._compute_histogram()
         if self._show_peaking and self._peaking_overlay is None:
             QTimer.singleShot(0, self._recompute_peaking)
+        self.update()
+
+    def set_animation_frame(self, pm: QPixmap):
+        """Swap only the frame of a playing animation — keeps the current
+        zoom/pan/fit and skips fade + histogram work (frame sizes are constant)."""
+        if pm is None or pm.isNull():
+            return
+        self._error_text = None
+        self._base_pixmap = pm
+        self._apply_rotation()
         self.update()
 
     def _recompute_peaking(self):
@@ -701,6 +733,13 @@ class ImageCanvas(QWidget):
         p = QPainter(self)
         p.fillRect(event.rect(), theme_mod.c("canvas_bg"))
         if self._pixmap is None or self._pixmap.isNull():
+            if self._error_text:
+                p.setPen(QColor(210, 120, 120))
+                f = p.font()
+                f.setPointSize(13)
+                p.setFont(f)
+                p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter,
+                           f"⚠  {self._error_text}")
             p.end()
             return
         p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
@@ -1749,6 +1788,7 @@ class SlideshowView(QWidget):
     status_changed = pyqtSignal()
     fullscreen_requested = pyqtSignal()
     title_changed = pyqtSignal()
+    files_changed = pyqtSignal()   # a move/delete changed the folder's file set
 
     PIXMAP_CACHE_MAX = 12
     PIXMAP_CACHE_MAX_BYTES = 512 * 1024 * 1024  # 512 MB
@@ -1768,6 +1808,9 @@ class SlideshowView(QWidget):
         self._compare_view = None
         self._filmstrip_deferred = filmstrip_hidden
         self._scan_total = len(manager.images)
+        self._movie = None            # QMovie for animated GIF/WEBP/APNG
+        self._movie_first = True
+        self._anim_cache: dict[str, bool] = {}   # path → is-animated, memoized
 
         self._exif_pos = settings_mod.get("exif_position") or "tr"
         self._hist_pos = settings_mod.get("histogram_position") or "br"
@@ -1795,9 +1838,26 @@ class SlideshowView(QWidget):
 
         QTimer.singleShot(0, self._post_show_settle)
         QTimer.singleShot(80, self._post_show_settle)
+        QTimer.singleShot(350, self._maybe_show_resume_toast)
 
         if self._filmstrip_deferred:
             QTimer.singleShot(200, self._kick_background_scan)
+
+    def _maybe_show_resume_toast(self):
+        """If we opened the folder at a remembered position (not the start),
+        tell the user so — with a nudge that Home jumps back to the first photo.
+
+        This fires on a delayed timer, so the view may already be torn down
+        (its C++ widgets deleted) — the broad guard keeps that from raising."""
+        try:
+            saved = settings_mod.get_position(self._manager.source_folder)
+            total = len(self._manager.images)
+            if self._idx > 0 and self._idx == saved and total > 1:
+                self._toast.show_message(
+                    f"↩ Resumed at photo {self._idx + 1} of {total}  ·  Home = start over",
+                    ms=2600)
+        except Exception:
+            return
 
     def _post_show_settle(self):
         if hasattr(self, "_canvas"):
@@ -2109,6 +2169,7 @@ class SlideshowView(QWidget):
     def _load_image(self, idx: int):
         if idx < 0 or idx >= len(self._manager.images):
             return
+        self._stop_movie()   # halt any animation from the image we're leaving
         self._idx = idx
         rec = self._manager.images[idx]
         self._current_path = rec.path
@@ -2129,6 +2190,17 @@ class SlideshowView(QWidget):
 
         key = self._cache_key(idx)
         rotation = self._manager.rotations.get(rec.filename, 0)
+
+        # Animated GIF / WEBP / APNG → play frames via QMovie instead of a still.
+        if self._is_animated_cached(rec.path):
+            if self._start_movie(rec.path, rotation):
+                self._update_status()
+                return
+            # Detected as multi-frame but QMovie couldn't open it → it's broken.
+            # (Don't fall through: the static loader skips animated files.)
+            self._canvas.set_error("Couldn't open this image — the file may be corrupt")
+            self._update_status()
+            return
 
         # Overlay positions read once on slideshow init (settings rarely change mid-session)
         self._canvas.set_overlay_positions(self._exif_pos, self._hist_pos)
@@ -2161,11 +2233,13 @@ class SlideshowView(QWidget):
 
     def _load_video(self, rec):
         """Switch the viewer stack to the video player and start playback."""
-        self._viewer_stack.setCurrentWidget(self._video_view)
         if not self._video_available:
-            self._toast.show_message("Video playback unavailable (PyQt6-Multimedia missing)", ms=2500)
+            self._viewer_stack.setCurrentWidget(self._canvas)
+            self._canvas.set_error("Video playback unavailable — the multimedia "
+                                   "component is missing")
             self._update_status()
             return
+        self._viewer_stack.setCurrentWidget(self._video_view)
         try:
             fsize = os.path.getsize(rec.path)
             if fsize > self._VIDEO_SIZE_WARN_BYTES:
@@ -2184,7 +2258,12 @@ class SlideshowView(QWidget):
         # Don't dispatch the image loader for video files — videos are streamed
         # directly through QMediaPlayer.
         from .media import is_video
-        if is_video(self._manager.images[idx].path):
+        path = self._manager.images[idx].path
+        if is_video(path):
+            return
+        # Animated images play through QMovie, not the static decoder — skip so
+        # preloading GIF/WEBP neighbours doesn't waste a decode.
+        if self._is_animated_cached(path):
             return
         self._inflight.add(idx)
         self._load_t0[idx] = time.perf_counter()
@@ -2199,7 +2278,11 @@ class SlideshowView(QWidget):
 
     @pyqtSlot(str)
     def _on_video_error(self, msg: str):
-        self._toast.show_message(f"Playback error: {msg}", ms=3500)
+        log.warn("video.play failed", msg=msg)
+        self._viewer_stack.setCurrentWidget(self._canvas)
+        self._canvas.set_error("Couldn't play this video — the file may be corrupt "
+                               "or use an unsupported codec")
+        self._update_status()
 
     def _preload(self, idx: int):
         self._start_load(idx)
@@ -2208,6 +2291,19 @@ class SlideshowView(QWidget):
     def _on_image_ready(self, idx: int, img: QImage):
         self._inflight.discard(idx)
         t0 = self._load_t0.pop(idx, None)
+        # Null image = decode failed. Don't cache it; show a one-line error if
+        # it's the photo currently on screen (a failed preload just stays absent
+        # so it retries when navigated to).
+        if img.isNull():
+            if t0 is not None:
+                rec = self._manager.images[idx] if idx < len(self._manager.images) else None
+                log.warn("image.decode failed",
+                         file=os.path.basename(rec.path) if rec else "?", idx=idx)
+            if idx == self._idx:
+                self._canvas.set_error("Couldn't open this image — the file may be "
+                                       "corrupt or an unsupported format")
+                self._update_status()
+            return
         if t0 is not None:
             ms = (time.perf_counter() - t0) * 1000
             rec = self._manager.images[idx] if idx < len(self._manager.images) else None
@@ -2242,6 +2338,69 @@ class SlideshowView(QWidget):
         for off in range(1, self._preload_count + 1):
             self._preload(self._idx + off)
             self._preload(self._idx - off)
+
+    # Only these container formats can hold multiple frames — everything else
+    # (jpg/heic/tiff/raw/svg/…) skips the frame-count probe entirely.
+    _ANIMATABLE_EXTS = (".gif", ".webp", ".apng", ".png")
+
+    @classmethod
+    def _is_animated(cls, path: str) -> bool:
+        """True for multi-frame images (animated GIF/WEBP/APNG)."""
+        if os.path.splitext(path)[1].lower() not in cls._ANIMATABLE_EXTS:
+            return False
+        try:
+            from PyQt6.QtGui import QImageReader
+            r = QImageReader(path)
+            return r.supportsAnimation() and r.imageCount() > 1
+        except Exception:
+            return False
+
+    def _is_animated_cached(self, path: str) -> bool:
+        """Memoized _is_animated — the current image and its preloaded neighbours
+        would otherwise re-probe the same PNG/WEBP header on the hot path."""
+        v = self._anim_cache.get(path)
+        if v is None:
+            v = self._is_animated(path)
+            self._anim_cache[path] = v
+        return v
+
+    def _start_movie(self, path: str, rotation: int) -> bool:
+        """Play an animated image via QMovie. Returns False if it can't (caller
+        then falls back to a static decode)."""
+        from PyQt6.QtGui import QMovie
+        movie = QMovie(path)
+        if not movie.isValid():
+            return False
+        self._movie = movie
+        self._movie_rotation = rotation
+        self._movie_first = True
+        movie.frameChanged.connect(self._on_movie_frame)
+        movie.start()
+        return True
+
+    @pyqtSlot(int)
+    def _on_movie_frame(self, _frame_no: int):
+        if self._movie is None:
+            return
+        pm = self._movie.currentPixmap()
+        if pm.isNull():
+            return
+        if self._movie_first:
+            self._movie_first = False
+            # First frame: full set so the canvas fits it to the window.
+            self._canvas.set_pixmap(pm, key=None, rotation=self._movie_rotation)
+        else:
+            self._canvas.set_animation_frame(pm)
+
+    def _stop_movie(self):
+        if self._movie is not None:
+            try:
+                self._movie.frameChanged.disconnect(self._on_movie_frame)
+            except Exception:
+                pass
+            self._movie.stop()
+            self._movie.deleteLater()
+            self._movie = None
 
     def _go_next(self):
         if self._idx + 1 < len(self._manager.images):
@@ -2296,6 +2455,10 @@ class SlideshowView(QWidget):
             self._toast.show_message("Skipped")
             return
         verb = "Moved" if self._manager.mode == "move" else "Copied"
+        if self._manager.mode == "move":
+            # File left the source folder — mark the browser stale so it refreshes
+            # on return instead of restoring a tile that points at a gone file.
+            self.files_changed.emit()
         self._flash_if_enabled()
         self._toast.show_message(
             f"✓  {verb} to  {dest_name}", ms=3000,
@@ -2313,6 +2476,7 @@ class SlideshowView(QWidget):
             self._toast.show_message("Nothing to undo")
             return
         self._toast.show_message("↩  Undone")
+        self.files_changed.emit()   # undo may have restored a moved file to the folder
         self.status_changed.emit()
         self._filmstrip.refresh()
         self._update_status()
@@ -2391,7 +2555,8 @@ class SlideshowView(QWidget):
                 + title_html
             )
         if self._manager.scan_complete:
-            counter = f'[{self._idx + 1} / {total}]'
+            pct = round((self._idx + 1) / total * 100) if total else 0
+            counter = f'[{self._idx + 1} / {total} · {pct}%]'
         else:
             counter = f'[{self._idx + 1}]'
         self._title.setText(
@@ -2574,6 +2739,8 @@ class SlideshowView(QWidget):
             self._send_to(2)
         elif has_dest and key == Qt.Key.Key_Tab:
             self._cycle_dest()
+        elif ctrl and key == Qt.Key.Key_C:
+            self._copy_image_to_clipboard()      # Ctrl+C — copy picture to clipboard
         elif ctrl and key == Qt.Key.Key_Z:
             if self._last_transfer is not None:
                 self._undo_last_transfer()
@@ -2642,6 +2809,7 @@ class SlideshowView(QWidget):
             ("OPEN", [
                 ("O", "System default"),
                 ("Ctrl+O", "Open with…"),
+                ("Ctrl+C", "Copy image to clipboard"),
                 ("E", "Reveal in Explorer"),
             ]),
             ("COMPARE", [
@@ -2843,11 +3011,26 @@ class SlideshowView(QWidget):
 
         menu.addSeparator()
 
+        if not video:
+            act_copy_img = menu.addAction(menu_icon("copy"), "Copy Image")
+            act_copy_img.setShortcut("Ctrl+C")
+            act_copy_img.setToolTip("Copy the picture to the clipboard "
+                                    "(paste into a document, chat, etc.)")
+            act_copy_img.triggered.connect(self._copy_image_to_clipboard)
         act_copy = menu.addAction(menu_icon("copy_path"), "Copy Path")
         act_copy.triggered.connect(lambda: QApplication.clipboard().setText(path))
         act_reveal = menu.addAction(menu_icon("reveal"), "Reveal in Explorer")
         act_reveal.setShortcut("E")
         act_reveal.triggered.connect(self._reveal_in_explorer)
+
+        # "Show on Map" only appears when the photo actually carries GPS EXIF.
+        if not video:
+            coords = exif_mod.read_gps(path)
+            if coords is not None:
+                act_map = menu.addAction(menu_icon("reveal"), "Show on Map")
+                act_map.setToolTip(f"Open {coords[0]:.4f}, {coords[1]:.4f} in your browser")
+                act_map.triggered.connect(
+                    lambda _=False, c=coords: self._open_map(*c))
 
         menu.addSeparator()
         act_del = menu.addAction(menu_icon("delete"), "Delete (Recycle Bin)")
@@ -2855,6 +3038,24 @@ class SlideshowView(QWidget):
         act_del.triggered.connect(self._delete_current)
 
         menu.exec(event.globalPos())
+
+    def _open_map(self, lat: float, lon: float):
+        """Open the photo's GPS location in the default browser (OpenStreetMap)."""
+        from PyQt6.QtGui import QDesktopServices
+        from PyQt6.QtCore import QUrl
+        QDesktopServices.openUrl(QUrl(exif_mod.map_url(lat, lon)))
+        self._toast.show_message(f"📍 {lat:.5f}, {lon:.5f}", ms=1600)
+
+    def _copy_image_to_clipboard(self):
+        """Put the current picture on the system clipboard so it can be pasted
+        into a document, email, chat, etc. Uses the displayed (rotation-applied)
+        pixmap."""
+        pm = getattr(self._canvas, "_pixmap", None)
+        if pm is None or pm.isNull():
+            self._toast.show_message("Image still loading — try again", ms=1500)
+            return
+        QApplication.clipboard().setImage(pm.toImage())
+        self._toast.show_message("Image copied to clipboard", ms=1200)
 
     def _rotate_current(self, delta: int = 90):
         new_rot = self._canvas.rotate_by(delta)
@@ -2940,6 +3141,10 @@ class SlideshowView(QWidget):
         self._flash_if_enabled()
         self._last_transfer = {"op": "move" if move else "copy", "src": src,
                                "dst": dst, "idx": idx, "rec": rec}
+        # A move removes the file from the folder we came from; flag the browser
+        # so it refreshes on return instead of restoring a stale tile.
+        if move:
+            self.files_changed.emit()
         verb = "Moved" if move else "Copied"
         if move:
             self._manager.images.pop(idx)
@@ -2953,6 +3158,10 @@ class SlideshowView(QWidget):
             self.status_changed.emit()
         self._toast.show_message(f"{verb} → {name}", ms=2200,
                                  action="Undo", action_cb=self._undo_last_transfer)
+        # Auto-advance: a move already slid the next image into place; a copy
+        # leaves the current one, so step forward if the setting is on.
+        if not move and self._auto_advance:
+            self._go_next()
 
     def _undo_last_transfer(self):
         """Reverse the most recent move / copy / delete."""
@@ -2980,6 +3189,7 @@ class SlideshowView(QWidget):
         self._idx = idx
         self._load_image(self._idx)
         self._filmstrip.refresh()
+        self.files_changed.emit()   # undo of a move restored the file
         self.status_changed.emit()
 
     # ── Delete to Recycle Bin ────────────────────────────────────────────────
@@ -3008,6 +3218,7 @@ class SlideshowView(QWidget):
             return
         self._toast.show_message("→ Recycle Bin", ms=1500)
         self._manager.images.pop(self._idx)
+        self.files_changed.emit()
         if not self._manager.images:
             self.closed.emit(0)
             return
@@ -3082,6 +3293,7 @@ class SlideshowView(QWidget):
     def cleanup(self):
         """Called by MainWindow before this view is removed from the stack.
         Embedded widgets don't get closeEvent — do worker pool teardown here."""
+        self._stop_movie()
         if self._compare_view is not None:
             self._compare_view.cleanup()
             self._compare_view = None

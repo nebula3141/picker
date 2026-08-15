@@ -223,6 +223,13 @@ class ImageInfoPanel(QWidget):
             time_sec = _Section("Captured")
             time_sec.add_row("Date/time", ex.get("datetime") or "—")
             self._insert(time_sec)
+
+            coords = exif_mod.read_gps(path)
+            if coords is not None:
+                loc_sec = _Section("Location")
+                loc_sec.add_row("GPS", f"{coords[0]:.5f}, {coords[1]:.5f}")
+                loc_sec.add_row("", "Right-click → Show on Map")
+                self._insert(loc_sec)
         else:
             no_exif = _Section("EXIF")
             no_exif.add_row("Status", "Not available")

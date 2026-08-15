@@ -1,5 +1,88 @@
 # Changelog
 
+## v4.10.0 (2026-08-14)
+
+### New features
+- **HEIC / HEIF / AVIF support** — iPhone photos and modern formats open, browse,
+  thumbnail and sort like any other image (via pillow-heif; bundled in installs).
+- **Animated GIF / WEBP / APNG play** in the viewer instead of showing a frozen
+  first frame.
+- **Show on Map** — right-click a photo with GPS to open its location in your
+  browser (OpenStreetMap); coordinates also appear in the Info panel.
+- **Auto-advance on send** now applies to the **Selection** menu too — copy/send
+  a photo and PICker jumps to the next automatically, so you can rapid-fire sort.
+- **Progress + resume** — the viewer counter shows how far through you are
+  (`[42 / 900 · 5%]`), and reopening a folder resumes where you left off with a
+  brief "Resumed at photo X" note (Home jumps back to the first).
+- **First-run welcome** — a short three-card guide to browsing, sorting, and
+  shortcuts, shown once (reopen any time from Help → Getting Started).
+
+### Keyboard access & Copy Image
+- **Folder tiles are now keyboard-navigable** — arrow keys move between folders,
+  **Enter** (or Space) opens the focused folder, and a clear focus ring shows
+  where you are. Opening the browser puts focus on the first tile, so you can
+  drive it without touching the mouse.
+- **Escape now goes back one level at a time** (subfolder → parent → … → library),
+  instead of jumping straight out to the library.
+- **Copy Image** — a new right-click option (and **Ctrl+C**) in the image viewer,
+  and in the folder browser's right-click menu, copies the picture to the
+  clipboard so you can paste it straight into a document, email, or chat.
+
+### No more redundant re-scan on Back
+- Returning from the image viewer to the folder browser is now **instant** — the
+  browser is kept alive while you view, so pressing **Escape** restores it exactly
+  as it was (same scroll position, no rescan). It only refreshes — and only the
+  one folder — when you actually moved or deleted a file in the viewer.
+
+### Faster, streamlined loading
+- **Folders now open instantly, no matter how deep the tree.** The per-subfolder
+  recursive walk that used to freeze the browser (counting every image and finding
+  a cover before the first paint) no longer blocks. A folder paints immediately —
+  subfolders show a **"counting…"** placeholder while their real image count and
+  cover **stream in from the background**, top-down, and fill the tiles in place.
+- Empty subfolders are pruned once their walk finishes; the finished result is
+  cached so re-visiting a folder is instant with correct counts.
+- **Uses your CPU cores:** several walker threads share one ordered queue, so
+  counts fill in as fast as the machine allows while still resolving the visible
+  (top) folders first. Thumbnail/cover decodes run on their own pool alongside.
+- **Scrolling stays smooth while a folder loads.** All background decode/scan
+  threads now run at low OS priority, so the UI thread always wins the cores it
+  needs to paint scroll frames — opening a folder no longer stutters the grid.
+  Thread pools were also right-sized so a folder open doesn't oversubscribe the
+  CPU with four competing pools.
+- **Reopening a folder or gallery is now near-instant.** Image dimensions are
+  remembered in a small per-folder cache, so the justified grid lays out with the
+  correct shapes on the very first paint — no per-image header-read pass and no
+  re-justify shuffle. A folder you've opened before (this session or a previous
+  one) does **zero** dimension decodes; combined with the on-disk thumbnail cache,
+  the grid is right immediately and thumbs stream straight off disk. The cache
+  self-invalidates when a file changes.
+
+### SVG
+- SVG/SVGZ **thumbnails and folder covers are now crisp** — vectors rasterize up
+  to thumbnail resolution instead of being decoded at their tiny intrinsic size
+  and stretched.
+- **Gallery layout no longer stalls behind thumbnail decodes** — dimension reads
+  (which the justified layout waits on) get their own thread pool, so rows lay out
+  while heavy decodes proceed separately.
+
+### Reliability
+- **Clear load errors** — if an image or video can't be opened (corrupt file,
+  unsupported codec), the viewer now shows a single explanatory line instead of a
+  blank grey frame.
+- **Library indexing no longer freezes the window** — the optional launch scan now
+  runs on a background thread.
+
+### Fixes
+- Fixed a cache bug where moving a photo out of a folder while its counts were
+  still streaming could leave that folder stuck showing "counting…" on return.
+- Fixed the folder browser being restored stale after a **move** (or its undo) in
+  the sort workflow — it now refreshes just that folder on return.
+- Fixed a blank view that could appear when opening an image from a folder that
+  had just become empty.
+- Animated files that can't be decoded now show the load-error line instead of
+  sticking on a placeholder.
+
 ## v4.9.0 (2026-07-23)
 
 ### Search

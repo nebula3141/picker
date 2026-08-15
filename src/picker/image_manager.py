@@ -12,6 +12,8 @@ from . import settings as settings_mod
 SUPPORTED_EXTENSIONS = {
     # Common raster
     ".jpg", ".jpeg", ".png", ".tiff", ".tif", ".bmp", ".webp",
+    # Modern (HEIC/AVIF — decoded via pillow-heif when installed)
+    ".heic", ".heif", ".hif", ".avif",
     # Vector
     ".svg", ".svgz",
     # RAW
@@ -24,6 +26,7 @@ FILE_TYPE_MAP = {
     "tiff": {".tiff", ".tif"},
     "webp": {".webp"},
     "bmp":  {".bmp"},
+    "heif": {".heic", ".heif", ".hif", ".avif"},
     "svg":  {".svg", ".svgz"},
     "raw":  {".cr2", ".cr3", ".nef", ".arw", ".dng", ".raf", ".orf", ".rw2", ".pef", ".srw"},
 }

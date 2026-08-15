@@ -6,6 +6,10 @@ numpy>=1.24
 # Soft requirement — RAW decode is disabled gracefully if missing.
 rawpy>=0.18
 
+# Soft requirement — HEIC/HEIF/AVIF decode (iPhone photos). Disabled gracefully
+# if missing; bundle with the app so packaged builds can open these.
+pillow-heif>=0.13
+
 # Optional runtime dependencies (no pip package — bundle the binaries):
 # ffmpeg.exe + ffprobe.exe alongside main.py / PICker.exe.
 #   Without them: video thumbnails + ffprobe metadata are skipped.

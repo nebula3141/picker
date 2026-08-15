@@ -6,13 +6,16 @@ count) followed by the loose images sitting directly in that folder. Clicking
 a folder navigates into it (push to the nav stack); clicking an image opens
 the slideshow over the current folder's images.
 
-Scan happens synchronously per level — on huge libraries the caller passes a
-progress callback that drives a LoadingScreen so the UI stays informative.
+Opening a folder is instant regardless of subtree size: a single scandir lists
+the subfolders (with placeholder counts) and the folder's own images, then each
+subfolder's real recursive count + cover stream in from a background pool and
+fill the tiles in place (see _start_folder_stats). Empty subfolders are pruned
+once their walk completes; the enriched result is cached for instant re-visits.
 """
 from __future__ import annotations
 
 import os
-import time
+import threading
 from collections import OrderedDict
 from pathlib import Path
 
@@ -34,6 +37,7 @@ from . import theme as theme_mod
 from . import settings as settings_mod
 from . import log
 from .album import Folder, ImageItem, scan_path
+from . import dim_cache
 from .icon import menu_icon
 from .gallery_view import (
     cache_file as thumb_cache_file,
@@ -41,6 +45,7 @@ from .gallery_view import (
     _HeaderTask,
     _ThumbTask,
     _WorkerSignals,
+    lower_worker_priority,
 )
 
 
@@ -268,6 +273,7 @@ class _CoverTask(QRunnable):
         self.setAutoDelete(True)
 
     def run(self):
+        lower_worker_priority()
         cf = thumb_cache_file(self._source_root, self._cover_path)
         img: QImage | None = None
         if cf.exists():
@@ -277,18 +283,25 @@ class _CoverTask(QRunnable):
             if img is None or img.isNull():
                 img = None
         if img is None:
-            reader = QImageReader(self._cover_path)
-            reader.setAutoTransform(True)
-            size = reader.size()
-            if size.isValid() and size.width() > 0 and size.height() > 0:
-                longest = max(size.width(), size.height())
-                if longest > COVER_LONGEST:
-                    s = COVER_LONGEST / longest
-                    reader.setScaledSize(QSize(
-                        max(1, int(size.width() * s)),
-                        max(1, int(size.height() * s)),
-                    ))
-            img = reader.read()
+            from . import heif_loader
+            if heif_loader.is_heif(self._cover_path) and heif_loader.available():
+                img = heif_loader.load_heif(self._cover_path, max_edge=COVER_LONGEST)
+            if img is None or img.isNull():
+                reader = QImageReader(self._cover_path)
+                reader.setAutoTransform(True)
+                size = reader.size()
+                is_svg = os.path.splitext(self._cover_path)[1].lower() in (".svg", ".svgz")
+                if size.isValid() and size.width() > 0 and size.height() > 0:
+                    longest = max(size.width(), size.height())
+                    # Vectors: rasterize UP to cover size for a crisp thumb (their
+                    # intrinsic size is often tiny). Rasters only scale down.
+                    if is_svg or longest > COVER_LONGEST:
+                        s = COVER_LONGEST / longest
+                        reader.setScaledSize(QSize(
+                            max(1, round(size.width() * s)),
+                            max(1, round(size.height() * s)),
+                        ))
+                img = reader.read()
             if img is None or img.isNull():
                 return
             try:
@@ -297,6 +310,71 @@ class _CoverTask(QRunnable):
             except OSError:
                 pass
         self._signals.ready.emit(self._cover_path, QPixmap.fromImage(img))
+
+
+# ── Background folder-stat streamer ────────────────────────────────────────────
+# scan_path(deep=False) opens a folder instantly with placeholder counts; this
+# fills in each subfolder's real recursive count + cover off the UI thread and
+# streams results back as they land. The walks are CPU/IO-bound and independent,
+# so several workers pull from one shared, ordered queue — using the machine's
+# cores while still resolving the top (visible) folders first. A generation token
+# lets the view discard results from a walk it has already navigated away from.
+
+class _FolderStatSignals(QObject):
+    ready = pyqtSignal(int, str, int, str)   # (gen, folder_path, count, cover)
+    done = pyqtSignal(int)                    # (gen,)
+
+
+class _FolderStatWork:
+    """Thread-safe, in-order work queue shared by the folder-stat workers."""
+    def __init__(self, gen: int, paths: list[str], workers: int):
+        self.gen = gen
+        self.cancelled = False
+        self._paths = paths
+        self._i = 0
+        self._active = workers          # workers still running
+        self._lock = threading.Lock()
+
+    def next(self) -> str | None:
+        with self._lock:
+            if self.cancelled or self._i >= len(self._paths):
+                return None
+            p = self._paths[self._i]
+            self._i += 1
+            return p
+
+    def finish_one(self) -> bool:
+        """Mark one worker done; returns True for the last one to leave."""
+        with self._lock:
+            self._active -= 1
+            return self._active == 0
+
+
+class _FolderStatTask(QRunnable):
+    def __init__(self, work: _FolderStatWork, signals: _FolderStatSignals):
+        super().__init__()
+        self._work = work
+        self._signals = signals
+        self.setAutoDelete(True)
+
+    def run(self):
+        lower_worker_priority()
+        from . import album as _album
+        work = self._work
+        while True:
+            path = work.next()
+            if path is None:
+                break
+            try:
+                count, cover = _album.folder_stat(path)
+            except Exception:
+                count, cover = 0, ""
+            if work.cancelled:
+                break
+            self._signals.ready.emit(work.gen, path, count, cover)
+        # Only the last worker to finish emits done (once).
+        if work.finish_one() and not work.cancelled:
+            self._signals.done.emit(work.gen)
 
 
 # ── Tile widgets ───────────────────────────────────────────────────────────────
@@ -321,6 +399,11 @@ class _BaseTile(QWidget):
         self._item = item
         self._cover: QPixmap | None = None
         self._hover = False
+        self._focused = False
+        # Keyboard-accessible: tiles take focus so arrows move between them and
+        # Enter/Space opens — no mouse required.
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self._nav_cb = None    # browser sets this to handle arrow navigation
         self.setFixedSize(TILE_W, TILE_H)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
@@ -341,14 +424,48 @@ class _BaseTile(QWidget):
         self._hover = False
         self.update()
 
+    def focusInEvent(self, event):
+        self._focused = True
+        self.update()
+
+    def focusOutEvent(self, event):
+        self._focused = False
+        self.update()
+
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
+            self.setFocus(Qt.FocusReason.MouseFocusReason)
             self.clicked.emit(self._item)
+
+    def keyPressEvent(self, event):
+        key = event.key()
+        if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Space):
+            self.clicked.emit(self._item)
+            return
+        if self._nav_cb is not None and key in (
+                Qt.Key.Key_Left, Qt.Key.Key_Right,
+                Qt.Key.Key_Up, Qt.Key.Key_Down):
+            if self._nav_cb(self, key):
+                return
+        # Escape (and anything else) bubbles up so the browser can go back.
+        event.ignore()
 
 
 class FolderTile(_BaseTile):
     def __init__(self, folder: Folder, parent=None):
         super().__init__(folder, parent)
+        # Count/cover may still be unknown (lazy scan) — kept mutable and filled
+        # in by set_stat() once the background walk lands.
+        self._count = folder.image_count
+        self._cover_path = folder.cover_path
+
+    def cover_path(self) -> str:
+        return self._cover_path
+
+    def set_stat(self, count: int, cover_path: str):
+        self._count = count
+        self._cover_path = cover_path
+        self.update()
 
     def paintEvent(self, event):
         p = QPainter(self)
@@ -397,14 +514,18 @@ class FolderTile(_BaseTile):
                    Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, elided)
         f.setPointSize(9); f.setBold(False); p.setFont(f)
         p.setPen(muted)
-        n = self.item.image_count
+        n = self._count
+        caption = "counting…" if n < 0 else f"{n:,} image{'s' if n != 1 else ''}"
         p.drawText(QRect(8, COVER_H + 24, TILE_W - 16, 18),
                    Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-                   f"{n:,} image{'s' if n != 1 else ''}")
+                   caption)
 
-        if self._hover:
+        if self._hover or self._focused:
             p.setBrush(Qt.BrushStyle.NoBrush)
-            p.setPen(QPen(QColor(80, 140, 220), 2))
+            # Brighter, thicker ring when keyboard-focused so it's unmistakable.
+            width = 3 if self._focused else 2
+            color = QColor(90, 160, 240) if self._focused else QColor(80, 140, 220)
+            p.setPen(QPen(color, width))
             p.drawRect(self.rect().adjusted(1, 1, -1, -1))
         p.end()
 
@@ -462,7 +583,10 @@ class _ImageMosaic(QWidget):
         # decodes, so the layout (and the loading bar) crawled. Isolating them
         # lets the grid settle fast while thumbnails fill in independently.
         self._header_pool = QThreadPool()
-        self._header_pool.setMaxThreadCount(max(2, cpu))
+        # Half the cores: headers are fast reads, so this keeps the layout pass
+        # snappy without piling on threads that would compete with the UI and
+        # the folder-stat walkers during a folder open.
+        self._header_pool.setMaxThreadCount(max(2, cpu // 2))
 
         self._pending_headers: set[int] = set()
         self._pending_thumbs: set[int] = set()
@@ -496,21 +620,41 @@ class _ImageMosaic(QWidget):
             self._recompute_layout()
 
     def _dispatch_headers_chunk(self):
-        """Queue the next batch of header reads, then yield to the event loop."""
+        """Resolve the next batch of aspect ratios, then yield to the event loop.
+
+        Dimensions already in the persistent cache (a cheap stat + dict lookup)
+        are applied instantly and cost no thread work — a folder seen before lays
+        out correctly on the first paint with zero header decodes. Only genuinely
+        unknown images fall back to a threaded header read."""
         if self._stopped:
             return  # view was torn down — stop reading headers for a folder we left
         n = len(self._items)
         end = min(n, self._header_dispatch_i + self.HEADER_DISPATCH_CHUNK)
+        resolved_from_cache = 0
         for idx in range(self._header_dispatch_i, end):
+            dims = dim_cache.get(self._source, self._items[idx].path)
+            if dims is not None:
+                w, h = dims
+                if h > 0:
+                    self._aspects[idx] = w / h
+                self._headers_done += 1
+                resolved_from_cache += 1
+                continue
             self._pending_headers.add(idx)
             self._header_pool.start(_HeaderTask(idx, self._items[idx].path, self._signals))
         self._header_dispatch_i = end
+        if resolved_from_cache:
+            # Cache hits produced no worker callbacks — refresh the layout + bar
+            # ourselves so the corrected aspects show without waiting on threads.
+            self.load_progress.emit(self._headers_done, n)
+            self._recompute_layout()
         if end < n:
             from PyQt6.QtCore import QTimer
             QTimer.singleShot(0, self._dispatch_headers_chunk)
 
     def cleanup(self):
         self._stopped = True   # halt the chunked header dispatch loop
+        dim_cache.flush(self._source)   # save any sizes measured this visit
         try:
             self._header_pool.clear()
             self._header_pool.waitForDone(200)
@@ -653,6 +797,7 @@ class _ImageMosaic(QWidget):
         self._headers_done += 1
         if h > 0:
             self._aspects[idx] = w / h
+            dim_cache.put(self._source, self._items[idx].path, w, h)
         # Drive the load bar (coarsely, plus a final exact tick).
         total = len(self._items)
         if self._headers_done >= total or self._headers_done % 25 == 0:
@@ -660,6 +805,8 @@ class _ImageMosaic(QWidget):
         # Relayout while headers are still arriving (every 50) and once at the end.
         if not self._pending_headers or len(self._pending_headers) % 50 == 0:
             self._recompute_layout()
+        if not self._pending_headers and self._header_dispatch_i >= total:
+            dim_cache.flush(self._source)   # persist the freshly-measured sizes
 
     @pyqtSlot(int, QPixmap, int, int)
     def _on_thumb_ready(self, idx: int, pm: QPixmap, w: int, h: int):
@@ -679,6 +826,10 @@ class _ImageMosaic(QWidget):
             if cached <= 0 or abs(actual_aspect - cached) / max(cached, 0.01) > 0.05:
                 self._aspects[idx] = actual_aspect
                 needs_relayout = True
+                # The decoded thumb is authoritative on aspect (it accounts for
+                # EXIF rotation the header read missed) — persist the correction
+                # so the next open lays this tile out right without a reshuffle.
+                dim_cache.put(self._source, self._items[idx].path, w, h)
         if needs_relayout:
             self._schedule_relayout()
             return
@@ -878,8 +1029,13 @@ class _ImageMosaic(QWidget):
             self._cursor = max(self._cursor, 0)
             return
         if key == Qt.Key.Key_Escape:
-            self._set_selection(set())
-            self._anchor = -1
+            if self._selected:
+                # First Escape just clears a multi-selection.
+                self._set_selection(set())
+                self._anchor = -1
+                return
+            # Nothing selected → let Escape bubble up so it goes back a level.
+            event.ignore()
             return
         if key in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace) and self._selected:
             self._delete_paths(sorted(self._selected))
@@ -973,6 +1129,23 @@ class _ImageMosaic(QWidget):
             return sorted(self._selected)
         return [idx] if 0 <= idx < len(self._items) else []
 
+    def _copy_image_to_clipboard(self, path: str):
+        """Load ``path`` and put it on the clipboard for pasting elsewhere."""
+        img = None
+        try:
+            from . import raw_loader
+            if raw_loader.is_raw(path) and raw_loader.available():
+                img = raw_loader.load_raw(path, prefer_thumb=False)
+        except Exception:
+            img = None
+        if img is None or img.isNull():
+            reader = QImageReader(path)
+            reader.setAutoTransform(True)
+            img = reader.read()
+        if img is None or img.isNull():
+            return
+        QApplication.clipboard().setImage(img)
+
     def _show_context_menu(self, idx: int, global_pos):
         targets = self._target_indices(idx)
         if not targets:
@@ -1045,6 +1218,15 @@ class _ImageMosaic(QWidget):
         act_copy_choose.triggered.connect(lambda: self._choose_and_transfer(list(paths), move=False))
 
         menu.addSeparator()
+
+        if not multi:
+            from .media import is_video as _is_video
+            if not _is_video(paths[0]):
+                act_copy_img = menu.addAction(menu_icon("copy"), "Copy Image")
+                act_copy_img.setToolTip("Copy the picture to the clipboard "
+                                        "(paste into a document, chat, etc.)")
+                act_copy_img.triggered.connect(
+                    lambda _=False, p=paths[0]: self._copy_image_to_clipboard(p))
 
         act_copy = menu.addAction(menu_icon("copy_path"),
                                   "Copy Path" + ("s" if multi else ""))
@@ -1256,11 +1438,29 @@ class AlbumBrowserView(QWidget):
         self._search_results: list[ImageItem] | None = None
         self._tiles: list[QWidget] = []
         self._tile_by_cover: dict[str, QWidget] = {}
+        self._folder_tile_by_path: dict[str, "FolderTile"] = {}
+        self._focus_pending = False   # focus first tile after a navigation render
 
         self._signals = _CoverSignals()
         self._signals.ready.connect(self._on_cover_ready)
         self._pool = QThreadPool()
         self._pool.setMaxThreadCount(max(2, (os.cpu_count() or 4) // 2))
+
+        # Lazy folder-stat streaming (deep counts/covers filled in after the
+        # instant first paint). Its own single-thread pool so the sequential
+        # walk never competes with cover decodes; a generation token discards
+        # results from a folder we've already left.
+        self._stat_signals = _FolderStatSignals()
+        self._stat_signals.ready.connect(self._on_folder_stat)
+        self._stat_signals.done.connect(self._on_folder_stats_done)
+        # Several walker threads across the machine's cores. Capped: the walks are
+        # disk-bound, so past a handful more threads just thrash the drive; leave
+        # a core for the UI + cover decodes.
+        self._stat_workers = max(1, min(4, (os.cpu_count() or 4) // 2))
+        self._stat_pool = QThreadPool()
+        self._stat_pool.setMaxThreadCount(self._stat_workers)
+        self._stat_gen = 0
+        self._stat_work: "_FolderStatWork | None" = None
 
         self._cover_cache: "OrderedDict[str, QPixmap]" = OrderedDict()
         self._cover_cache_max = 400
@@ -1295,11 +1495,13 @@ class AlbumBrowserView(QWidget):
         # else: replace current top (used when called from breadcrumb)
         else:
             self._nav_stack[-1] = path
+        self._focus_pending = True
         self._scan_and_render()
 
     def go_back(self):
         if len(self._nav_stack) > 1:
             self._nav_stack.pop()
+            self._focus_pending = True
             self._scan_and_render()
         else:
             self.back_requested.emit()
@@ -1480,6 +1682,8 @@ class AlbumBrowserView(QWidget):
     def _scan_and_render(self, force: bool = False):
         path = self.current_path
         self._update_breadcrumb()
+        # Abandon any stat stream still running for the folder we're leaving.
+        self._cancel_folder_stats()
 
         # Cache hit — skip the disk walk entirely.
         if not force and path in self._scan_cache:
@@ -1495,60 +1699,102 @@ class AlbumBrowserView(QWidget):
                      folders=len(self._folders), images=len(self._items))
             return
 
-        # Show full loading screen for heavy folders (with a Cancel escape hatch).
-        from .loading_screen import LoadingScreen, ScanCancelled
-        folder_label = os.path.basename(path.rstrip(os.sep)) or path
-        loading = LoadingScreen(sub=f"Scanning {folder_label}…", parent=self.window(),
-                                cancellable=True)
-        loading.show()
-        QApplication.processEvents()
-
-        last = [time.monotonic()]
-        count = [0]
-
-        def _cb(child_path: str):
-            count[0] += 1
-            now = time.monotonic()
-            if now - last[0] >= 0.04:
-                last[0] = now
-                loading.set_text(
-                    f"Scanning {os.path.basename(child_path) or child_path}…"
-                )
-                QApplication.processEvents()
-                if loading.cancelled:
-                    raise ScanCancelled()
-
-        try:
-            with log.timed("album.scan", path=path):
-                self._folders, self._items = scan_path(path, progress_cb=_cb)
-        except ScanCancelled:
-            log.info("album.scan cancelled by user", path=path)
-            loading.close_smoothly()
-            self._folders, self._items = [], []
-            self._was_cached = False
-            self._scan_strip.hide()
+        # Fast scan: a single scandir lists subfolders (with placeholder counts)
+        # and the folder's own images. This is instant even on huge trees — the
+        # per-subfolder recursive walk that used to freeze the UI now runs in the
+        # background (see _start_folder_stats), streaming real counts + covers in.
+        with log.timed("album.scan", path=path, lazy=True):
+            self._folders, self._items = scan_path(path, deep=False)
+        self._was_cached = False
+        self._scan_strip.hide()
+        with log.timed("album.render", path=path, cached=False,
+                       folders=len(self._folders), images=len(self._items)):
             self._render_grid()
-            self._update_count()
+        self._update_count()
+        self._start_folder_stats(path)
+        log.info("album.open", path=path, cached=False, lazy=True,
+                 folders=len(self._folders), images=len(self._items))
+
+    # ── Lazy folder-stat streaming ──────────────────────────────────────────────
+
+    def _cache_current(self, path: str):
+        """Store the current folder in the scan cache — but never while any tile
+        still holds a placeholder count, or a cache hit would render 'counting…'
+        forever (the hit path doesn't restart the background walk)."""
+        if any(f.image_count < 0 for f in self._folders):
+            self._scan_cache.pop(path, None)
             return
-        # Store in cache (LRU eviction on overflow).
         self._scan_cache[path] = (self._folders, self._items)
         self._scan_cache.move_to_end(path)
         while len(self._scan_cache) > self._scan_cache_max:
             self._scan_cache.popitem(last=False)
-        self._was_cached = False
-        self._scan_strip.hide()
-        # Keep the loading screen up THROUGH render + first paint. It used to
-        # close right after the disk scan, so the user stared at an empty dark
-        # canvas while thousands of tiles were built and laid out. Render under
-        # the overlay, flush one paint, then fade it out.
-        with log.timed("album.render", path=path, cached=False,
-                       folders=len(self._folders), images=len(self._items)):
-            self._render_grid()
-        QApplication.processEvents()
-        loading.close_smoothly()
+
+    def _start_folder_stats(self, path: str):
+        """Walk each placeholder subfolder in the background for its real count +
+        cover, feeding results into the tiles as they arrive."""
+        pending = [f.path for f in self._folders if f.image_count < 0]
+        if not pending:
+            # Nothing to resolve (all counts known) — safe to cache right now.
+            self._cache_current(path)
+            return
+        self._stat_gen += 1
+        self._stat_path = path
+        self._stat_results: dict[str, tuple[int, str]] = {}
+        n = max(1, min(self._stat_workers, len(pending)))
+        self._stat_work = _FolderStatWork(self._stat_gen, pending, n)
+        for _ in range(n):
+            self._stat_pool.start(_FolderStatTask(self._stat_work, self._stat_signals))
+
+    def _cancel_folder_stats(self):
+        if self._stat_work is not None:
+            self._stat_work.cancelled = True
+            self._stat_work = None
+        # Bump the generation so any already-queued signals are ignored.
+        self._stat_gen += 1
+
+    @pyqtSlot(int, str, int, str)
+    def _on_folder_stat(self, gen: int, folder_path: str, count: int, cover: str):
+        if gen != self._stat_gen:
+            return
+        self._stat_results[folder_path] = (count, cover)
+        tile = self._folder_tile_by_path.get(folder_path)
+        if tile is None:
+            return
+        if count <= 0:
+            # Empty subtree — drop it (matches the old deep-scan behaviour).
+            tile.hide()
+            return
+        tile.set_stat(count, cover)
+        if not cover:
+            return
+        if cover in self._cover_cache:
+            tile.set_cover(self._cover_cache[cover])
+        else:
+            self._pool.start(_CoverTask(self._source, cover, self._signals))
+
+    @pyqtSlot(int)
+    def _on_folder_stats_done(self, gen: int):
+        if gen != self._stat_gen:
+            return
+        # Rebuild the folder list with real counts/covers, dropping empties, and
+        # cache it so the next visit is instant with correct numbers.
+        enriched: list[Folder] = []
+        had_empty = False
+        for f in self._folders:
+            c, cov = self._stat_results.get(f.path, (f.image_count, f.cover_path))
+            if c <= 0:
+                had_empty = True
+                continue
+            enriched.append(Folder(path=f.path, name=f.name,
+                                   image_count=c, cover_path=cov))
+        self._folders = enriched
+        self._cache_current(self._stat_path)
+        self._stat_work = None
+        # Empty tiles were hidden in place, leaving grid gaps — one light
+        # re-layout closes them (rare: only when a subfolder had no images).
+        if had_empty:
+            self._render_grid()   # rebuilds tiles + reloads covers
         self._update_count()
-        log.info("album.open", path=path, cached=False,
-                 folders=len(self._folders), images=len(self._items))
 
     # ── Search ────────────────────────────────────────────────────────────────
 
@@ -1654,6 +1900,12 @@ class AlbumBrowserView(QWidget):
         self._scan_cache.pop(self.current_path, None)
         self._scan_and_render(force=True)
 
+    def reload_current(self):
+        """Public: re-scan just the current folder in place — used when files
+        changed elsewhere (e.g. moved/deleted in the image viewer). Reuses this
+        live view instead of rebuilding it, so only the one folder is touched."""
+        self._force_rescan()
+
     def _on_items_removed(self, paths):
         """Files left the current folder (move/delete). Update the model and
         cache in place — the mosaic already dropped its tiles, so we must NOT
@@ -1662,9 +1914,9 @@ class AlbumBrowserView(QWidget):
         pathset = {os.path.normcase(os.path.abspath(p)) for p in paths}
         self._items = [it for it in self._items
                        if os.path.normcase(os.path.abspath(it.path)) not in pathset]
-        # Keep the in-memory scan cache consistent for back-navigation.
-        self._scan_cache[self.current_path] = (self._folders, self._items)
-        self._scan_cache.move_to_end(self.current_path)
+        # Keep the in-memory scan cache consistent for back-navigation (skips the
+        # write if folder stats are still streaming, to avoid caching placeholders).
+        self._cache_current(self.current_path)
         self._was_cached = True
         self._update_count()
 
@@ -1752,6 +2004,7 @@ class AlbumBrowserView(QWidget):
                 w.deleteLater()
         self._tiles.clear()
         self._tile_by_cover.clear()
+        self._folder_tile_by_path.clear()
         if getattr(self, "_mosaic", None) is not None:
             try:
                 self._mosaic.cleanup()
@@ -1793,8 +2046,11 @@ class AlbumBrowserView(QWidget):
             for f in self._folders:
                 tile = FolderTile(f)
                 tile.clicked.connect(self._on_folder_clicked)
+                tile._nav_cb = self._folder_nav
                 self._tiles.append(tile)
-                self._tile_by_cover.setdefault(f.cover_path, tile)
+                self._folder_tile_by_path[f.path] = tile
+                if f.cover_path:
+                    self._tile_by_cover.setdefault(f.cover_path, tile)
                 self._grid.addWidget(tile, row, col)
                 col += 1
                 if col >= cols:
@@ -1832,6 +2088,53 @@ class AlbumBrowserView(QWidget):
             QTimer.singleShot(80, self._kick_mosaic_width)
 
         self._load_covers()
+
+        # After a navigation (not a resize re-render), drop keyboard focus on the
+        # first tile so arrows/Enter work immediately without a click.
+        if getattr(self, "_focus_pending", False):
+            self._focus_pending = False
+            if self._tiles:
+                self._tiles[0].setFocus(Qt.FocusReason.OtherFocusReason)
+            elif self._mosaic is not None:
+                self._mosaic.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    def focus_content(self):
+        """Put keyboard focus on the first folder tile (or the image grid) so
+        arrows/Enter work without a click — used when this view is re-shown."""
+        if self._tiles:
+            self._tiles[0].setFocus(Qt.FocusReason.OtherFocusReason)
+        elif self._mosaic is not None:
+            self._mosaic.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    def _folder_nav(self, tile, key) -> bool:
+        """Arrow-key movement between folder tiles (grid-aware). Returns True if
+        it handled the key. Down past the last folder row drops into the image
+        mosaic below."""
+        tiles = self._tiles
+        try:
+            cur = tiles.index(tile)
+        except ValueError:
+            return False
+        cols = max(1, self._last_cols)
+        if key == Qt.Key.Key_Left:
+            nxt = cur - 1
+        elif key == Qt.Key.Key_Right:
+            nxt = cur + 1
+        elif key == Qt.Key.Key_Down:
+            nxt = cur + cols
+        else:  # Up
+            nxt = cur - cols
+        if 0 <= nxt < len(tiles):
+            tiles[nxt].setFocus(Qt.FocusReason.OtherFocusReason)
+            try:
+                self._scroll.ensureWidgetVisible(tiles[nxt], 0, 40)
+            except (RuntimeError, AttributeError):
+                pass
+            return True
+        if key == Qt.Key.Key_Down and self._mosaic is not None:
+            self._mosaic.setFocus(Qt.FocusReason.OtherFocusReason)
+            return True
+        return False
 
     # Below this many photos, headers finish near-instantly — skip the bar
     # so it doesn't flash for small folders.
@@ -1900,8 +2203,8 @@ class AlbumBrowserView(QWidget):
 
     def _load_covers(self):
         for tile in self._tiles:
-            cover = (tile.item.cover_path
-                     if isinstance(tile.item, Folder) else tile.item.path)
+            cover = (tile.cover_path()
+                     if isinstance(tile, FolderTile) else tile.item.path)
             if not cover:
                 continue
             if cover in self._cover_cache:
@@ -1919,8 +2222,8 @@ class AlbumBrowserView(QWidget):
             self._cover_cache.popitem(last=False)
         # Apply to whichever tile claims this cover (folder cover or image self).
         for tile in self._tiles:
-            target = (tile.item.cover_path
-                      if isinstance(tile.item, Folder) else tile.item.path)
+            target = (tile.cover_path()
+                      if isinstance(tile, FolderTile) else tile.item.path)
             if target == cover_path:
                 tile.set_cover(pm)
 
@@ -1942,5 +2245,8 @@ class AlbumBrowserView(QWidget):
             except Exception:
                 pass
             self._mosaic = None
+        self._cancel_folder_stats()
+        self._stat_pool.clear()
+        self._stat_pool.waitForDone(200)
         self._pool.clear()
         self._pool.waitForDone(200)

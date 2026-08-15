@@ -139,32 +139,40 @@ def _walk_count_and_cover(
     return count, (image_cover or video_cover)
 
 
-def scan_path(
-    path: str,
-    extensions: set[str] | None = None,
-    exclude_hidden: bool | None = None,
-    progress_cb: Callable[[str], None] | None = None,
-) -> tuple[list[Folder], list[ImageItem]]:
-    """Inspect ``path`` non-recursively. Returns (subfolders, images).
-
-    ``subfolders`` are entries whose subtree contains at least one image — empty
-    folders are dropped so the browser stays tidy. ``images`` are image files
-    directly inside ``path``.
-
-    For each subfolder we do one recursive walk to compute total image count
-    and pick a cover (the first image, by sort order, found anywhere inside).
-    On big libraries this can take a moment per parent — caller should show a
-    loading screen and pump events via ``progress_cb``.
-    """
-    base = Path(path)
-    if not base.is_dir():
-        return [], []
-
+def _resolve_scan_opts(extensions, exclude_hidden):
     if extensions is None:
         types = settings_mod.get("file_types") or None
         extensions = active_extensions(types if isinstance(types, list) else None)
     if exclude_hidden is None:
         exclude_hidden = bool(settings_mod.get("exclude_hidden"))
+    return extensions, exclude_hidden
+
+
+def scan_path(
+    path: str,
+    extensions: set[str] | None = None,
+    exclude_hidden: bool | None = None,
+    progress_cb: Callable[[str], None] | None = None,
+    deep: bool = True,
+) -> tuple[list[Folder], list[ImageItem]]:
+    """Inspect ``path`` non-recursively. Returns (subfolders, images).
+
+    ``images`` are the image files directly inside ``path``. ``subfolders`` are
+    the immediate subdirectories.
+
+    **Fast mode (`deep=False`) — the default first paint:** subdirectories are
+    listed as-is (``image_count = -1``, ``cover_path = ""``); their real recursive
+    count + cover are computed later by :func:`folder_stat` off the UI thread.
+    This makes opening any folder instant regardless of subtree size.
+
+    **Deep mode (`deep=True`):** each subfolder is walked recursively for its
+    exact image count + cover, and empty ones are dropped. Used to fill in / cache
+    the tiles after the fast paint.
+    """
+    base = Path(path)
+    if not base.is_dir():
+        return [], []
+    extensions, exclude_hidden = _resolve_scan_opts(extensions, exclude_hidden)
 
     folders: list[Folder] = []
     images: list[ImageItem] = []
@@ -180,6 +188,10 @@ def scan_path(
             if exclude_hidden and (_is_hidden(name) or name == ".picker_cache"):
                 continue
             if e.is_dir(follow_symlinks=False):
+                if not deep:
+                    folders.append(Folder(path=e.path, name=name,
+                                          image_count=-1, cover_path=""))
+                    continue
                 if progress_cb:
                     progress_cb(e.path)
                 count, cover = _walk_count_and_cover(e.path, extensions, exclude_hidden)
@@ -197,3 +209,14 @@ def scan_path(
             continue
 
     return folders, images
+
+
+def folder_stat(
+    folder_path: str,
+    extensions: set[str] | None = None,
+    exclude_hidden: bool | None = None,
+) -> tuple[int, str]:
+    """Recursive image count + best cover for a single folder. Runs off the UI
+    thread to fill in tiles produced by ``scan_path(deep=False)``."""
+    extensions, exclude_hidden = _resolve_scan_opts(extensions, exclude_hidden)
+    return _walk_count_and_cover(folder_path, extensions, exclude_hidden)

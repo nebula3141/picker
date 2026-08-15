@@ -20,6 +20,7 @@ from .image_manager import ImageManager, STATUS_UNREVIEWED
 from . import external
 from . import settings as settings_mod
 from . import theme as theme_mod
+from . import dim_cache
 
 
 # ── Constants ──────────────────────────────────────────────────────────────────
@@ -28,6 +29,20 @@ ROW_HEIGHT_DEFAULT = 170
 SPACING = 3
 THUMB_MAX_DIM = 360            # cached thumb longest side
 BORDER_WIDTH = 3
+
+
+def lower_worker_priority():
+    """Drop the calling thread-pool thread below the UI thread's priority.
+
+    Decode/scan work is heavy but never urgent — the UI thread, which paints
+    scroll frames, must always preempt it. Call once at the top of every
+    background ``run()``. Without this, a folder-open burst of decode/walk
+    threads competes with the UI thread for cores and scrolling stutters.
+    """
+    from PyQt6.QtCore import QThread
+    th = QThread.currentThread()
+    if th is not None:
+        th.setPriority(QThread.Priority.LowestPriority)
 CACHE_DIRNAME = ".picker_cache"
 WORKERS = 4
 
@@ -115,6 +130,7 @@ class _HeaderTask(QRunnable):
         self.setAutoDelete(True)
 
     def run(self):
+        lower_worker_priority()
         if _is_video_path(self.path):
             # Try the on-disk video thumb cache for a free dimension read.
             try:
@@ -173,6 +189,7 @@ class _ThumbTask(QRunnable):
         self.setAutoDelete(True)
 
     def run(self):
+        lower_worker_priority()
         if _is_video_path(self.path):
             self._run_video()
             return
@@ -186,22 +203,32 @@ class _ThumbTask(QRunnable):
                 img = None
 
         if img is None:
-            reader = QImageReader(self.path)
-            reader.setAutoTransform(True)
-            size = reader.size()
-            if size.isValid():
-                longest = max(size.width(), size.height())
-                if longest > THUMB_MAX_DIM:
-                    scale = THUMB_MAX_DIM / longest
-                    reader.setScaledSize(QSize(
-                        max(1, int(size.width() * scale)),
-                        max(1, int(size.height() * scale)),
-                    ))
-            img = reader.read()
+            # HEIC/AVIF have no native Qt reader — decode via pillow-heif first.
+            from . import heif_loader
+            if heif_loader.is_heif(self.path) and heif_loader.available():
+                img = heif_loader.load_heif(self.path, max_edge=THUMB_MAX_DIM)
+
+            if img is None or img.isNull():
+                reader = QImageReader(self.path)
+                reader.setAutoTransform(True)
+                size = reader.size()
+                is_svg = os.path.splitext(self.path)[1].lower() in (".svg", ".svgz")
+                if size.isValid() and max(size.width(), size.height()) > 0:
+                    longest = max(size.width(), size.height())
+                    # Vectors have a tiny intrinsic size — rasterize UP to the thumb
+                    # resolution so they're crisp, not blurry. Rasters only scale down.
+                    if is_svg or longest > THUMB_MAX_DIM:
+                        scale = THUMB_MAX_DIM / longest
+                        reader.setScaledSize(QSize(
+                            max(1, round(size.width() * scale)),
+                            max(1, round(size.height() * scale)),
+                        ))
+                img = reader.read()
             if img is None or img.isNull():
                 img = QImage(THUMB_MAX_DIM, int(THUMB_MAX_DIM * 2 / 3),
                              QImage.Format.Format_RGB32)
                 img.fill(QColor(40, 40, 40))
+            # Cache the freshly decoded thumb (covers the HEIF path too).
             try:
                 self.cache_file.parent.mkdir(parents=True, exist_ok=True)
                 img.save(str(self.cache_file), "JPEG", 82)
@@ -287,6 +314,12 @@ class _GalleryCanvas(QWidget):
 
         self._pool = QThreadPool()
         self._pool.setMaxThreadCount(WORKERS)
+        # Dimension (header) reads get their own pool so the justified layout —
+        # which waits on every aspect — doesn't stall behind the heavy thumbnail
+        # decodes sharing the main pool.
+        import os as _os
+        self._header_pool = QThreadPool()
+        self._header_pool.setMaxThreadCount(max(2, (_os.cpu_count() or 4) // 2))
 
         self._pending_headers = set()
         self._pending_thumbs = set()
@@ -303,13 +336,23 @@ class _GalleryCanvas(QWidget):
 
     def _start_loading_headers(self):
         self._total_headers = len(self._manager.images)
+        src = self._manager.source_folder
         for idx, rec in enumerate(self._manager.images):
+            # Known size from a previous open → correct aspect instantly, no
+            # thread work. This makes reopening a gallery lay out right on the
+            # first paint instead of reshuffling as headers trickle in.
+            dims = dim_cache.get(src, rec.path)
+            if dims is not None and dims[1] > 0:
+                self._aspects[idx] = dims[0] / dims[1]
+                continue
             # Default placeholder aspect until header arrives
             self._aspects[idx] = 3.0 / 2.0
             self._pending_headers.add(idx)
             task = _HeaderTask(idx, rec.path, self._signals)
-            self._pool.start(task)
-        if self._total_headers == 0:
+            self._header_pool.start(task)
+        if not self._pending_headers:
+            self.load_progress.emit(self._total_headers, self._total_headers)
+            self._recompute_layout()
             self.load_done.emit()
 
     def _schedule_thumb(self, idx: int):
@@ -331,10 +374,12 @@ class _GalleryCanvas(QWidget):
                 self.load_done.emit()
             return
         self._aspects[idx] = w / h
+        dim_cache.put(self._manager.source_folder, self._manager.images[idx].path, w, h)
         # Recompute layout once in a while — avoid thrash, do every 50 headers
         if len(self._pending_headers) == 0 or len(self._pending_headers) % 50 == 0:
             self._recompute_layout()
         if not self._pending_headers:
+            dim_cache.flush(self._manager.source_folder)
             self.load_done.emit()
 
     @pyqtSlot(int, QPixmap, int, int)
@@ -345,6 +390,9 @@ class _GalleryCanvas(QWidget):
             actual_aspect = w / h
             if abs(actual_aspect - self._aspects.get(idx, 0)) > 0.01:
                 self._aspects[idx] = actual_aspect
+                # Thumb is authoritative (EXIF-aware) — persist the correction.
+                dim_cache.put(self._manager.source_folder,
+                              self._manager.images[idx].path, w, h)
         # Repaint just the tile rect
         for tile in self._tiles:
             if tile.idx == idx:
@@ -647,6 +695,9 @@ class _GalleryCanvas(QWidget):
         return None
 
     def cleanup(self):
+        dim_cache.flush(self._manager.source_folder)   # save measured sizes
+        self._header_pool.clear()
+        self._header_pool.waitForDone(200)
         self._pool.clear()
         self._pool.waitForDone(200)
 

@@ -27,6 +27,7 @@ FILE_TYPE_LABELS = [
     ("TIFF", "tiff"),
     ("WEBP", "webp"),
     ("BMP", "bmp"),
+    ("HEIC/AVIF", "heif"),
     ("SVG", "svg"),
     ("RAW (CR2/NEF/ARW/DNG/…)", "raw"),
 ]

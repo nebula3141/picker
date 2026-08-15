@@ -142,3 +142,33 @@ def test_progress_callback(tree):
     scan_path(str(tree), extensions=exts, exclude_hidden=True,
               progress_cb=lambda p: calls.append(p))
     assert len(calls) > 0
+
+
+def test_scan_path_lazy_lists_all_subfolders_with_placeholders(tree):
+    """Fast mode returns every subfolder instantly with unknown counts (-1),
+    including ones a deep walk would drop as empty — those get pruned later."""
+    from picker.album import scan_path
+    exts = {".jpg", ".jpeg", ".png"}
+    folders, images = scan_path(str(tree), extensions=exts,
+                                exclude_hidden=True, deep=False)
+    names = {f.name for f in folders}
+    assert {"sub1", "sub2", "empty"} <= names   # empty listed, not yet pruned
+    assert ".hidden" not in names               # hidden still excluded
+    assert all(f.image_count == -1 and f.cover_path == "" for f in folders)
+    assert len(images) == 1 and images[0].name == "a.jpg"  # own images are eager
+
+
+def test_folder_stat_fills_in_lazy_placeholders(tree):
+    """folder_stat resolves a placeholder tile's real count + cover, matching
+    what a deep scan would have produced."""
+    from picker.album import scan_path, folder_stat
+    exts = {".jpg", ".jpeg", ".png"}
+    folders, _ = scan_path(str(tree), extensions=exts,
+                           exclude_hidden=True, deep=False)
+    by_name = {f.name: f for f in folders}
+    c1, cover1 = folder_stat(by_name["sub1"].path, exts, True)
+    assert c1 == 2 and cover1.endswith("b.jpg")
+    c2, _ = folder_stat(by_name["sub2"].path, exts, True)
+    assert c2 == 1
+    c_empty, cover_empty = folder_stat(by_name["empty"].path, exts, True)
+    assert c_empty == 0 and cover_empty == ""   # signals a prune

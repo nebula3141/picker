@@ -105,6 +105,12 @@ class MainWindow(QMainWindow):
         self._slideshow: SlideshowView | None = None
         self._gallery: GalleryView | None = None
         self._album_browser: AlbumBrowserView | None = None
+        # When an image is opened from the folder browser, the browser is parked
+        # (kept alive, not destroyed) so returning is instant — no rescan. Only
+        # rebuilt if files actually changed in the viewer (_album_dirty).
+        self._parked_album: AlbumBrowserView | None = None
+        self._parked_source: str | None = None
+        self._album_dirty: bool = False
         self._library_view = None
 
         self._source_folder: str | None = manager.source_folder if manager else None
@@ -131,6 +137,23 @@ class MainWindow(QMainWindow):
             self._show_library_view()
 
         self._restore_window_geometry()
+
+        # First-run coach marks — after the window is up, once.
+        from PyQt6.QtCore import QTimer
+        QTimer.singleShot(400, self._maybe_show_welcome)
+
+    def _maybe_show_welcome(self):
+        try:
+            from picker import welcome
+            if welcome.should_show():
+                welcome.WelcomeDialog(self).exec()
+        except Exception:
+            pass
+
+    def _show_welcome(self):
+        """Re-open the coach marks on demand (Help menu)."""
+        from picker import welcome
+        welcome.WelcomeDialog(self).exec()
 
     def _restore_window_geometry(self):
         """Restore last window size/position, then SHOW the window.
@@ -278,6 +301,7 @@ class MainWindow(QMainWindow):
 
     def _swap_source(self, new_source: str):
         """Switch to a new source folder and show its album browser."""
+        self._discard_parked_album()
         if self._slideshow:
             self._slideshow.cleanup()
             self._slideshow = None
@@ -318,10 +342,24 @@ class MainWindow(QMainWindow):
 
     # ── Folder-tree browser ───────────────────────────────────────────────────
 
+    def _discard_parked_album(self):
+        """Tear down a parked (kept-alive) browser we're no longer returning to.
+        It was detached via takeCentralWidget (no parent), so we must free it
+        ourselves or it would leak."""
+        if self._parked_album is not None:
+            try:
+                self._parked_album.cleanup()
+            except Exception:
+                pass
+            self._parked_album.deleteLater()
+            self._parked_album = None
+            self._parked_source = None
+
     def _show_album_browser(self):
         if self._source_folder is None:
             self._show_library_view()
             return
+        self._discard_parked_album()
         if self._slideshow:
             self._slideshow.cleanup()
             self._slideshow = None
@@ -336,6 +374,9 @@ class MainWindow(QMainWindow):
         self._album_browser.open_image.connect(self._open_image_in_folder)
         self._album_browser.back_requested.connect(self._show_library_view)
         self._set_central(self._album_browser)
+        # Focus a tile once shown so the grid is keyboard-drivable without a click.
+        from PyQt6.QtCore import QTimer
+        QTimer.singleShot(0, self._album_browser.focus_content)
         bar = self.statusBar()
         bar.showMessage(f"  {self._source_folder}")
 
@@ -353,6 +394,7 @@ class MainWindow(QMainWindow):
         except OSError:
             files = []
         if not files:
+            # Nothing to open — leave the browser exactly as it is (don't park).
             QMessageBox.information(
                 self, "No images",
                 f"No supported media files found in:\n\n{folder_path}",
@@ -364,6 +406,22 @@ class MainWindow(QMainWindow):
             idx = settings_mod.get_position(folder_path)
             idx = max(0, min(idx, len(files) - 1))
             target = os.path.join(folder_path, files[idx])
+
+        # Now that we're committed to opening, park the live browser so Escape
+        # restores it instantly (no rescan).
+        self._album_dirty = False
+        if self._album_browser is not None:
+            self._discard_parked_album()   # drop any earlier stale parked view
+            # Detach it WITHOUT deleting: setCentralWidget() (when the slideshow
+            # opens) would otherwise deleteLater() the outgoing central widget,
+            # destroying the very browser we intend to restore. takeCentralWidget
+            # hands ownership back to us so the instance stays alive, parked.
+            self.takeCentralWidget()
+            self._album_browser.hide()
+            self._parked_album = self._album_browser
+            self._parked_source = self._source_folder
+            self._album_browser = None     # stop _instant_open_file destroying it
+
         self._opened_from_explorer = False
         self._instant_open_file(target)
 
@@ -442,6 +500,10 @@ class MainWindow(QMainWindow):
         keys_action.triggered.connect(self._show_shortcuts)
         help_menu.addAction(keys_action)
 
+        welcome_action = QAction("Getting Started…", self)
+        welcome_action.triggered.connect(self._show_welcome)
+        help_menu.addAction(welcome_action)
+
         help_menu.addSeparator()
 
         diag_action = QAction("Copy Diagnostic Info", self)
@@ -467,6 +529,7 @@ class MainWindow(QMainWindow):
     # ── Gallery ────────────────────────────────────────────────────────────────
 
     def _build_gallery(self):
+        self._discard_parked_album()
         if self._gallery:
             self._gallery.cleanup()
 
@@ -500,6 +563,9 @@ class MainWindow(QMainWindow):
         self._slideshow.status_changed.connect(self._on_status_changed)
         self._slideshow.fullscreen_requested.connect(self._toggle_fullscreen)
         self._slideshow.title_changed.connect(self._update_window_title)
+        # A move/delete in the viewer marks the parked browser stale so it
+        # refreshes on return; pure navigation leaves it clean for instant restore.
+        self._slideshow.files_changed.connect(self._on_viewer_files_changed)
         self.setCentralWidget(self._slideshow)
         self._slideshow.setFocus()
         if not filmstrip_hidden:
@@ -516,6 +582,10 @@ class MainWindow(QMainWindow):
             self.activateWindow()
             self._slideshow.setFocus(Qt.FocusReason.OtherFocusReason)
 
+    def _on_viewer_files_changed(self):
+        """A move/delete happened in the viewer — the parked browser is now stale."""
+        self._album_dirty = True
+
     @pyqtSlot(int)
     def _on_slideshow_closed(self, last_idx: int):
         if self._slideshow:
@@ -524,12 +594,29 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"PICker {__version__}")
         if self._opened_from_explorer:
             self._opened_from_explorer = False
+            self._discard_parked_album()
             # Configurable: on Esc from an Explorer-opened photo, either quit
             # (one-shot viewer) or drop into the folder's mosaic to keep browsing.
             if (settings_mod.get("explorer_escape_action") or "mosaic") == "close":
                 self.close()
                 return
             # else fall through → _show_album_browser() below (mosaic)
+        # Fast path: restore the live browser we parked on open. No rescan when
+        # the user only navigated; a cheap one-folder refresh if files changed.
+        if self._parked_album is not None:
+            self._album_browser = self._parked_album
+            self._parked_album = None
+            self._source_folder = self._parked_source
+            self._parked_source = None
+            self._current_folder = None
+            self._album_browser.show()            # was hidden while parked
+            self._set_central(self._album_browser)
+            if self._album_dirty:
+                self._album_dirty = False
+                self._album_browser.reload_current()
+            self._album_browser.focus_content()   # keyboard-ready without a click
+            self.statusBar().showMessage(f"  {self._source_folder or ''}")
+            return
         if self._current_folder is not None and self._source_folder is not None:
             self._show_album_browser()
         else:
@@ -638,6 +725,7 @@ class MainWindow(QMainWindow):
         if not data:
             return
 
+        self._discard_parked_album()
         if self._slideshow:
             self._slideshow.cleanup()
             self._slideshow = None
@@ -770,6 +858,7 @@ class MainWindow(QMainWindow):
     def _show_library_view(self):
         """Swap central widget to the library home screen."""
         from picker.library_view import LibraryView
+        self._discard_parked_album()
         if self._slideshow:
             self._slideshow.cleanup()
             self._slideshow = None
@@ -801,22 +890,32 @@ class MainWindow(QMainWindow):
         roots = library_mod.roots()
         if not roots:
             return
-        from picker import index as index_mod
+        # Read settings on the UI thread, then walk + index on a background thread
+        # so a large library can't freeze the window. scan_root opens its own
+        # sqlite connection and touches no Qt objects, so this is safe.
         from picker.image_manager import active_extensions
+        params = {
+            "exts": active_extensions(settings_mod.get("file_types") or None),
+            "excl_hidden": bool(settings_mod.get("exclude_hidden")),
+            "inc_sub": bool(settings_mod.get("scan_recursive")),
+        }
+        import threading
+        threading.Thread(target=self._run_idle_index,
+                         args=(list(roots), params), daemon=True).start()
+
+    def _run_idle_index(self, roots, params):
+        from picker import index as index_mod
         from picker import log
-        exts_set = active_extensions(settings_mod.get("file_types") or None)
-        excl_hidden = bool(settings_mod.get("exclude_hidden"))
-        inc_sub = bool(settings_mod.get("scan_recursive"))
         for root in roots:
-            path = root["path"]
-            if not os.path.isdir(path):
+            path = root.get("path")
+            if not path or not os.path.isdir(path):
                 continue
             try:
                 index_mod.scan_root(
                     path,
-                    include_subfolders=inc_sub,
-                    exclude_hidden=excl_hidden,
-                    extensions=exts_set,
+                    include_subfolders=params["inc_sub"],
+                    exclude_hidden=params["excl_hidden"],
+                    extensions=params["exts"],
                 )
                 log.info("idle index done", root=path)
             except Exception as e:
@@ -1068,7 +1167,9 @@ class MainWindow(QMainWindow):
             if self._gallery is not None and self._slideshow is None and self._current_folder is not None:
                 self._show_album_browser()
             elif self._album_browser is not None and self._slideshow is None:
-                self._show_library_view()
+                # Go UP one folder level (hierarchical back); go_back() drops to
+                # the library only when already at the source root.
+                self._album_browser.go_back()
             else:
                 super().keyPressEvent(event)
         else:
@@ -1092,8 +1193,16 @@ class MainWindow(QMainWindow):
             self._gallery.cleanup()
         if self._album_browser:
             self._album_browser.cleanup()
+        self._discard_parked_album()
         if self._slideshow:
             self._slideshow.cleanup()
+        # Catch-all: persist any image dimensions measured but not yet flushed
+        # (e.g. a folder still mid-load) so the next launch opens instantly.
+        try:
+            from picker import dim_cache
+            dim_cache.flush()
+        except Exception:
+            pass
         super().closeEvent(event)
 
 
