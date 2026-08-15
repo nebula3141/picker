@@ -17,9 +17,12 @@ from picker import __version__, __version_info__
 from picker.icon import export_ico
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
+_REPO = os.path.dirname(ROOT)
 ICO = os.path.join(ROOT, "icon.ico")
 VER_FILE = os.path.join(ROOT, "version_info.txt")
-SPEC = os.path.join(ROOT, "PICker_multifile.spec")
+# Canonical spec lives at the repo root (bundles pillow-heif's native decoder,
+# the coach-mark assets, and names the exe "PICker.exe" to match the installer).
+SPEC = os.path.join(_REPO, "PICker_multifile.spec")
 
 export_ico(ICO)
 print(f"wrote {ICO}")

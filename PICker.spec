@@ -52,6 +52,11 @@ a = Analysis(
     hiddenimports=[
         'PyQt6.QtMultimedia',
         'PyQt6.QtMultimediaWidgets',
+        # The native HEIF/AVIF decoder is a TOP-LEVEL extension module
+        # (_pillow_heif.<abi>.pyd, a sibling of the pillow_heif package), so
+        # collect_all('pillow_heif') misses it. Name it explicitly or HEIC
+        # decode silently fails in the packaged app.
+        '_pillow_heif',
         *_heif_hidden,
     ],
     hookspath=[],
