@@ -788,8 +788,8 @@ class _ImageMosaic(QWidget):
 
     # ── Worker callbacks ─────────────────────────────────────────────────────
 
-    @pyqtSlot(int, int, int)
-    def _on_header_ready(self, idx: int, w: int, h: int):
+    @pyqtSlot(int, int, int, bool)
+    def _on_header_ready(self, idx: int, w: int, h: int, exact: bool = True):
         # Stale callback from a task whose index was removed/remapped — ignore.
         if idx not in self._pending_headers:
             return
@@ -797,7 +797,9 @@ class _ImageMosaic(QWidget):
         self._headers_done += 1
         if h > 0:
             self._aspects[idx] = w / h
-            dim_cache.put(self._source, self._items[idx].path, w, h)
+            # Only persist real header dims, never the video/HEIC placeholders.
+            if exact:
+                dim_cache.put(self._source, self._items[idx].path, w, h)
         # Drive the load bar (coarsely, plus a final exact tick).
         total = len(self._items)
         if self._headers_done >= total or self._headers_done % 25 == 0:
@@ -1138,6 +1140,10 @@ class _ImageMosaic(QWidget):
                 img = raw_loader.load_raw(path, prefer_thumb=False)
         except Exception:
             img = None
+        if img is None or img.isNull():
+            from . import heif_loader
+            if heif_loader.is_heif(path) and heif_loader.available():
+                img = heif_loader.load_heif(path)
         if img is None or img.isNull():
             reader = QImageReader(path)
             reader.setAutoTransform(True)

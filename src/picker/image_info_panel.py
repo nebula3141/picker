@@ -224,7 +224,7 @@ class ImageInfoPanel(QWidget):
             time_sec.add_row("Date/time", ex.get("datetime") or "—")
             self._insert(time_sec)
 
-            coords = exif_mod.read_gps(path)
+            coords = ex.get("gps")   # already extracted by read_exif above
             if coords is not None:
                 loc_sec = _Section("Location")
                 loc_sec.add_row("GPS", f"{coords[0]:.5f}, {coords[1]:.5f}")

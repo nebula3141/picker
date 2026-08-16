@@ -105,7 +105,7 @@ _cache_file = cache_file
 
 class _WorkerSignals(QObject):
     thumb_ready = pyqtSignal(int, QPixmap, int, int)   # idx, pm, orig_w, orig_h
-    header_ready = pyqtSignal(int, int, int)           # idx, orig_w, orig_h
+    header_ready = pyqtSignal(int, int, int, bool)     # idx, orig_w, orig_h, exact
 
 
 def _is_video_path(path: str) -> bool:
@@ -144,14 +144,15 @@ class _HeaderTask(QRunnable):
                 if cf.exists():
                     img = QImage(str(cf))
                     if not img.isNull():
+                        # Real frame aspect from the cached video thumb.
                         self.signals.header_ready.emit(
-                            self.idx, img.width(), img.height()
+                            self.idx, img.width(), img.height(), True
                         )
                         return
             except Exception:
                 pass
-            # Fallback: 16:9 placeholder (most videos).
-            self.signals.header_ready.emit(self.idx, 16, 9)
+            # Fallback: 16:9 placeholder (most videos) — NOT exact, don't cache.
+            self.signals.header_ready.emit(self.idx, 16, 9, False)
             return
 
         reader = QImageReader(self.path)
@@ -174,9 +175,10 @@ class _HeaderTask(QRunnable):
                     sz = QSize(sz.height(), sz.width())
             except Exception:
                 pass
-            self.signals.header_ready.emit(self.idx, sz.width(), sz.height())
+            self.signals.header_ready.emit(self.idx, sz.width(), sz.height(), True)
         else:
-            self.signals.header_ready.emit(self.idx, 3, 2)
+            # Unreadable header (e.g. HEIC has no Qt reader) → 3:2 guess, not exact.
+            self.signals.header_ready.emit(self.idx, 3, 2, False)
 
 
 class _ThumbTask(QRunnable):
@@ -364,8 +366,8 @@ class _GalleryCanvas(QWidget):
         task = _ThumbTask(idx, rec.path, cf, self._signals)
         self._pool.start(task)
 
-    @pyqtSlot(int, int, int)
-    def _on_header_ready(self, idx: int, w: int, h: int):
+    @pyqtSlot(int, int, int, bool)
+    def _on_header_ready(self, idx: int, w: int, h: int, exact: bool = True):
         self._pending_headers.discard(idx)
         done = self._total_headers - len(self._pending_headers)
         self.load_progress.emit(done, self._total_headers)
@@ -374,7 +376,10 @@ class _GalleryCanvas(QWidget):
                 self.load_done.emit()
             return
         self._aspects[idx] = w / h
-        dim_cache.put(self._manager.source_folder, self._manager.images[idx].path, w, h)
+        # Only persist genuine header dimensions — never the video/HEIC guesses,
+        # or the next open would serve the wrong aspect as a cache "hit".
+        if exact:
+            dim_cache.put(self._manager.source_folder, self._manager.images[idx].path, w, h)
         # Recompute layout once in a while — avoid thrash, do every 50 headers
         if len(self._pending_headers) == 0 or len(self._pending_headers) % 50 == 0:
             self._recompute_layout()

@@ -2399,6 +2399,14 @@ class SlideshowView(QWidget):
             except Exception:
                 pass
             self._movie.stop()
+            # Release the open file handle *synchronously*. deleteLater() defers
+            # C++ destruction to the next event-loop pass, so the file would stay
+            # locked through a move/delete that runs right after this call —
+            # setFileName("") closes the underlying reader immediately (Windows).
+            try:
+                self._movie.setFileName("")
+            except Exception:
+                pass
             self._movie.deleteLater()
             self._movie = None
 
@@ -2440,6 +2448,10 @@ class SlideshowView(QWidget):
         if dest_idx < 0 or dest_idx >= len(self._manager.destinations):
             return
         dest_name = self._manager.destinations[dest_idx]["name"]
+        # In move mode the file is renamed out of the folder — release any
+        # QMovie handle first so an animated image doesn't hit a sharing violation.
+        if self._manager.mode == "move" and self._movie is not None:
+            self._stop_movie()
         prev_handler = self._manager.conflict_handler
         self._manager.conflict_handler = lambda s, d: conflict_dialog.ask(self, s, d)
         try:
@@ -3132,6 +3144,11 @@ class SlideshowView(QWidget):
         src = rec.path
         idx = self._idx
         name = _elide_middle(os.path.basename(dest_dir.rstrip(os.sep)) or dest_dir, 30)
+        # A playing QMovie keeps the file open — release it before a move or the
+        # rename fails on Windows with a sharing violation. (Copy is fine: both
+        # are read handles.)
+        if move and self._movie is not None:
+            self._stop_movie()
         dst, err = abv.transfer_one(src, dest_dir, move=move)
         if err:
             self._toast.show_message(_friendly_error(err), ms=3500)
@@ -3208,6 +3225,9 @@ class SlideshowView(QWidget):
             )
             if reply != QMessageBox.StandardButton.Yes:
                 return
+        # Release any QMovie handle so an animated file isn't locked on delete.
+        if self._movie is not None:
+            self._stop_movie()
         try:
             from picker._recycle import send_to_recycle_bin
             if not send_to_recycle_bin(rec.path):
@@ -3488,6 +3508,14 @@ class CompareView(QWidget):
 
     @pyqtSlot(int, QImage)
     def _on_image_ready(self, idx: int, img: QImage):
+        # Null image = decode failed — show the one-line error, not a blank pane.
+        if img.isNull():
+            if idx == self._idx_a:
+                self._canvas_a.set_error("Couldn't open this image")
+            if idx == self._idx_b:
+                self._canvas_b.set_error("Couldn't open this image")
+            self._update_header()
+            return
         pm = QPixmap.fromImage(img)
         if idx == self._idx_a:
             self._dims["a"] = (img.width(), img.height())
