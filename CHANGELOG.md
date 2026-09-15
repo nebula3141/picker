@@ -1,5 +1,73 @@
 # Changelog
 
+## v4.11.0 (2026-09-16)
+
+### New: two-pane Sort
+- **File → Sort…** (`Ctrl+Shift+S`, or the **⇄ Sort** button in the folder browser) opens a
+  split screen: the **source** folder's mosaic on the left, the **destination** folder's on
+  the right. Arrow to a photo and press **Space** to copy it (or the whole selection) across.
+- The copy shows up on the right **instantly** — it reuses the source's thumbnail and shape
+  while the bytes copy in the background, in the order you pressed Space.
+- Source photos already in the destination get a **green tick**; pressing Space on one again
+  does nothing. Name clashes with a *different* file follow your conflict setting.
+- **Both panes are live**: files added, removed or renamed by anything else (Explorer, an
+  import, another app) appear within a fraction of a second, without a rescan.
+- **Enter** (or double-click) opens a big **preview** — ←/→ step, Space copies and moves on.
+  **Tab** switches panes, **Ctrl+Z** undoes the last copy, **+/−** resize tiles, **Swap**
+  exchanges the folders, **Change…** picks another folder; the last pair is remembered.
+- The previous multi-destination workflow is unchanged and now called **Sort-Multi…**
+  (`Ctrl+Alt+S`).
+
+### Instant everything
+- **One shared thumbnail memory** for the whole app, sized to your free RAM. A thumbnail
+  decoded anywhere (folder mosaic, gallery, filmstrip, folder covers, Sort) is instantly
+  available everywhere else — leaving and re-entering a folder, closing the viewer, or typing
+  a search no longer re-decodes anything.
+- **One prioritised decode service** replaces the private thread pools each view used to spin
+  up: visible tiles jump the queue, and tiles you scroll past before their turn are simply
+  never decoded.
+- **Folders open without ever blocking the window** — listings run in the background, and the
+  subfolders of whatever you're looking at are pre-listed, so clicking into one is usually
+  rendered straight from memory. Hovering a folder pre-warms its first screen of thumbnails.
+  Cached listings re-check the folder on disk and patch themselves if something changed.
+- **Counting a folder counts everything beneath it once**: drilling down no longer re-walks
+  the same subtree at every level.
+- **Opening a photo from a big folder is ~900× faster** in the listing step (5,000 photos:
+  1.4 s → 1.6 ms); the old closest-first re-insert was quadratic and posted a UI callback per
+  file. The viewer now opens complete — filmstrip and counter included — reusing the listing
+  the folder browser already had.
+- **Viewer**: decoded full-size frames are kept in a RAM-sized cache that survives closing the
+  viewer; preloading looks further ahead in the direction you're moving and cancels decodes
+  you've already flicked past. Remembering your position no longer writes and fsyncs a file on
+  every arrow key.
+- **Library home** paints immediately: card counts and covers load in the background (covers
+  were decoded at full resolution on the UI thread), and the index no longer copies its whole
+  database file on every query.
+- Search refilters the grid in place; scrolling, hovering and clicking only touch the rows on
+  screen; window resizes re-flow folder tiles instead of rebuilding the grid.
+- Faster start: numpy/rawpy and the video player load on first use; transitions are snappier;
+  no more splash screen when opening a folder.
+- Thumbnails read a file into memory before decoding, so the app no longer holds files open
+  (which could make a delete or move in Explorer fail with "file in use").
+
+### Fixes
+- Clicking a photo in a **filtered** folder or in **whole-library search results** now opens
+  that exact photo (it used to open whichever file had the same position in the unfiltered
+  folder).
+
+### macOS support
+- **PICker now runs on macOS** (Apple Silicon & Intel). Qt is cross-platform; the
+  OS-specific glue is now handled per-platform:
+  - **Delete → macOS Trash** (recoverable via Finder), not a permanent delete.
+  - **Reveal in Finder** (`open -R`); the menu label adapts per OS.
+  - **Open With** finds Adobe Photoshop / Lightroom in `/Applications` and opens
+    files via `open -a`.
+  - Settings, caches and crash logs live under `~/Library/Application Support/PICker/`.
+- **Build & distribution:** a PyInstaller `.app` spec (`PICker_mac.spec`) plus a
+  GitHub Actions job that builds signed-later `.dmg`s for arm64 and x86_64 on
+  every tag; a `mac/` folder with `setup.sh` / `run.sh` for running from source.
+  Tests now also run on macOS in CI.
+
 ## v4.10.0 (2026-08-14)
 
 ### New features

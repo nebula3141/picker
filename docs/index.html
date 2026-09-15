@@ -143,11 +143,11 @@ footer a:hover{color:var(--fg)}
   <h1>Your photos.<br>Lightning fast.</h1>
   <p>A fast, no-nonsense photo viewer and culler for photographers who shoot thousands of files. Opens 60MP RAW instantly — no catalog, no cloud, no waiting.</p>
   <div class="buttons">
-    <a href="https://github.com/nebula3141/picker/releases/download/v4.10.0/PICker-4.10.0-setup.exe" class="btn btn-primary" target="_blank" rel="noopener">
+    <a href="https://github.com/nebula3141/picker/releases/download/v4.11.0/PICker-4.11.0-setup.exe" class="btn btn-primary" target="_blank" rel="noopener">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg>
       Download for Windows
     </a>
-    <a href="https://github.com/nebula3141/picker/releases/download/v4.10.0/PICker-4.10.0.exe" class="btn btn-ghost" target="_blank" rel="noopener">
+    <a href="https://github.com/nebula3141/picker/releases/download/v4.11.0/PICker-4.11.0.exe" class="btn btn-ghost" target="_blank" rel="noopener">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg>
       Portable (no install)
     </a>
@@ -209,15 +209,15 @@ footer a:hover{color:var(--fg)}
 <section id="whatsnew">
   <div class="features-head">
     <div class="eyebrow">What's new</div>
-    <h2>v4.10.0 — Modern formats, instant loading &amp; a friendlier start</h2>
+    <h2>v4.11.0 — Two-pane Sort &amp; instant everything</h2>
   </div>
   <ul class="newlist">
-    <li><b>HEIC / HEIF / AVIF</b> — iPhone photos and modern formats open, browse, thumbnail and sort like any other image.</li>
-    <li><b>Animated GIF / WEBP / APNG</b> now play in the viewer, and <b>Show on Map</b> opens a photo's GPS location in your browser.</li>
-    <li><b>Instant loading</b> — folders open immediately no matter how deep the tree, counts stream in on your CPU cores, and reopening a folder is near-instant. Scrolling stays smooth while a folder loads.</li>
-    <li><b>Rapid-fire sorting</b> — send a photo (<b>Ctrl+Space</b> / <b>Ctrl+1…9</b>) and it auto-advances to the next; a progress counter and resume-where-you-left-off keep long culls on track.</li>
-    <li><b>Fully keyboard-driven</b> — arrow-key folder navigation, Enter to open, Escape to step back a level, plus <b>Copy Image</b> (<b>Ctrl+C</b>) to the clipboard.</li>
-    <li><b>First-run welcome</b> and <b>clear load errors</b> for corrupt or unsupported files. Full list in the <a href="https://github.com/nebula3141/picker/blob/master/CHANGELOG.md" target="_blank" rel="noopener" style="color:var(--accent)">changelog</a>.</li>
+    <li><b>Two-pane Sort</b> — source folder on the left, destination on the right. Arrow to a photo and press <b>Space</b> to copy it across; it appears on the right instantly.</li>
+    <li><b>Live folders</b> — both panes follow the disk in real time, and photos already in the destination wear a green tick. <b>Enter</b> previews, <b>Ctrl+Z</b> undoes. The classic multi-destination flow lives on as <b>Sort-Multi</b>.</li>
+    <li><b>One shared memory for thumbnails and photos</b>, sized to your free RAM — nothing is decoded twice, whether you go back, search, or reopen the viewer.</li>
+    <li><b>Never waits on the disk</b> — folders list in the background, subfolders are pre-loaded before you click, and on-screen thumbnails always decode first.</li>
+    <li><b>Opening a photo in a 5,000-photo folder is ~900× faster</b>, the viewer preloads in the direction you're flicking, and the library home screen appears immediately.</li>
+    <li><b>macOS builds</b> for Apple Silicon and Intel. Full list in the <a href="https://github.com/nebula3141/picker/blob/master/CHANGELOG.md" target="_blank" rel="noopener" style="color:var(--accent)">changelog</a>.</li>
   </ul>
 </section>
 
@@ -226,10 +226,10 @@ footer a:hover{color:var(--fg)}
   <h2>Free, open source, no install required.</h2>
   <p>Grab the installer, or the single portable .exe — drop it anywhere and run.</p>
   <div class="buttons">
-    <a href="https://github.com/nebula3141/picker/releases/download/v4.10.0/PICker-4.10.0-setup.exe" class="btn btn-primary" target="_blank" rel="noopener">Installer (.exe)</a>
-    <a href="https://github.com/nebula3141/picker/releases/download/v4.10.0/PICker-4.10.0.exe" class="btn btn-ghost" target="_blank" rel="noopener">Portable (.exe)</a>
+    <a href="https://github.com/nebula3141/picker/releases/download/v4.11.0/PICker-4.11.0-setup.exe" class="btn btn-primary" target="_blank" rel="noopener">Installer (.exe)</a>
+    <a href="https://github.com/nebula3141/picker/releases/download/v4.11.0/PICker-4.11.0.exe" class="btn btn-ghost" target="_blank" rel="noopener">Portable (.exe)</a>
   </div>
-  <p class="meta">Latest release: v4.10.0 &middot; <a href="https://github.com/nebula3141/picker/releases" target="_blank" rel="noopener" style="color:var(--accent)">all releases &amp; changelog</a></p>
+  <p class="meta">Latest release: v4.11.0 &middot; <a href="https://github.com/nebula3141/picker/releases" target="_blank" rel="noopener" style="color:var(--accent)">all releases &amp; changelog</a></p>
   <div class="linuxbox">
     <div class="linuxbox-title">🐧 On Linux? Run it from source:</div>
     <pre>git clone https://github.com/nebula3141/picker.git
@@ -240,7 +240,7 @@ cd picker/linux &amp;&amp; ./setup.sh &amp;&amp; ./run.sh</pre>
 </section>
 
 <footer>
-  <p>Built by <a href="https://github.com/nebula3141" target="_blank" rel="noopener">nebula3141</a> &middot; PICker v4.10.0 &middot; GPL-3.0 &middot; Python + Qt</p>
+  <p>Built by <a href="https://github.com/nebula3141" target="_blank" rel="noopener">nebula3141</a> &middot; PICker v4.11.0 &middot; GPL-3.0 &middot; Python + Qt</p>
 </footer>
 
 </body>

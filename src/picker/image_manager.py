@@ -4,7 +4,7 @@ import shutil
 import tempfile
 from pathlib import Path
 from dataclasses import dataclass, field
-from threading import Thread, Lock
+from threading import Lock
 from typing import Optional
 
 from . import settings as settings_mod
@@ -249,9 +249,20 @@ class ImageManager:
                       seed_count: int = 5,
                       destinations: list[dict] | None = None,
                       mode: str = "copy", resolution_pct: int = 50,
-                      on_progress=None, on_complete=None):
-        """Create ImageManager with only ±seed_count files around target_file loaded.
-        Remaining files discovered in background thread, closest-first."""
+                      on_progress=None, on_complete=None,
+                      names: list[str] | None = None):
+        """Create an ImageManager for ``target_file``'s folder, positioned on it.
+
+        One ``scandir`` pass lists the whole folder (type + stat info come with
+        each entry, so no per-file ``isfile`` syscall), which is effectively
+        instant even for thousands of files — so the manager is complete from the
+        start. The old version re-inserted every other file one at a time, closest
+        first, rebuilding a sorted key list per insert (O(n²)) and posting one UI
+        callback per file. ``start_background_scan`` / ``on_complete`` are kept for
+        callers; completion is simply signalled right away.
+
+        ``names`` may be supplied by a caller that already listed the folder
+        (e.g. the folder browser) to skip even that one pass."""
         mgr = cls.__new__(cls)
         mgr.source_folder = source_folder
         mgr.destinations = destinations or []
@@ -268,63 +279,48 @@ class ImageManager:
         mgr._on_scan_progress = on_progress
         mgr._on_scan_complete = on_complete
 
-        folder = Path(source_folder).resolve()
-        types = settings_mod.get("file_types") or []
-        exts = active_extensions(types if isinstance(types, list) else None)
-        exclude_hidden = bool(settings_mod.get("exclude_hidden"))
+        folder = str(Path(source_folder).resolve())
+        if names is None:
+            types = settings_mod.get("file_types") or []
+            exts = active_extensions(types if isinstance(types, list) else None)
+            exclude_hidden = bool(settings_mod.get("exclude_hidden"))
+            names = []
+            try:
+                with os.scandir(folder) as it:
+                    for e in it:
+                        n = e.name
+                        if exclude_hidden and n.startswith("."):
+                            continue
+                        if os.path.splitext(n)[1].lower() not in exts:
+                            continue
+                        try:
+                            if e.is_file():
+                                names.append(n)
+                        except OSError:
+                            continue
+            except OSError:
+                names = []
+        # Case-insensitive order — matches the folder browser's tile order.
+        all_names = sorted(names, key=str.lower)
 
-        try:
-            all_names = sorted(
-                f for f in os.listdir(str(folder))
-                if os.path.isfile(os.path.join(str(folder), f))
-                and os.path.splitext(f)[1].lower() in exts
-                and (not exclude_hidden or not f.startswith("."))
-            )
-        except OSError:
-            all_names = []
+        target_base = os.path.basename(target_file).lower()
+        center = 0
+        for i, n in enumerate(all_names):
+            if n.lower() == target_base:
+                center = i
+                break
 
-        target_base = os.path.basename(target_file)
-        try:
-            center = [n.lower() for n in all_names].index(target_base.lower())
-        except ValueError:
-            center = 0
-
-        lo = max(0, center - seed_count)
-        hi = min(len(all_names), center + seed_count + 1)
-        seed_names = all_names[lo:hi]
-
-        mgr.images = [
-            ImageRecord(
-                path=os.path.join(str(folder), n),
-                filename=n,
-            )
-            for n in seed_names
-        ]
-        mgr._seed_idx = center - lo
-
-        remaining = all_names[:lo] + all_names[hi:]
-        remaining_sorted = sorted(remaining, key=lambda n: abs(
-            all_names.index(n) - center
-        ))
+        mgr.images = [ImageRecord(path=os.path.join(folder, n), filename=n)
+                      for n in all_names]
+        mgr._seed_idx = center
+        mgr._scan_done = True
 
         def _bg_scan():
-            import bisect
-            for name in remaining_sorted:
-                rec = ImageRecord(
-                    path=os.path.join(str(folder), name),
-                    filename=name,
-                )
-                with mgr._scan_lock:
-                    keys = [r.filename.lower() for r in mgr.images]
-                    insert_pos = bisect.bisect_left(keys, name.lower())
-                    mgr.images.insert(insert_pos, rec)
-                if mgr._on_scan_progress:
-                    try:
-                        mgr._on_scan_progress(len(mgr.images))
-                    except Exception:
-                        pass
-            with mgr._scan_lock:
-                mgr._scan_done = True
+            if mgr._on_scan_progress:
+                try:
+                    mgr._on_scan_progress(len(mgr.images))
+                except Exception:
+                    pass
             if mgr._on_scan_complete:
                 try:
                     mgr._on_scan_complete()
@@ -336,11 +332,11 @@ class ImageManager:
         return mgr, mgr._seed_idx
 
     def start_background_scan(self):
-        """Call after initial image is on screen to begin discovering remaining files."""
+        """Fire the (already-satisfied) progress/complete callbacks once."""
         if self._scan_thread or not hasattr(self, "_bg_scan_fn"):
             return
-        self._scan_thread = Thread(target=self._bg_scan_fn, daemon=True)
-        self._scan_thread.start()
+        self._scan_thread = True
+        self._bg_scan_fn()
 
     @property
     def scan_complete(self) -> bool:
@@ -350,6 +346,10 @@ class ImageManager:
         """Find current index of a file path (may shift during background scan)."""
         norm = os.path.normcase(os.path.abspath(path))
         with (self._scan_lock or Lock()):
+            # Fast path: path strings are built identically, so try == first.
+            for i, rec in enumerate(self.images):
+                if rec.path == path:
+                    return i
             for i, rec in enumerate(self.images):
                 if os.path.normcase(os.path.abspath(rec.path)) == norm:
                     return i

@@ -1,5 +1,5 @@
+import bisect
 import os
-import hashlib
 from pathlib import Path
 from dataclasses import dataclass
 
@@ -21,46 +21,32 @@ from . import external
 from . import settings as settings_mod
 from . import theme as theme_mod
 from . import dim_cache
+from . import thumb_store
+# Disk-cache helpers now live in thumb_store; re-exported here for callers.
+from .thumb_store import (  # noqa: F401
+    THUMB_MAX_DIM, CACHE_DIRNAME, cache_key, cache_file, lower_worker_priority, stat_sig,
+)
 
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
 ROW_HEIGHT_DEFAULT = 170
 SPACING = 3
-THUMB_MAX_DIM = 360            # cached thumb longest side
 BORDER_WIDTH = 3
-
-
-def lower_worker_priority():
-    """Drop the calling thread-pool thread below the UI thread's priority.
-
-    Decode/scan work is heavy but never urgent — the UI thread, which paints
-    scroll frames, must always preempt it. Call once at the top of every
-    background ``run()``. Without this, a folder-open burst of decode/walk
-    threads competes with the UI thread for cores and scrolling stutters.
-    """
-    from PyQt6.QtCore import QThread
-    th = QThread.currentThread()
-    if th is not None:
-        th.setPriority(QThread.Priority.LowestPriority)
-CACHE_DIRNAME = ".picker_cache"
-WORKERS = 4
 
 DEST_COLORS = [
     QColor(60, 200, 80),
     QColor(60, 150, 230),
     QColor(230, 170, 40),
 ]
-# ── Disk cache helpers (public — used by filmstrip) ────────────────────────────
-
-def cache_key(path: str) -> str:
-    stat = os.stat(path)
-    raw = f"{path}|{int(stat.st_mtime)}|{stat.st_size}".encode("utf-8")
-    return hashlib.md5(raw).hexdigest()
 
 
-def cache_file(source_folder: str, path: str) -> Path:
-    return Path(source_folder) / CACHE_DIRNAME / f"{cache_key(path)}.jpg"
+def prune_cache_async(source_folder: str, max_bytes: int) -> None:
+    """:func:`prune_cache` on a daemon thread — it stats every cached file, which
+    used to run on the UI thread each time a gallery opened."""
+    import threading
+    threading.Thread(target=prune_cache, args=(source_folder, max_bytes),
+                     daemon=True).start()
 
 
 def prune_cache(source_folder: str, max_bytes: int) -> None:
@@ -101,174 +87,32 @@ _cache_key = cache_key
 _cache_file = cache_file
 
 
-# ── Worker pool ────────────────────────────────────────────────────────────────
+# ── Background dimension lookup ────────────────────────────────────────────────
+# Thumbnails and header reads go through the shared thumb_store service. What's
+# left here is the one gallery-specific step: ImageManager records carry no stat
+# info, so validating the dimension cache needs a stat per file — done on a
+# worker instead of the UI thread.
 
-class _WorkerSignals(QObject):
-    thumb_ready = pyqtSignal(int, QPixmap, int, int)   # idx, pm, orig_w, orig_h
-    header_ready = pyqtSignal(int, int, int, bool)     # idx, orig_w, orig_h, exact
-
-
-def _is_video_path(path: str) -> bool:
-    # Local import — avoids a hard dep cycle with media.py at module load.
-    from .media import is_video
-    return is_video(path)
+class _LookupSignals(QObject):
+    done = pyqtSignal(object, object)   # hits {path: (w,h)}, sigs {path: sig}
 
 
-class _HeaderTask(QRunnable):
-    """Read just media header to get dimensions. Very fast.
-
-    For video files the dimensions come from the previously-cached video thumb
-    if present (zero ffprobe cost). If no cached thumb exists we emit a 16:9
-    placeholder aspect — the layout will correct itself once the thumb task
-    delivers the real frame.
-    """
-    def __init__(self, idx: int, path: str, signals: _WorkerSignals):
+class _DimLookupTask(QRunnable):
+    def __init__(self, source: str, paths: list[str], signals: _LookupSignals):
         super().__init__()
-        self.idx = idx
-        self.path = path
-        self.signals = signals
+        self._source, self._paths, self._signals = source, paths, signals
         self.setAutoDelete(True)
 
     def run(self):
         lower_worker_priority()
-        if _is_video_path(self.path):
-            # Try the on-disk video thumb cache for a free dimension read.
-            try:
-                from .video_thumb import cache_path_for_video
-                # Source folder is unknown here; cache_path_for_video uses the
-                # video's own folder convention. Probe a generic location:
-                # the gallery cache file lives next to source media.
-                from os.path import dirname
-                src_folder = dirname(self.path)
-                cf = cache_path_for_video(src_folder, self.path)
-                if cf.exists():
-                    img = QImage(str(cf))
-                    if not img.isNull():
-                        # Real frame aspect from the cached video thumb.
-                        self.signals.header_ready.emit(
-                            self.idx, img.width(), img.height(), True
-                        )
-                        return
-            except Exception:
-                pass
-            # Fallback: 16:9 placeholder (most videos) — NOT exact, don't cache.
-            self.signals.header_ready.emit(self.idx, 16, 9, False)
-            return
-
-        reader = QImageReader(self.path)
-        reader.setAutoTransform(True)
-        sz = reader.size()
-        if sz.isValid() and sz.width() > 0 and sz.height() > 0:
-            # `setAutoTransform(True)` rotates the decoded image but `size()`
-            # still returns pre-rotation dimensions from the header. Swap
-            # width/height when EXIF orientation is 90/270 so the layout
-            # gets the correct aspect on the FIRST pass — otherwise rotated
-            # phone shots flash with the wrong aspect until their thumb loads.
-            try:
-                from PyQt6.QtGui import QImageIOHandler
-                tflag = reader.transformation()
-                rot = (
-                    QImageIOHandler.Transformation.TransformationRotate90
-                    | QImageIOHandler.Transformation.TransformationRotate270
-                )
-                if int(tflag) & int(rot):
-                    sz = QSize(sz.height(), sz.width())
-            except Exception:
-                pass
-            self.signals.header_ready.emit(self.idx, sz.width(), sz.height(), True)
-        else:
-            # Unreadable header (e.g. HEIC has no Qt reader) → 3:2 guess, not exact.
-            self.signals.header_ready.emit(self.idx, 3, 2, False)
-
-
-class _ThumbTask(QRunnable):
-    def __init__(self, idx: int, path: str, cache_file: Path, signals: _WorkerSignals):
-        super().__init__()
-        self.idx = idx
-        self.path = path
-        self.cache_file = cache_file
-        self.signals = signals
-        self.setAutoDelete(True)
-
-    def run(self):
-        lower_worker_priority()
-        if _is_video_path(self.path):
-            self._run_video()
-            return
-        self._run_image()
-
-    def _run_image(self):
-        img: QImage | None = None
-        if self.cache_file.exists():
-            img = QImage(str(self.cache_file))
-            if img.isNull():
-                img = None
-
-        if img is None:
-            # HEIC/AVIF have no native Qt reader — decode via pillow-heif first.
-            from . import heif_loader
-            if heif_loader.is_heif(self.path) and heif_loader.available():
-                img = heif_loader.load_heif(self.path, max_edge=THUMB_MAX_DIM)
-
-            if img is None or img.isNull():
-                reader = QImageReader(self.path)
-                reader.setAutoTransform(True)
-                size = reader.size()
-                is_svg = os.path.splitext(self.path)[1].lower() in (".svg", ".svgz")
-                if size.isValid() and max(size.width(), size.height()) > 0:
-                    longest = max(size.width(), size.height())
-                    # Vectors have a tiny intrinsic size — rasterize UP to the thumb
-                    # resolution so they're crisp, not blurry. Rasters only scale down.
-                    if is_svg or longest > THUMB_MAX_DIM:
-                        scale = THUMB_MAX_DIM / longest
-                        reader.setScaledSize(QSize(
-                            max(1, round(size.width() * scale)),
-                            max(1, round(size.height() * scale)),
-                        ))
-                img = reader.read()
-            if img is None or img.isNull():
-                img = QImage(THUMB_MAX_DIM, int(THUMB_MAX_DIM * 2 / 3),
-                             QImage.Format.Format_RGB32)
-                img.fill(QColor(40, 40, 40))
-            # Cache the freshly decoded thumb (covers the HEIF path too).
-            try:
-                self.cache_file.parent.mkdir(parents=True, exist_ok=True)
-                img.save(str(self.cache_file), "JPEG", 82)
-            except Exception:
-                pass
-
-        pm = QPixmap.fromImage(img)
-        self.signals.thumb_ready.emit(self.idx, pm, img.width(), img.height())
-
-    def _run_video(self):
-        # The image cache path passed in will be ".jpg"; the video thumb cache
-        # uses ".v.jpg" so the two never clobber each other. Compute the video
-        # cache path from the same source folder the image cache was based on.
-        from .video_thumb import extract_thumb, cache_path_for_video
-        # Reverse-engineer the source folder from the cache path:
-        # cache_file = <source>/.picker_cache/<key>.jpg
+        sigs = {p: stat_sig(p) for p in self._paths}
+        entries = [(p, s[0] if s else None, s[1] if s else 0) for p, s in sigs.items()]
+        found = dim_cache.get_many(self._source, entries)
+        hits = {e[0]: d for e, d in zip(entries, found) if d is not None}
         try:
-            source_folder = self.cache_file.parent.parent
-        except Exception:
-            source_folder = self.cache_file.parent
-        v_cache = cache_path_for_video(str(source_folder), self.path)
-
-        img: QImage | None = None
-        if v_cache.exists():
-            img = QImage(str(v_cache))
-            if img.isNull():
-                img = None
-        if img is None:
-            img = extract_thumb(self.path, v_cache)
-        if img is None or img.isNull():
-            # Placeholder: dark tile so the layout can settle even if ffmpeg
-            # is missing or the file is corrupt.
-            img = QImage(THUMB_MAX_DIM, int(THUMB_MAX_DIM * 9 / 16),
-                         QImage.Format.Format_RGB32)
-            img.fill(QColor(28, 28, 28))
-
-        pm = QPixmap.fromImage(img)
-        self.signals.thumb_ready.emit(self.idx, pm, img.width(), img.height())
+            self._signals.done.emit(hits, sigs)
+        except RuntimeError:
+            pass
 
 
 # ── Tile data ──────────────────────────────────────────────────────────────────
@@ -283,7 +127,8 @@ class Tile:
 # ── Justified gallery canvas ───────────────────────────────────────────────────
 
 class _GalleryCanvas(QWidget):
-    """Paints justified rows of tiles. One widget for all 1000 images."""
+    """Paints justified rows of tiles. One widget for all images; only the rows
+    in view are painted/hit-tested, and thumbs come from the shared RAM store."""
 
     clicked = pyqtSignal(int)
     load_progress = pyqtSignal(int, int)   # done, total
@@ -291,13 +136,15 @@ class _GalleryCanvas(QWidget):
 
     ZOOM_MIN = 80
     ZOOM_MAX = 400
+    LOOKAHEAD = 700
 
     def __init__(self, manager: ImageManager, parent=None):
         super().__init__(parent)
         self._manager = manager
         self._aspects: dict[int, float] = {}
-        self._pixmaps: dict[int, QPixmap] = {}
-        self._tiles: list[Tile] = []
+        self._tiles: list[Tile] = []          # index order: _tiles[i].idx == i
+        self._row_tops: list[int] = []
+        self._row_starts: list[int] = []
         self._total_height = 0
         self._viewport_width = 0
         self._row_height = int(settings_mod.get("thumbnail_row_height") or ROW_HEIGHT_DEFAULT)
@@ -305,27 +152,29 @@ class _GalleryCanvas(QWidget):
         self._save_timer.setSingleShot(True)
         self._save_timer.setInterval(600)
         self._save_timer.timeout.connect(self._persist_row_height)
+        self._relayout_timer = QTimer(self)
+        self._relayout_timer.setSingleShot(True)
+        self._relayout_timer.setInterval(60)
+        self._relayout_timer.timeout.connect(self._recompute_layout)
 
         self.setAutoFillBackground(True)
         self._apply_theme_bg()
         self.setMouseTracking(True)
 
-        self._signals = _WorkerSignals()
-        self._signals.header_ready.connect(self._on_header_ready)
-        self._signals.thumb_ready.connect(self._on_thumb_ready)
-
-        self._pool = QThreadPool()
-        self._pool.setMaxThreadCount(WORKERS)
-        # Dimension (header) reads get their own pool so the justified layout —
-        # which waits on every aspect — doesn't stall behind the heavy thumbnail
-        # decodes sharing the main pool.
-        import os as _os
-        self._header_pool = QThreadPool()
-        self._header_pool.setMaxThreadCount(max(2, (_os.cpu_count() or 4) // 2))
-
-        self._pending_headers = set()
-        self._pending_thumbs = set()
+        self._store = thumb_store.store()
+        self._svc = thumb_store.service()
+        self._svc.thumb_ready.connect(self._on_thumb_ready)
+        self._svc.dims_ready.connect(self._on_dims_ready)
+        self._index_by_path: dict[str, int] = {}
+        self._sigs: dict[str, tuple[int, int] | None] = {}
+        self._requested: set[str] = set()
+        self._last_scan_rect = QRect()
+        self._pending_headers: set[str] = set()
         self._total_headers = 0
+        self._stopped = False
+
+        self._lookup_signals = _LookupSignals()
+        self._lookup_signals.done.connect(self._on_lookup_done)
 
         self._start_loading_headers()
 
@@ -337,72 +186,108 @@ class _GalleryCanvas(QWidget):
         self.setPalette(pal)
 
     def _start_loading_headers(self):
-        self._total_headers = len(self._manager.images)
-        src = self._manager.source_folder
-        for idx, rec in enumerate(self._manager.images):
-            # Known size from a previous open → correct aspect instantly, no
-            # thread work. This makes reopening a gallery lay out right on the
-            # first paint instead of reshuffling as headers trickle in.
-            dims = dim_cache.get(src, rec.path)
+        images = self._manager.images
+        self._total_headers = len(images)
+        self._index_by_path = {rec.path: i for i, rec in enumerate(images)}
+        for i in range(len(images)):
+            self._aspects[i] = 3.0 / 2.0
+        if not images:
+            self.load_progress.emit(0, 0)
+            self.load_done.emit()
+            return
+        # Cache validation needs a stat per file — do it off the UI thread.
+        paths = [rec.path for rec in images]
+        QThreadPool.globalInstance().start(
+            _DimLookupTask(self._manager.source_folder, paths, self._lookup_signals))
+
+    @pyqtSlot(object, object)
+    def _on_lookup_done(self, hits: dict, sigs: dict):
+        if self._stopped:
+            return
+        self._sigs = sigs
+        misses = []
+        for path, idx in self._index_by_path.items():
+            dims = hits.get(path)
             if dims is not None and dims[1] > 0:
                 self._aspects[idx] = dims[0] / dims[1]
-                continue
-            # Default placeholder aspect until header arrives
-            self._aspects[idx] = 3.0 / 2.0
-            self._pending_headers.add(idx)
-            task = _HeaderTask(idx, rec.path, self._signals)
-            self._header_pool.start(task)
-        if not self._pending_headers:
-            self.load_progress.emit(self._total_headers, self._total_headers)
-            self._recompute_layout()
+            else:
+                misses.append(path)
+        self._pending_headers = set(misses)
+        self.load_progress.emit(self._total_headers - len(misses), self._total_headers)
+        self._recompute_layout()
+        if misses:
+            self._svc.request_dims(self._manager.source_folder, misses)
+        else:
             self.load_done.emit()
 
-    def _schedule_thumb(self, idx: int):
-        if idx in self._pixmaps or idx in self._pending_thumbs:
+    @pyqtSlot(str, object)
+    def _on_dims_ready(self, source: str, results):
+        if self._stopped or source != self._manager.source_folder or not self._pending_headers:
             return
-        rec = self._manager.images[idx]
-        cf = _cache_file(self._manager.source_folder, rec.path)
-        self._pending_thumbs.add(idx)
-        task = _ThumbTask(idx, rec.path, cf, self._signals)
-        self._pool.start(task)
-
-    @pyqtSlot(int, int, int, bool)
-    def _on_header_ready(self, idx: int, w: int, h: int, exact: bool = True):
-        self._pending_headers.discard(idx)
+        for p, w, h, _exact, _sig in results:
+            if p not in self._pending_headers:
+                continue
+            self._pending_headers.discard(p)
+            idx = self._index_by_path.get(p)
+            if idx is not None and h > 0:
+                self._aspects[idx] = w / h
         done = self._total_headers - len(self._pending_headers)
         self.load_progress.emit(done, self._total_headers)
-        if h <= 0:
-            if not self._pending_headers:
-                self.load_done.emit()
-            return
-        self._aspects[idx] = w / h
-        # Only persist genuine header dimensions — never the video/HEIC guesses,
-        # or the next open would serve the wrong aspect as a cache "hit".
-        if exact:
-            dim_cache.put(self._manager.source_folder, self._manager.images[idx].path, w, h)
-        # Recompute layout once in a while — avoid thrash, do every 50 headers
-        if len(self._pending_headers) == 0 or len(self._pending_headers) % 50 == 0:
+        if self._pending_headers:
+            self._relayout_timer.start()
+        else:
+            self._relayout_timer.stop()
             self._recompute_layout()
-        if not self._pending_headers:
-            dim_cache.flush(self._manager.source_folder)
             self.load_done.emit()
 
-    @pyqtSlot(int, QPixmap, int, int)
-    def _on_thumb_ready(self, idx: int, pm: QPixmap, w: int, h: int):
-        self._pending_thumbs.discard(idx)
-        self._pixmaps[idx] = pm
+    @pyqtSlot(str)
+    def _on_thumb_ready(self, path: str):
+        if self._stopped:
+            return
+        idx = self._index_by_path.get(path)
+        if idx is None:
+            return
+        self._requested.discard(path)
+        pm = self._store.get(path)
+        if pm is None:
+            return
+        h = pm.height()
         if h > 0:
-            actual_aspect = w / h
+            actual_aspect = pm.width() / h
             if abs(actual_aspect - self._aspects.get(idx, 0)) > 0.01:
                 self._aspects[idx] = actual_aspect
                 # Thumb is authoritative (EXIF-aware) — persist the correction.
-                dim_cache.put(self._manager.source_folder,
-                              self._manager.images[idx].path, w, h)
-        # Repaint just the tile rect
-        for tile in self._tiles:
-            if tile.idx == idx:
-                self.update(tile.rect)
+                sig = self._sigs.get(path)
+                if sig is not None:
+                    dim_cache.put_sig(self._manager.source_folder, path, pm.width(), h, sig)
+                    self._svc.note_dims(self._manager.source_folder)
+                self._relayout_timer.start()
+                return
+        if idx < len(self._tiles):
+            self.update(self._tiles[idx].rect)
+
+    def _schedule_visible(self):
+        vis = self.visibleRegion().boundingRect()
+        if vis.isEmpty() or vis == self._last_scan_rect:
+            return
+        self._last_scan_rect = vis
+        images = self._manager.images
+        src = self._manager.source_folder
+        wanted: set[str] = set()
+        for idx in self._index_range(vis.top() - self.LOOKAHEAD, vis.bottom() + self.LOOKAHEAD):
+            if idx >= len(images):
                 break
+            path = images[idx].path
+            wanted.add(path)
+            if self._store.contains(path):
+                continue
+            pri = (self._svc.PRI_VISIBLE if self._tiles[idx].rect.intersects(vis)
+                   else self._svc.PRI_NEAR)
+            if self._svc.request(path, src, pri, self._sigs.get(path)):
+                self._requested.add(path)
+        for p in self._requested - wanted:
+            self._svc.cancel(p)
+        self._requested &= wanted
 
     # ── Layout ────────────────────────────────────────────────────────────────
 
@@ -414,6 +299,8 @@ class _GalleryCanvas(QWidget):
         target_h = self._row_height
         spacing = SPACING
         tiles: list[Tile] = []
+        row_tops: list[int] = []
+        row_starts: list[int] = []
 
         row_items: list[tuple[int, float]] = []
         row_aspect_sum = 0.0
@@ -429,6 +316,8 @@ class _GalleryCanvas(QWidget):
                 actual_h = (width - (len(row_items) - 1) * spacing) / row_aspect_sum
             else:
                 actual_h = target_h
+            row_tops.append(int(round(y)))
+            row_starts.append(row_items[0][0])
             x = 0
             for idx, a in row_items:
                 w = a * actual_h
@@ -455,10 +344,32 @@ class _GalleryCanvas(QWidget):
             close_row(fit_to_width=False)
 
         self._tiles = tiles
+        self._row_tops = row_tops
+        self._row_starts = row_starts
+        self._last_scan_rect = QRect()
         self._total_height = int(y)
         self.setMinimumHeight(self._total_height)
         self.resize(width, self._total_height)
         self.update()
+
+    def _index_range(self, top: int, bottom: int) -> range:
+        """Tile indices in rows intersecting [top, bottom] (rows vary in height,
+        so start one row early and let the rect test trim)."""
+        if not self._row_tops:
+            return range(0)
+        r0 = max(0, bisect.bisect_right(self._row_tops, top) - 1)
+        r1 = bisect.bisect_right(self._row_tops, bottom)
+        if r0 >= r1:
+            return range(0)
+        start = self._row_starts[r0]
+        end = self._row_starts[r1] if r1 < len(self._row_starts) else len(self._tiles)
+        return range(start, end)
+
+    def _tile_at(self, pos) -> int:
+        for idx in self._index_range(pos.y(), pos.y()):
+            if self._tiles[idx].rect.contains(pos):
+                return idx
+        return -1
 
     def zoom(self, factor: float, anchor_idx: int | None = None) -> int:
         """Scale row height by factor. Returns anchor tile's new top-y for scroll preservation."""
@@ -469,10 +380,8 @@ class _GalleryCanvas(QWidget):
         self._row_height = new_h
         self._recompute_layout()
         self._save_timer.start()
-        if anchor_idx is not None:
-            for tile in self._tiles:
-                if tile.idx == anchor_idx:
-                    return tile.rect.top()
+        if anchor_idx is not None and 0 <= anchor_idx < len(self._tiles):
+            return self._tiles[anchor_idx].rect.top()
         return -1
 
     def row_height(self) -> int:
@@ -510,27 +419,27 @@ class _GalleryCanvas(QWidget):
             painter.end()
             return
 
-        # Trigger thumb loading for visible + small margin
-        margin = 400
-        vis_margin = visible.adjusted(0, -margin, 0, margin)
+        self._schedule_visible()
+        images = self._manager.images
+        placeholder = theme_mod.c("tile_placeholder")
+        has_dest = self._manager.has_destinations
 
-        for tile in self._tiles:
+        for idx in self._index_range(visible.top(), visible.bottom()):
+            if idx >= len(images):
+                break
+            tile = self._tiles[idx]
             if not tile.rect.intersects(visible):
-                if tile.rect.intersects(vis_margin):
-                    self._schedule_thumb(tile.idx)
                 continue
-
-            self._schedule_thumb(tile.idx)
-            pm = self._pixmaps.get(tile.idx)
-            if pm and not pm.isNull():
+            rec = images[idx]
+            pm = self._store.get(rec.path)
+            if pm is not None:
                 painter.drawPixmap(tile.rect, pm)
             else:
-                painter.fillRect(tile.rect, theme_mod.c("tile_placeholder"))
+                painter.fillRect(tile.rect, placeholder)
 
             # Status overlay only when destinations are set
-            if not self._manager.has_destinations:
+            if not has_dest:
                 continue
-            rec = self._manager.images[tile.idx]
             color = self._status_color(rec.status)
             if color:
                 pen = QPen(color)
@@ -614,31 +523,24 @@ class _GalleryCanvas(QWidget):
     # ── Input ─────────────────────────────────────────────────────────────────
 
     def mouseMoveEvent(self, event):
-        pos = event.position().toPoint()
-        for tile in self._tiles:
-            if tile.rect.contains(pos):
-                rec = self._manager.images[tile.idx]
-                name = os.path.basename(rec.path)
-                pm = self._pixmaps.get(tile.idx)
-                dims = ""
-                if pm and not pm.isNull():
-                    dims = f"\n{pm.width()}×{pm.height()}"
-                self.setToolTip(f"{name}{dims}")
-                return
+        idx = self._tile_at(event.position().toPoint())
+        if 0 <= idx < len(self._manager.images):
+            rec = self._manager.images[idx]
+            name = os.path.basename(rec.path)
+            pm = self._store.get(rec.path)
+            dims = f"\n{pm.width()}×{pm.height()}" if pm is not None else ""
+            self.setToolTip(f"{name}{dims}")
+            return
         self.setToolTip("")
 
     def mousePressEvent(self, event):
-        pos = event.position().toPoint()
+        idx = self._tile_at(event.position().toPoint())
+        if idx < 0:
+            return
         if event.button() == Qt.MouseButton.LeftButton:
-            for tile in self._tiles:
-                if tile.rect.contains(pos):
-                    self.clicked.emit(tile.idx)
-                    return
+            self.clicked.emit(idx)
         elif event.button() == Qt.MouseButton.RightButton:
-            for tile in self._tiles:
-                if tile.rect.contains(pos):
-                    self._show_context_menu(tile.idx, event.globalPosition().toPoint())
-                    return
+            self._show_context_menu(idx, event.globalPosition().toPoint())
 
     def _show_context_menu(self, idx: int, global_pos):
         rec = self._manager.images[idx]
@@ -665,7 +567,7 @@ class _GalleryCanvas(QWidget):
         act_sys.triggered.connect(lambda: self._launch(external.open_default, path))
 
         menu.addSeparator()
-        act_folder = menu.addAction("Reveal in Explorer")
+        act_folder = menu.addAction(external.reveal_label())
         act_folder.triggered.connect(lambda: self._reveal(path))
 
         menu.exec(global_pos)
@@ -676,35 +578,32 @@ class _GalleryCanvas(QWidget):
             QMessageBox.warning(self, "Launch failed", err)
 
     def _reveal(self, path: str):
-        try:
-            import subprocess
-            subprocess.Popen(["explorer", "/select,", os.path.normpath(path)])
-        except Exception as e:
-            QMessageBox.warning(self, "Error", str(e))
+        err = external.reveal_in_file_manager(path)
+        if err:
+            QMessageBox.warning(self, "Error", err)
 
     # ── Public API ────────────────────────────────────────────────────────────
 
     def refresh_status(self, idx: int | None = None):
         if idx is None:
             self.update()
-        else:
-            for tile in self._tiles:
-                if tile.idx == idx:
-                    self.update(tile.rect)
-                    return
+        elif 0 <= idx < len(self._tiles):
+            self.update(self._tiles[idx].rect)
 
     def tile_rect(self, idx: int) -> QRect | None:
-        for tile in self._tiles:
-            if tile.idx == idx:
-                return tile.rect
-        return None
+        return self._tiles[idx].rect if 0 <= idx < len(self._tiles) else None
 
     def cleanup(self):
-        dim_cache.flush(self._manager.source_folder)   # save measured sizes
-        self._header_pool.clear()
-        self._header_pool.waitForDone(200)
-        self._pool.clear()
-        self._pool.waitForDone(200)
+        self._stopped = True
+        self._relayout_timer.stop()
+        for p in self._requested:
+            self._svc.cancel(p)
+        self._requested.clear()
+        try:
+            self._svc.thumb_ready.disconnect(self._on_thumb_ready)
+            self._svc.dims_ready.disconnect(self._on_dims_ready)
+        except (TypeError, RuntimeError):
+            pass
 
 
 # ── Smooth-scroll scroll area ──────────────────────────────────────────────────
@@ -735,13 +634,9 @@ class _SmoothScrollArea(QScrollArea):
                 # Find tile under cursor (canvas coords = viewport y + scroll value)
                 vp_pos = event.position().toPoint()
                 canvas_y = vp_pos.y() + bar.value()
-                anchor_idx = -1
-                anchor_y_before = 0
-                for tile in getattr(canvas, "_tiles", []):
-                    if tile.rect.contains(vp_pos.x(), canvas_y):
-                        anchor_idx = tile.idx
-                        anchor_y_before = tile.rect.top() - bar.value()
-                        break
+                anchor_idx = canvas._tile_at(QPoint(vp_pos.x(), canvas_y))
+                anchor_y_before = (canvas._tiles[anchor_idx].rect.top() - bar.value()
+                                   if anchor_idx >= 0 else 0)
                 new_top = canvas.zoom(factor, anchor_idx if anchor_idx >= 0 else None)
                 if new_top >= 0:
                     # Keep anchor tile at same viewport y-offset
@@ -911,8 +806,12 @@ class GalleryView(QWidget):
         self._overlay.hide()
         self._canvas.load_progress.connect(self._on_load_progress)
         self._canvas.load_done.connect(self._on_load_done)
+        # The grid is usable immediately (placeholder aspects, cached dims land
+        # in milliseconds) — only put up the dimming overlay if loading is
+        # genuinely slow, instead of hiding a working grid on every open.
+        self._load_finished = False
         if len(manager.images) > 0:
-            self._overlay.start(len(manager.images))
+            QTimer.singleShot(400, self._maybe_show_overlay)
 
         # setCentralWidget can fire our resizeEvent before the scroll area's
         # viewport has settled to its real width — leaving the canvas laid out
@@ -924,7 +823,7 @@ class GalleryView(QWidget):
         # Evict any stale / oversized disk cache (non-blocking, just stat+unlink)
         try:
             cap_mb = int(settings_mod.get("thumb_cache_mb") or 1024)
-            prune_cache(manager.source_folder, cap_mb * 1024 * 1024)
+            prune_cache_async(manager.source_folder, cap_mb * 1024 * 1024)
         except Exception:
             pass
 
@@ -1000,8 +899,17 @@ class GalleryView(QWidget):
     def _on_load_progress(self, done: int, total: int):
         self._overlay.set_progress(done, total)
 
+    def _maybe_show_overlay(self):
+        try:
+            if not self._load_finished:
+                self._overlay.start(len(self._manager.images))
+                self._overlay.setGeometry(self.rect())
+        except RuntimeError:
+            pass   # view already torn down
+
     @pyqtSlot()
     def _on_load_done(self):
+        self._load_finished = True
         self._overlay.stop()
 
     def refresh_cell(self, idx: int):

@@ -1,20 +1,42 @@
-"""RAW file decoder. Uses rawpy; falls back to embedded thumb for speed."""
+"""RAW file decoder. Uses rawpy; falls back to embedded thumb for speed.
+
+rawpy and numpy are imported lazily — on the first RAW decode, on a worker
+thread — instead of at app start, where they added a noticeable chunk to launch
+time even for users who never open a RAW file.
+"""
+import importlib.util
+import threading
 from pathlib import Path
 
 from PyQt6.QtGui import QImage
 from PyQt6.QtCore import QByteArray
 
-try:
-    import rawpy
-    _HAVE_RAWPY = True
-except Exception:
-    _HAVE_RAWPY = False
+rawpy = None
+np = None
+_import_lock = threading.Lock()
+_imported = False
+_HAVE_RAWPY = importlib.util.find_spec("rawpy") is not None     # cheap: no import
+_HAVE_NUMPY = importlib.util.find_spec("numpy") is not None
 
-try:
-    import numpy as np
-    _HAVE_NUMPY = True
-except Exception:
-    _HAVE_NUMPY = False
+
+def _ensure_imports() -> bool:
+    global rawpy, np, _imported, _HAVE_RAWPY, _HAVE_NUMPY
+    if _imported:
+        return _HAVE_RAWPY
+    with _import_lock:
+        if not _imported:
+            try:
+                import rawpy as _rawpy
+                rawpy = _rawpy
+            except Exception:
+                _HAVE_RAWPY = False
+            try:
+                import numpy as _np
+                np = _np
+            except Exception:
+                _HAVE_NUMPY = False
+            _imported = True
+    return _HAVE_RAWPY
 
 
 RAW_EXTENSIONS = {".cr2", ".cr3", ".nef", ".arw", ".dng", ".raf", ".orf", ".rw2", ".pef", ".srw"}
@@ -30,7 +52,7 @@ def available() -> bool:
 
 def load_raw(path: str, prefer_thumb: bool = True) -> QImage | None:
     """Return QImage of RAW. Tries embedded JPEG first (fast), then full demosaic."""
-    if not _HAVE_RAWPY:
+    if not _ensure_imports():
         return None
     try:
         with rawpy.imread(path) as raw:

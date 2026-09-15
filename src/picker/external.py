@@ -198,6 +198,19 @@ def _glob_programfiles(patterns: list[str]) -> str | None:
     return None
 
 
+def _glob_macos_apps(patterns: list[str]) -> str | None:
+    """Find an app bundle under /Applications (and ~/Applications)."""
+    roots = ["/Applications", os.path.expanduser("~/Applications")]
+    for root in roots:
+        if not os.path.isdir(root):
+            continue
+        for pat in patterns:
+            matches = sorted(glob.glob(os.path.join(root, pat)), reverse=True)
+            if matches:
+                return matches[0]
+    return None
+
+
 def _resolve(key: str, finders) -> str | None:
     if key in _cache:
         return _cache[key]
@@ -206,7 +219,8 @@ def _resolve(key: str, finders) -> str | None:
             p = fn()
         except Exception:
             p = None
-        if p and os.path.isfile(p):
+        # os.path.exists (not isfile) so macOS .app bundles (directories) count.
+        if p and os.path.exists(p):
             _cache[key] = p
             return p
     _cache[key] = None
@@ -218,6 +232,8 @@ def photoshop_path() -> str | None:
     if manual and os.path.isfile(manual):
         return manual
     return _resolve("ps", [
+        lambda: _glob_macos_apps(["Adobe Photoshop */Adobe Photoshop *.app",
+                                  "Adobe Photoshop*.app"]),
         lambda: _registry_app_paths("Photoshop.exe"),
         lambda: _registry_adobe_exe("Photoshop", "Photoshop.exe"),
         lambda: _registry_uninstall_exe("Adobe Photoshop", "Photoshop.exe"),
@@ -235,6 +251,9 @@ def lightroom_path() -> str | None:
     if manual and os.path.isfile(manual):
         return manual
     return _resolve("lr", [
+        lambda: _glob_macos_apps(["Adobe Lightroom Classic/Adobe Lightroom Classic.app",
+                                  "Adobe Lightroom*/Adobe Lightroom*.app",
+                                  "Adobe Lightroom*.app"]),
         lambda: _registry_app_paths("Lightroom.exe"),
         lambda: _registry_adobe_exe("Lightroom", "Lightroom.exe"),
         lambda: _registry_adobe_exe("Lightroom CC", "Lightroom.exe"),
@@ -281,7 +300,11 @@ def resolve_or_prompt(which: str, parent=None) -> str | None:
 
 def open_with(app_path: str, image_path: str) -> str | None:
     try:
-        subprocess.Popen([app_path, image_path], close_fds=True)
+        if sys.platform == "darwin" and app_path.endswith(".app"):
+            # macOS: launch a .app bundle with the file as its document.
+            subprocess.Popen(["open", "-a", app_path, image_path], close_fds=True)
+        else:
+            subprocess.Popen([app_path, image_path], close_fds=True)
         return None
     except Exception as e:
         return str(e)
@@ -295,6 +318,44 @@ def open_default(image_path: str) -> str | None:
             subprocess.Popen(["open", image_path])
         else:
             subprocess.Popen(["xdg-open", image_path])
+        return None
+    except Exception as e:
+        return str(e)
+
+
+def reveal_label() -> str:
+    """Platform-appropriate label for the reveal-in-file-manager action."""
+    if sys.platform == "win32":
+        return "Reveal in Explorer"
+    if sys.platform == "darwin":
+        return "Reveal in Finder"
+    return "Show in File Manager"
+
+
+def reveal_in_file_manager(path: str) -> str | None:
+    """Open the OS file manager with ``path`` selected. Returns an error string
+    on failure, else None."""
+    try:
+        p = os.path.normpath(path)
+        if sys.platform == "win32":
+            subprocess.Popen(["explorer", "/select,", p])
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", "-R", p])
+        else:
+            # Linux: no universal "select" — try common file managers, then fall
+            # back to opening the containing folder.
+            folder = os.path.dirname(p) or "."
+            for cmd in (["dbus-send", "--session", "--print-reply",
+                         "--dest=org.freedesktop.FileManager1",
+                         "--type=method_call", "/org/freedesktop/FileManager1",
+                         "org.freedesktop.FileManager1.ShowItems",
+                         f"array:string:file://{p}", "string:"],):
+                try:
+                    subprocess.Popen(cmd)
+                    return None
+                except Exception:
+                    pass
+            subprocess.Popen(["xdg-open", folder])
         return None
     except Exception as e:
         return str(e)

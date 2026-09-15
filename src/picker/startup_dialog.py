@@ -142,7 +142,7 @@ QPushButton#addDest:disabled { color: #444; border-color: #2a2a30; }
 class StartupDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Sort Photos")
+        self.setWindowTitle("Sort-Multi")
         from .icon import app_icon
         self.setWindowIcon(app_icon())
         self.setMinimumWidth(640)

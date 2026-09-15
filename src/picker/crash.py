@@ -11,16 +11,18 @@ _MAX_CRASH_FILES = 20
 
 
 def _crash_dir() -> Path:
+    # Reuse the platform-correct config dir (handles Windows/macOS/Linux + portable).
     try:
         from . import settings as settings_mod
-        if settings_mod.is_portable():
-            d = settings_mod.portable_dir() / "crash-logs"
-            d.mkdir(parents=True, exist_ok=True)
-            return d
+        d = settings_mod._config_dir() / "crash-logs"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
     except Exception:
         pass
     if os.name == "nt":
         base = Path(os.environ.get("APPDATA", Path.home()))
+    elif sys.platform == "darwin":
+        base = Path.home() / "Library" / "Application Support"
     else:
         base = Path.home() / ".config"
     d = base / "PICker" / "crash-logs"

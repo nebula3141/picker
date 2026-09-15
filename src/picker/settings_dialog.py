@@ -713,10 +713,13 @@ class SettingsDialog(QDialog):
             index_mod.clear_all()
         except Exception:
             pass
-        # 3) In-memory scan caches (folder browser)
+        # 3) In-memory scan caches (folder browser) + dimension/position memory
         try:
             from . import album_browser_view as abv
+            from . import dim_cache
             abv.invalidate_scan_cache()
+            dim_cache.reset()
+            settings_mod.clear_positions()
         except Exception:
             pass
         # 4) Sidecar state files under the config dir

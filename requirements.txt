@@ -10,6 +10,11 @@ rawpy>=0.18
 # if missing; bundle with the app so packaged builds can open these.
 pillow-heif>=0.13
 
+# Soft requirement — send files to the OS Trash on macOS/Linux (Windows uses a
+# built-in ctypes Recycle Bin call). Without it, "Delete" is disabled off-Windows
+# rather than permanently removing files.
+send2trash>=1.8 ; sys_platform != "win32"
+
 # Optional runtime dependencies (no pip package — bundle the binaries):
 # ffmpeg.exe + ffprobe.exe alongside main.py / PICker.exe.
 #   Without them: video thumbnails + ffprobe metadata are skipped.

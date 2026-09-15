@@ -39,6 +39,9 @@ def db_path() -> Path:
     return _config_dir() / "index.sqlite"
 
 
+_schema_ready: set[str] = set()   # DB paths already backed-up/migrated this process
+
+
 # ── Schema ─────────────────────────────────────────────────────────────────────
 
 _SCHEMA = """
@@ -121,17 +124,24 @@ def connect() -> sqlite3.Connection:
     move it aside and start fresh — better than crashing the app on launch
     because of a half-flushed sqlite from a previous power loss."""
     path = db_path()
+    key = str(path)
     try:
         conn = sqlite3.connect(path, timeout=10.0, isolation_level=None)
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
         conn.execute("PRAGMA foreign_keys=ON;")
-        _backup_db(path)
-        conn.executescript(_SCHEMA)
-        _migrate(conn)
+        if key not in _schema_ready:
+            # Backup + schema + migration used to run on EVERY connect — i.e. a
+            # full copy of index.sqlite per search or per library card. Once per
+            # database per process is all that's needed.
+            _backup_db(path)
+            conn.executescript(_SCHEMA)
+            _migrate(conn)
+            _schema_ready.add(key)
         conn.row_factory = sqlite3.Row
         return conn
     except sqlite3.DatabaseError:
+        _schema_ready.discard(key)
         try:
             conn.close()
         except Exception:

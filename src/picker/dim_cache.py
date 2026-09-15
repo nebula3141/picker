@@ -73,6 +73,39 @@ def get(source_folder: str, path: str) -> tuple[int, int] | None:
     return None
 
 
+def reset() -> None:
+    """Drop all in-memory state (after the on-disk caches were wiped)."""
+    with _lock:
+        _folders.clear()
+        _loaded.clear()
+        _dirty.clear()
+
+
+def preload(source_folder: str) -> None:
+    """Parse a folder's index now (call from a worker) so the first lookup on
+    the UI thread doesn't pay for the JSON read."""
+    with _lock:
+        _ensure_loaded(source_folder)
+
+
+def get_many(source_folder: str, entries) -> list[tuple[int, int] | None]:
+    """Batch lookup with **no syscalls**: ``entries`` is an iterable of
+    ``(path, mtime, size)`` whose stat fields the caller already has (scandir
+    provides them for free). One lock acquisition for the whole folder."""
+    out: list[tuple[int, int] | None] = []
+    with _lock:
+        d = _ensure_loaded(source_folder)
+        for path, mtime, size in entries:
+            v = d.get(_npath(path))
+            if (isinstance(v, list) and len(v) == 4 and mtime is not None
+                    and int(v[2]) == int(mtime) and int(v[3]) == int(size)
+                    and v[0] > 0 and v[1] > 0):
+                out.append((int(v[0]), int(v[1])))
+            else:
+                out.append(None)
+    return out
+
+
 def put(source_folder: str, path: str, w: int, h: int) -> None:
     """Record ``path``'s pixel size for next time. Buffered; see :func:`flush`."""
     if w <= 0 or h <= 0:
@@ -81,8 +114,15 @@ def put(source_folder: str, path: str, w: int, h: int) -> None:
         st = os.stat(path)
     except OSError:
         return
+    put_sig(source_folder, path, w, h, (int(st.st_mtime), int(st.st_size)))
+
+
+def put_sig(source_folder: str, path: str, w: int, h: int, sig: tuple[int, int]) -> None:
+    """:func:`put` with a caller-supplied (mtime, size) — no stat."""
+    if w <= 0 or h <= 0 or sig is None:
+        return
     key = _npath(path)
-    entry = [int(w), int(h), int(st.st_mtime), int(st.st_size)]
+    entry = [int(w), int(h), int(sig[0]), int(sig[1])]
     with _lock:
         d = _ensure_loaded(source_folder)
         if d.get(key) == entry:

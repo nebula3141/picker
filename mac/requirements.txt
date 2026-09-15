@@ -1,0 +1,17 @@
+# PICker — Python dependencies (macOS)
+# Install into a virtualenv:  pip install -r requirements.txt
+# ffmpeg is installed via Homebrew (see setup.sh / README.md).
+
+# ── Hard requirements (app won't start without these) ─────────────────────────
+PyQt6>=6.5,<7            # GUI toolkit. The wheel bundles Qt6 (Widgets/Gui/Core/
+                         # Network/Multimedia) — no system Qt needed on macOS.
+Pillow>=10.0             # EXIF reading
+numpy>=1.24              # image arrays, histogram, focus peaking
+
+# ── Soft requirements (feature degrades gracefully if missing) ────────────────
+rawpy>=0.18              # RAW decode via LibRaw (wheels bundle LibRaw)
+pillow-heif>=0.13        # HEIC/HEIF/AVIF decode (iPhone photos)
+send2trash>=1.8          # send deleted files to the macOS Trash (recoverable)
+
+# ── NOT a pip package — install via Homebrew (see setup.sh) ───────────────────
+#   ffmpeg / ffprobe   → video thumbnails + metadata   (brew install ffmpeg)

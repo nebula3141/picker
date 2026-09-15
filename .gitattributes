@@ -1,0 +1,5 @@
+# Shell scripts and launchers must stay LF or they break on macOS/Linux.
+*.sh    text eol=lf
+*.command text eol=lf
+mac/*    text eol=lf
+linux/*.sh text eol=lf

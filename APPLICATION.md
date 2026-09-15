@@ -72,8 +72,8 @@ Browse into a folder tree. Shows:
 - An **Images** section: the images directly in the current folder, laid out as a
   **justified mosaic** (variable-width tiles that keep their real aspect ratio, packed into
   centered rows).
-- A clickable **breadcrumb** path, a labelled **"‹ Back"** button, an item count, and a
-  **Rescan** button.
+- A clickable **breadcrumb** path, a labelled **"‹ Back"** button, an item count, a
+  **Rescan** button, and a **⇄ Sort** button (opens two-pane Sort with this folder as source).
 - A **search box** (`Ctrl+F`; `Esc` clears) with a **scope toggle**:
   - *This folder* — filters the current folder by filename live as you type.
   - *Whole library* — pressing Enter searches every indexed photo and shows the matches.
@@ -148,8 +148,26 @@ releases the file when leaving so the file can be moved/renamed/deleted.)
 
 ## 5. Culling / sorting workflow
 
+### 5.1 Sort (two panes)
+- **File → Sort…** or the folder browser's **⇄ Sort** button. The screen splits into a
+  **source** mosaic (left) and a **destination** mosaic (right), each with a header showing
+  the folder, a photo count and a **Change…** button. The last source/destination pair is
+  remembered; missing ones are asked for with a folder picker.
+- Arrow keys / Home / End / PgUp / PgDn move a focus ring through the source; **Space**
+  copies the focused photo (or the multi-selection) into the destination and advances.
+- The copied tile appears on the right **immediately** (reusing the source thumbnail and
+  aspect) while the copy runs in the background, in order. Source photos already present in
+  the destination show a **green tick**; Space on them does nothing. A name clash with a
+  different file follows the conflict policy.
+- **Both panes update in real time** from the file system (external adds/removes/renames).
+- **Enter**/double-click: large preview (←/→ step, Space copy + advance, Esc/Enter close).
+  **Tab** switches panes · **Ctrl+Z** undoes the last copy · **+/−** tile size ·
+  **Del** sends the focused photo to the Recycle Bin · **Swap** exchanges the folders ·
+  **Esc** returns to where Sort was opened from.
+
+### 5.2 Sort-Multi (destinations + number keys)
 - The user defines up to **9 destination folders**, each with a label and a color, in the
-  "Sort Photos" dialog (along with the source folder).
+  "Sort-Multi" dialog (along with the source folder).
 - **File mode** is copy (keep original) or move (remove from source).
 - In the slideshow, number keys send the current image to a destination; an Enter key sends
   to the "active" destination; a key cycles the active destination; and there's **undo**.
@@ -231,7 +249,18 @@ releases the file when leaving so the file can be moved/renamed/deleted.)
 - **Thumbnail cache:** generated thumbnails are cached on disk next to the photos (in a
   hidden cache folder) and reused; the cache auto-invalidates when a file changes. A cache
   size cap is configurable, and the cache can be cleared.
-- A **loading screen** with progress is shown for heavy folder scans.
+- **Shared memory caches sized to free RAM:** one app-wide thumbnail memory (every view reuses
+  every decoded thumbnail) and one full-size frame memory that survives closing the viewer.
+  Both shrink when other apps need memory.
+- **One prioritised, cancellable decode queue:** on-screen work first; work for things
+  scrolled or flicked past is dropped before it starts.
+- **Never block the window:** folder listings, recursive counts, cache pruning and library
+  cards all load in the background. Subfolders of the current folder are listed ahead of
+  time (and hovered folders pre-warm their thumbnails), so navigation renders from memory;
+  cached listings re-validate against the folder's modification time.
+- **Nothing is re-done:** one recursive walk records the counts of every folder beneath it;
+  image dimensions are remembered so grids lay out correctly on the first paint; searching
+  refilters the grid in place; viewer positions are written lazily, not per keypress.
 
 ---
 
@@ -374,7 +403,12 @@ All local and disposable:
 ## 16. Keyboard shortcuts
 
 **Global / window**
-- Home (Library); Open Folder; Sort Photos; toggle theme; quit; fullscreen; show shortcuts.
+- Home (Library); Open Folder; Sort (`Ctrl+Shift+S`); Sort-Multi (`Ctrl+Alt+S`); toggle
+  theme; quit; fullscreen; show shortcuts.
+
+**Sort (two panes)**
+- Arrows / Home / End / PgUp / PgDn move; Space copy to destination; Enter preview; Tab switch
+  pane; Ctrl+Z undo last copy; +/− tile size; Del recycle; Esc back.
 - Escape goes up one level (slideshow → browser/gallery → library), exiting fullscreen first.
 
 **Slideshow — navigation & view**

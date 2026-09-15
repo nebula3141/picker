@@ -14,13 +14,14 @@ once their walk completes; the enriched result is cached for instant re-visits.
 """
 from __future__ import annotations
 
+import bisect
 import os
 import threading
 from collections import OrderedDict
 from pathlib import Path
 
 from PyQt6.QtCore import (
-    Qt, QSize, QRect, QObject, QRunnable, QThreadPool, pyqtSignal, pyqtSlot
+    Qt, QSize, QRect, QObject, QRunnable, QThreadPool, QTimer, pyqtSignal, pyqtSlot
 )
 from PyQt6.QtGui import (
     QImage, QImageReader, QPixmap, QColor, QPainter, QPen, QBrush, QFont,
@@ -36,16 +37,16 @@ from PyQt6.QtWidgets import (
 from . import theme as theme_mod
 from . import settings as settings_mod
 from . import log
+from . import album as album_mod
 from .album import Folder, ImageItem, scan_path
 from . import dim_cache
+from . import thumb_store
 from .icon import menu_icon
-from .gallery_view import (
+from .thumb_store import (
     cache_file as thumb_cache_file,
     THUMB_MAX_DIM,
-    _HeaderTask,
-    _ThumbTask,
-    _WorkerSignals,
     lower_worker_priority,
+    npath as _npath,
 )
 
 
@@ -55,19 +56,58 @@ COVER_H = 150
 TILE_GAP = 16
 COVER_LONGEST = 360
 
-# Module-level cache keyed by absolute folder path. Survives across
-# AlbumBrowserView instances (the view is destroyed every time the user
-# enters the slideshow), so navigating back doesn't re-walk disk.
-_SCAN_CACHE: "OrderedDict[str, tuple[list, list]]" = OrderedDict()
-_SCAN_CACHE_MAX = 256
+# Module-level listing cache keyed by folder path: (folders, images, dir mtime).
+# Survives across AlbumBrowserView instances and is warmed speculatively (the
+# subfolders of whatever you're looking at are listed in the background), so
+# drilling into a folder usually renders from memory with zero disk access.
+# Entries are revalidated against the directory's mtime — which changes whenever
+# a file is added, removed or renamed in it — so a stale listing is shown for at
+# most one frame and then corrected in place.
+_SCAN_CACHE: "OrderedDict[str, tuple[list, list, int]]" = OrderedDict()
+_SCAN_CACHE_MAX = 512
+_SCAN_LOCK = threading.Lock()
 
 
 def invalidate_scan_cache(path: str | None = None):
-    """Drop one entry (path given) or wipe the whole cache."""
-    if path is None:
-        _SCAN_CACHE.clear()
-    else:
-        _SCAN_CACHE.pop(path, None)
+    """Drop one entry (path given) or wipe the whole cache. Recursive counts of
+    the folder and its ancestors are dropped too — they include its files."""
+    with _SCAN_LOCK:
+        if path is None:
+            _SCAN_CACHE.clear()
+        else:
+            _SCAN_CACHE.pop(path, None)
+    album_mod.invalidate_folder_stats(path)
+
+
+def _dir_mtime(path: str) -> int:
+    try:
+        return os.stat(path).st_mtime_ns
+    except OSError:
+        return -1
+
+
+def _cache_get(path: str):
+    with _SCAN_LOCK:
+        hit = _SCAN_CACHE.get(path)
+        if hit is not None:
+            _SCAN_CACHE.move_to_end(path)
+        return hit
+
+
+def _cache_put(path: str, folders, items, mtime: int):
+    with _SCAN_LOCK:
+        _SCAN_CACHE[path] = (folders, items, mtime)
+        _SCAN_CACHE.move_to_end(path)
+        while len(_SCAN_CACHE) > _SCAN_CACHE_MAX:
+            _SCAN_CACHE.popitem(last=False)
+
+
+def _list_folder(path: str):
+    """scandir listing + dir mtime, for workers. Captures the mtime *before*
+    listing so a change racing the scan invalidates the entry, never hides."""
+    mtime = _dir_mtime(path)
+    folders, items = scan_path(path, deep=False)
+    return folders, items, mtime
 
 
 # ── Move / copy + recent destinations ──────────────────────────────────────────
@@ -258,58 +298,69 @@ def _qc(key: str) -> QColor:
     return val if isinstance(val, QColor) else QColor(val)
 
 
-# ── Background cover loader ────────────────────────────────────────────────────
+# ── Background folder listing + speculative prefetch ──────────────────────────
+# Covers and image thumbnails go through the shared thumb_store service (one
+# RAM cache + one prioritised pool for the whole app). Folder *listings* run on
+# this small pool: the folder you clicked (never on the UI thread, so a slow or
+# network drive can't freeze the window) and, at lower priority, the subfolders
+# you're likely to open next.
 
-class _CoverSignals(QObject):
-    ready = pyqtSignal(str, QPixmap)
+class _ListSignals(QObject):
+    listed = pyqtSignal(int, str, object)    # (gen, path, (folders, items, mtime))
 
 
-class _CoverTask(QRunnable):
-    def __init__(self, source_root: str, cover_path: str, signals: _CoverSignals):
+class _ListTask(QRunnable):
+    def __init__(self, gen: int, path: str, signals: _ListSignals | None):
         super().__init__()
-        self._source_root = source_root
-        self._cover_path = cover_path
-        self._signals = signals
+        self._gen, self._path, self._signals = gen, path, signals
         self.setAutoDelete(True)
 
     def run(self):
         lower_worker_priority()
-        cf = thumb_cache_file(self._source_root, self._cover_path)
-        img: QImage | None = None
-        if cf.exists():
-            r = QImageReader(str(cf))
-            r.setAutoTransform(True)
-            img = r.read()
-            if img is None or img.isNull():
-                img = None
-        if img is None:
-            from . import heif_loader
-            if heif_loader.is_heif(self._cover_path) and heif_loader.available():
-                img = heif_loader.load_heif(self._cover_path, max_edge=COVER_LONGEST)
-            if img is None or img.isNull():
-                reader = QImageReader(self._cover_path)
-                reader.setAutoTransform(True)
-                size = reader.size()
-                is_svg = os.path.splitext(self._cover_path)[1].lower() in (".svg", ".svgz")
-                if size.isValid() and size.width() > 0 and size.height() > 0:
-                    longest = max(size.width(), size.height())
-                    # Vectors: rasterize UP to cover size for a crisp thumb (their
-                    # intrinsic size is often tiny). Rasters only scale down.
-                    if is_svg or longest > COVER_LONGEST:
-                        s = COVER_LONGEST / longest
-                        reader.setScaledSize(QSize(
-                            max(1, round(size.width() * s)),
-                            max(1, round(size.height() * s)),
-                        ))
-                img = reader.read()
-            if img is None or img.isNull():
-                return
+        try:
+            result = _list_folder(self._path)
+        except Exception:
+            result = ([], [], -1)
+        _cache_put(self._path, *result)
+        if self._signals is not None:
             try:
-                cf.parent.mkdir(parents=True, exist_ok=True)
-                img.save(str(cf), "JPEG", 82)
-            except OSError:
-                pass
-        self._signals.ready.emit(self._cover_path, QPixmap.fromImage(img))
+                self._signals.listed.emit(self._gen, self._path, result)
+            except RuntimeError:
+                pass   # view already destroyed
+
+
+class _PrefetchTask(QRunnable):
+    """List a folder into the scan cache (if not already there) and parse the
+    source's dimension index, so opening it later costs nothing."""
+    def __init__(self, paths: list[str], source: str):
+        super().__init__()
+        self._paths, self._source = paths, source
+        self.setAutoDelete(True)
+
+    def run(self):
+        lower_worker_priority()
+        try:
+            dim_cache.preload(self._source)
+        except Exception:
+            pass
+        for p in self._paths:
+            if _cache_get(p) is not None:
+                continue
+            try:
+                _cache_put(p, *_list_folder(p))
+            except Exception:
+                continue
+
+
+_LIST_POOL: QThreadPool | None = None
+
+
+def _list_pool() -> QThreadPool:
+    global _LIST_POOL
+    if _LIST_POOL is None:
+        _LIST_POOL = QThreadPool()
+        _LIST_POOL.setMaxThreadCount(2)
+    return _LIST_POOL
 
 
 # ── Background folder-stat streamer ────────────────────────────────────────────
@@ -366,7 +417,7 @@ class _FolderStatTask(QRunnable):
             if path is None:
                 break
             try:
-                count, cover = _album.folder_stat(path)
+                count, cover = _album.folder_stat(path, cancelled=lambda: work.cancelled)
             except Exception:
                 count, cover = 0, ""
             if work.cancelled:
@@ -404,6 +455,8 @@ class _BaseTile(QWidget):
         # Enter/Space opens — no mouse required.
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self._nav_cb = None    # browser sets this to handle arrow navigation
+        self._hover_cb = None  # browser sets this for hover-intent prefetch
+        self._scaled_cover: QPixmap | None = None
         self.setFixedSize(TILE_W, TILE_H)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
@@ -414,10 +467,13 @@ class _BaseTile(QWidget):
 
     def set_cover(self, pm: QPixmap):
         self._cover = pm
+        self._scaled_cover = None   # re-crop lazily at paint time, once
         self.update()
 
     def enterEvent(self, event):
         self._hover = True
+        if self._hover_cb is not None:
+            self._hover_cb(self)
         self.update()
 
     def leaveEvent(self, event):
@@ -480,7 +536,16 @@ class FolderTile(_BaseTile):
         p.fillRect(cover_rect, QColor(20, 20, 20))
 
         if self._cover and not self._cover.isNull():
-            _draw_cover_into(p, self._cover, cover_rect)
+            # Smooth-scaling the cover on every hover repaint was wasted work —
+            # crop/scale it once and reuse.
+            if self._scaled_cover is None:
+                self._scaled_cover = QPixmap(cover_rect.size())
+                self._scaled_cover.fill(QColor(20, 20, 20))
+                sp = QPainter(self._scaled_cover)
+                _draw_cover_into(sp, self._cover, QRect(0, 0, cover_rect.width(),
+                                                          cover_rect.height()))
+                sp.end()
+            p.drawPixmap(cover_rect.topLeft(), self._scaled_cover)
 
         # Folder badge — small ribbon top-left so user sees this is a folder
         badge_w, badge_h = 78, 22
@@ -532,8 +597,26 @@ class FolderTile(_BaseTile):
 
 class _ImageMosaic(QWidget):
     """Justified mosaic of images. Tiles keep their aspect ratio (no crop) and
-    pack tightly into rows — same algorithm as the gallery's `_GalleryCanvas`,
-    but driven by a list of `ImageItem` instead of an `ImageManager`."""
+    pack into centred rows, driven by a list of ``ImageItem``.
+
+    Built to stay instant at any folder size:
+
+    * Aspect ratios come from the persistent dimension cache in one batch lookup
+      that needs **no syscalls** (the listing already carried each file's stat),
+      so a folder seen before lays out correctly on the very first paint.
+      Unknown sizes are read in batches by the shared service and relaid out on
+      a short debounce instead of every N results.
+    * Thumbnails come from the process-wide RAM store; misses are requested from
+      the shared decode service with visible tiles at the highest priority, and
+      queued decodes for tiles that scrolled far away are cancelled.
+    * Painting, hover and hit-testing only touch the rows in view (binary search
+      over row tops) rather than scanning every tile.
+    * ``set_items`` swaps the item list in place (search filtering, live folder
+      changes) keeping aspects, selection and cursor by path — no rebuild.
+
+    ``sort_mode`` adapts the input model for the two-pane Sort view: a click
+    focuses instead of opening, Space/Enter are emitted for the view to act on,
+    and ``set_marked`` flags tiles (e.g. "already in the destination")."""
 
     clicked = pyqtSignal(int)            # image index in the list passed in
     removed = pyqtSignal(list)           # paths gone from this folder (move/delete)
@@ -541,8 +624,9 @@ class _ImageMosaic(QWidget):
     load_progress = pyqtSignal(int, int) # (headers_done, total) — drives the load bar
     reload_requested = pyqtSignal()      # folder needs a rescan (e.g. rotate wrote new files)
     selection_changed = pyqtSignal(int)  # number of selected tiles (drives the bulk bar)
-
-    HEADER_DISPATCH_CHUNK = 150          # headers queued per event-loop tick
+    space_pressed = pyqtSignal()         # sort mode: act on cursor/selection
+    enter_pressed = pyqtSignal()         # sort mode: preview cursor tile
+    cursor_changed = pyqtSignal(int)     # keyboard/mouse focus tile moved
 
     ROW_HEIGHT = 200
     ROW_HEIGHT_MIN = 90
@@ -550,19 +634,26 @@ class _ImageMosaic(QWidget):
     ZOOM_FACTOR = 1.12
     SPACING = 3
     HOVER_BORDER = 3
+    LOOKAHEAD = 900                      # px above/below the viewport to pre-decode
 
-    def __init__(self, items: list, source_folder: str, parent=None):
+    def __init__(self, items: list, source_folder: str, parent=None, *,
+                 sort_mode: bool = False):
         super().__init__(parent)
-        self._items = items
+        self._items: list = list(items)
         self._source = source_folder
-        self._aspects: dict[int, float] = {}
-        self._pixmaps: dict[int, QPixmap] = {}
-        # tile cache: list of (idx, QRect)
-        self._tiles: list[tuple[int, QRect]] = []
+        self._sort_mode = sort_mode
+        self._aspects: list[float] = []
+        self._exact: list[bool] = []
+        self._index_by_path: dict[str, int] = {}
+        # Layout: tiles are in index order, so _rects[idx] is that tile's rect.
+        self._rects: list[QRect] = []
+        self._row_tops: list[int] = []
+        self._row_starts: list[int] = []     # first item index of each row
         self._viewport_width = 0
         self._total_height = 0
         self._hover_idx = -1
         self._row_height = self.ROW_HEIGHT
+        self._marked: set[str] = set()       # lower-cased names flagged with a badge
 
         # Multi-selection (shift = range from anchor, ctrl = toggle).
         self._selected: set[int] = set()
@@ -570,26 +661,20 @@ class _ImageMosaic(QWidget):
         self._cursor: int = -1          # keyboard focus tile (arrow-key navigation)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
-        self._signals = _WorkerSignals()
-        self._signals.header_ready.connect(self._on_header_ready)
-        self._signals.thumb_ready.connect(self._on_thumb_ready)
+        self._store = thumb_store.store()
+        self._svc = thumb_store.service()
+        self._svc.thumb_ready.connect(self._on_thumb_ready)
+        self._svc.dims_ready.connect(self._on_dims_ready)
+        self._requested: set[str] = set()     # paths this view has queued
+        self._last_scan_rect = QRect()
+        self._dims_pending: set[str] = set()
+        self._headers_done = 0
+        self._stopped = False
 
-        cpu = os.cpu_count() or 4
-        self._pool = QThreadPool()
-        self._pool.setMaxThreadCount(max(2, cpu // 2))
-        # Dimension (header) reads get their OWN pool. Sharing one pool with the
-        # heavy thumbnail decodes meant the lightweight header pass — which the
-        # whole justified layout waits on — got stuck behind slow full-image
-        # decodes, so the layout (and the loading bar) crawled. Isolating them
-        # lets the grid settle fast while thumbnails fill in independently.
-        self._header_pool = QThreadPool()
-        # Half the cores: headers are fast reads, so this keeps the layout pass
-        # snappy without piling on threads that would compete with the UI and
-        # the folder-stat walkers during a folder open.
-        self._header_pool.setMaxThreadCount(max(2, cpu // 2))
-
-        self._pending_headers: set[int] = set()
-        self._pending_thumbs: set[int] = set()
+        self._relayout_timer = QTimer(self)
+        self._relayout_timer.setSingleShot(True)
+        self._relayout_timer.setInterval(60)
+        self._relayout_timer.timeout.connect(self._recompute_layout)
 
         self.setMouseTracking(True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -598,19 +683,63 @@ class _ImageMosaic(QWidget):
         pal.setColor(self.backgroundRole(), _qc("canvas_bg"))
         self.setPalette(pal)
 
-        # Header dimensions drive the justified layout. Dispatching all of them
-        # synchronously here blocks the main thread (~0.6 ms each → seconds on a
-        # 1700-photo folder), freezing the UI and the loading screen. Instead we
-        # seed default aspects so the mosaic paints immediately, then queue the
-        # header reads in chunks across event-loop ticks so the canvas shows and
-        # the progress bar animates while they stream in.
-        for idx in range(len(items)):
-            self._aspects[idx] = 1.5
-        self._headers_done = 0
-        self._header_dispatch_i = 0
-        self._stopped = False
-        from PyQt6.QtCore import QTimer
-        QTimer.singleShot(0, self._dispatch_headers_chunk)
+        self._resolve_aspects(range(len(self._items)))
+
+    # ── Aspect resolution ─────────────────────────────────────────────────────
+
+    def _reindex(self):
+        self._index_by_path = {it.path: i for i, it in enumerate(self._items)}
+
+    def _resolve_aspects(self, indices):
+        """Fill aspects for ``indices`` from the dimension cache in one batch;
+        queue header reads for the rest."""
+        self._reindex()
+        n = len(self._items)
+        if len(self._aspects) != n:
+            self._aspects = (self._aspects + [1.5] * n)[:n]
+            self._exact = (self._exact + [False] * n)[:n]
+        indices = list(indices)
+        with_sig = [i for i in indices if self._items[i].mtime is not None]
+        hits = dim_cache.get_many(
+            self._source,
+            [(self._items[i].path, self._items[i].mtime, self._items[i].size) for i in with_sig])
+        unknown: list[str] = [self._items[i].path for i in indices
+                              if self._items[i].mtime is None]
+        for i, dims in zip(with_sig, hits):
+            if dims is not None and dims[1] > 0:
+                self._aspects[i] = dims[0] / dims[1]
+                self._exact[i] = True
+            else:
+                unknown.append(self._items[i].path)
+        self._headers_done = n - len(unknown)
+        self._dims_pending = set(unknown)
+        if unknown:
+            self._svc.request_dims(self._source, unknown)
+        self.load_progress.emit(self._headers_done, n)
+
+    @pyqtSlot(str, object)
+    def _on_dims_ready(self, source: str, results):
+        if self._stopped or source != self._source or not self._dims_pending:
+            return
+        changed = False
+        for p, w, h, exact, _sig in results:
+            if p not in self._dims_pending:
+                continue
+            self._dims_pending.discard(p)
+            self._headers_done += 1
+            idx = self._index_by_path.get(p)
+            if idx is not None and h > 0:
+                self._aspects[idx] = w / h
+                self._exact[idx] = exact
+                changed = True
+        n = len(self._items)
+        self.load_progress.emit(min(self._headers_done, n), n)
+        if changed:
+            if self._dims_pending:
+                self._relayout_timer.start()      # coalesce bursts
+            else:
+                self._relayout_timer.stop()
+                self._recompute_layout()
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -619,152 +748,182 @@ class _ImageMosaic(QWidget):
             self._viewport_width = width
             self._recompute_layout()
 
-    def _dispatch_headers_chunk(self):
-        """Resolve the next batch of aspect ratios, then yield to the event loop.
-
-        Dimensions already in the persistent cache (a cheap stat + dict lookup)
-        are applied instantly and cost no thread work — a folder seen before lays
-        out correctly on the first paint with zero header decodes. Only genuinely
-        unknown images fall back to a threaded header read."""
-        if self._stopped:
-            return  # view was torn down — stop reading headers for a folder we left
-        n = len(self._items)
-        end = min(n, self._header_dispatch_i + self.HEADER_DISPATCH_CHUNK)
-        resolved_from_cache = 0
-        for idx in range(self._header_dispatch_i, end):
-            dims = dim_cache.get(self._source, self._items[idx].path)
-            if dims is not None:
-                w, h = dims
-                if h > 0:
-                    self._aspects[idx] = w / h
-                self._headers_done += 1
-                resolved_from_cache += 1
-                continue
-            self._pending_headers.add(idx)
-            self._header_pool.start(_HeaderTask(idx, self._items[idx].path, self._signals))
-        self._header_dispatch_i = end
-        if resolved_from_cache:
-            # Cache hits produced no worker callbacks — refresh the layout + bar
-            # ourselves so the corrected aspects show without waiting on threads.
-            self.load_progress.emit(self._headers_done, n)
+    def set_row_height(self, h: int):
+        h = max(self.ROW_HEIGHT_MIN, min(self.ROW_HEIGHT_MAX, int(h)))
+        if h != self._row_height:
+            self._row_height = h
             self._recompute_layout()
-        if end < n:
-            from PyQt6.QtCore import QTimer
-            QTimer.singleShot(0, self._dispatch_headers_chunk)
+
+    def row_height(self) -> int:
+        return self._row_height
+
+    def items(self) -> list:
+        return self._items
+
+    def cursor_item(self):
+        return self._items[self._cursor] if 0 <= self._cursor < len(self._items) else None
+
+    def set_marked(self, names: set[str]):
+        """Flag tiles whose lower-cased filename is in ``names`` (sort view)."""
+        if names != self._marked:
+            self._marked = set(names)
+            self.update()
+
+    def aspect_of(self, path: str) -> float | None:
+        idx = self._index_by_path.get(path)
+        return self._aspects[idx] if idx is not None and self._exact[idx] else None
+
+    def set_items(self, items: list, seed_aspects: dict | None = None) -> None:
+        """Replace the item list in place, keeping per-path state (aspects,
+        selection, cursor) so nothing re-decodes or jumps. ``seed_aspects``
+        pre-fills known aspect ratios for new paths (e.g. a just-copied file
+        takes its source's shape) so they need no header read."""
+        old_items = self._items
+        old_aspects = {it.path: (self._aspects[i], self._exact[i])
+                       for i, it in enumerate(old_items) if i < len(self._aspects)}
+        if seed_aspects:
+            for p, a in seed_aspects.items():
+                if a and p not in old_aspects:
+                    old_aspects[p] = (a, True)
+        sel_paths = {old_items[i].path for i in self._selected if i < len(old_items)}
+        cur_path = old_items[self._cursor].path if 0 <= self._cursor < len(old_items) else None
+        anchor_path = old_items[self._anchor].path if 0 <= self._anchor < len(old_items) else None
+
+        self._items = list(items)
+        n = len(self._items)
+        self._aspects = [1.5] * n
+        self._exact = [False] * n
+        unresolved = []
+        for i, it in enumerate(self._items):
+            prev = old_aspects.get(it.path)
+            if prev is not None and prev[1]:
+                self._aspects[i], self._exact[i] = prev
+            elif prev is not None:
+                self._aspects[i] = prev[0]
+                unresolved.append(i)
+            else:
+                unresolved.append(i)
+        self._reindex()
+        # Only look up / read headers for genuinely new or inexact tiles.
+        if unresolved:
+            self._resolve_aspects(unresolved)
+        else:
+            self._dims_pending = set()
+            self._headers_done = n
+            self.load_progress.emit(n, n)
+
+        new_sel = {self._index_by_path[p] for p in sel_paths if p in self._index_by_path}
+        self._anchor = self._index_by_path.get(anchor_path, -1) if anchor_path else -1
+        if cur_path is not None and cur_path in self._index_by_path:
+            self._cursor = self._index_by_path[cur_path]
+        elif self._cursor >= n:
+            self._cursor = n - 1
+        self._hover_idx = -1
+        if new_sel != self._selected:
+            self._selected = new_sel
+            self.selection_changed.emit(len(new_sel))
+        self._last_scan_rect = QRect()
+        self._recompute_layout()
 
     def cleanup(self):
-        self._stopped = True   # halt the chunked header dispatch loop
-        dim_cache.flush(self._source)   # save any sizes measured this visit
+        self._stopped = True
+        self._relayout_timer.stop()
+        for p in self._requested:
+            self._svc.cancel(p)
+        self._requested.clear()
         try:
-            self._header_pool.clear()
-            self._header_pool.waitForDone(200)
-        except Exception:
-            pass
-        try:
-            self._pool.clear()
-            self._pool.waitForDone(200)
-        except Exception:
+            self._svc.thumb_ready.disconnect(self._on_thumb_ready)
+            self._svc.dims_ready.disconnect(self._on_dims_ready)
+        except (TypeError, RuntimeError):
             pass
 
     def _remove_paths(self, paths) -> None:
         """Remove items by path (move/delete) and notify the parent — no rescan."""
-        pathset = {os.path.normcase(os.path.abspath(p)) for p in paths}
-        indices = [i for i, it in enumerate(self._items)
-                   if os.path.normcase(os.path.abspath(it.path)) in pathset]
+        pathset = {_npath(p) for p in paths}
+        indices = [i for i, it in enumerate(self._items) if _npath(it.path) in pathset]
         if not indices:
             return
         self.remove_indices(indices)
         self.removed.emit(list(paths))
 
     def remove_indices(self, indices) -> None:
-        """Drop the given item indices in place and relayout. Aspects/pixmaps
-        already computed for surviving items are remapped to their new indices
-        so nothing re-decodes; pending tasks for old indices are dropped (their
-        callbacks no-op via the pending-set guard)."""
+        """Drop the given item indices in place and relayout."""
         drop = {i for i in indices if 0 <= i < len(self._items)}
         if not drop:
             return
-        keep = [i for i in range(len(self._items)) if i not in drop]
-        self._items = [self._items[i] for i in keep]
-        new_aspects: dict[int, float] = {}
-        new_pixmaps: dict[int, QPixmap] = {}
-        for new_idx, old_idx in enumerate(keep):
-            if old_idx in self._aspects:
-                new_aspects[new_idx] = self._aspects[old_idx]
-            if old_idx in self._pixmaps:
-                new_pixmaps[new_idx] = self._pixmaps[old_idx]
-        self._aspects = new_aspects
-        self._pixmaps = new_pixmaps
-        # Outstanding header/thumb tasks reference old indices — let their
-        # callbacks no-op rather than write into a remapped slot. Stop any
-        # remaining chunked header dispatch (the surviving items already have
-        # their aspects).
-        self._pending_headers.clear()
-        self._pending_thumbs.clear()
-        self._header_dispatch_i = len(self._items)
-        self._headers_done = len(self._items)
-        self._selected = set()
-        self.selection_changed.emit(0)
+        for i in drop:
+            self._store.invalidate(self._items[i].path)
+        self.set_items([it for i, it in enumerate(self._items) if i not in drop])
+        if self._selected:
+            self._selected = set()
+            self.selection_changed.emit(0)
         self._anchor = -1
-        self._cursor = -1
-        self._hover_idx = -1
-        self._recompute_layout()
-        self.update()
 
     # ── Layout ────────────────────────────────────────────────────────────────
 
     def _recompute_layout(self):
         """Free-flow mosaic, **centred**: every tile keeps its native aspect at
         the current row height, packs left-to-right, wraps when the next tile
-        won't fit. After bucketing tiles into rows the layout offsets each row
-        by `(viewport_width - row_width) / 2` so the gap is split evenly on
-        both sides instead of pooling on the right.
-
-        Row height is interactive — Ctrl+wheel adjusts `self._row_height`
-        within ROW_HEIGHT_MIN..ROW_HEIGHT_MAX and re-runs this layout."""
+        won't fit, and each row is offset by half its slack."""
         width = self._viewport_width
-        if width <= 0 or not self._items:
+        n = len(self._items)
+        if width <= 0:
             return
         target_h = self._row_height
         spacing = self.SPACING
-
-        # Phase 1 — bucket into rows with their natural total widths.
-        rows: list[list[tuple[int, int]]] = [[]]
-        row_w: list[int] = [0]
-        for idx in range(len(self._items)):
-            asp = self._aspects.get(idx, 1.5)
-            if asp <= 0:                # bad header / corrupt file
-                asp = 1.5
-            tw = max(1, min(int(round(asp * target_h)), width))
-            cur_w = row_w[-1]
-            sep = spacing if rows[-1] else 0
-            if rows[-1] and cur_w + sep + tw > width:
-                rows.append([])
-                row_w.append(0)
-                sep = 0
-            rows[-1].append((idx, tw))
-            row_w[-1] += sep + tw
-
-        # Phase 2 — centre each row horizontally.
-        tiles: list[tuple[int, QRect]] = []
+        rects: list[QRect] = [QRect()] * n
+        row_tops: list[int] = []
+        row_starts: list[int] = []
         y = 0
-        for row, rw in zip(rows, row_w):
-            if not row:
-                continue
-            x = max(0, (width - rw) // 2)
-            for idx, tw in row:
-                tiles.append((idx, QRect(x, y, tw, target_h)))
+        i = 0
+        aspects = self._aspects
+        while i < n:
+            start = i
+            row_w = 0
+            widths = []
+            while i < n:
+                asp = aspects[i] if aspects[i] > 0 else 1.5
+                tw = max(1, min(int(round(asp * target_h)), width))
+                sep = spacing if widths else 0
+                if widths and row_w + sep + tw > width:
+                    break
+                widths.append(tw)
+                row_w += sep + tw
+                i += 1
+            x = max(0, (width - row_w) // 2)
+            for k, tw in enumerate(widths):
+                rects[start + k] = QRect(x, y, tw, target_h)
                 x += tw + spacing
+            row_tops.append(y)
+            row_starts.append(start)
             y += target_h + spacing
-        # The trailing increment overshoots by one `spacing` if any row drew.
-        if tiles:
+        if n:
             y -= spacing
-
-        self._tiles = tiles
+        self._rects = rects
+        self._row_tops = row_tops
+        self._row_starts = row_starts
         self._total_height = max(int(y), target_h)
+        self._last_scan_rect = QRect()
         self.setMinimumHeight(self._total_height)
         self.setFixedHeight(self._total_height)
         self.update()
+
+    def _row_of(self, idx: int) -> int:
+        return max(0, bisect.bisect_right(self._row_starts, idx) - 1)
+
+    def _index_range(self, top: int, bottom: int) -> range:
+        """Item indices whose rows intersect [top, bottom]."""
+        if not self._row_tops:
+            return range(0)
+        # Row r spans [top_r, top_r + h - 1]; it intersects when top_r > top - h
+        # and top_r <= bottom. Row tops are sorted, so both ends are a bisect.
+        r0 = bisect.bisect_right(self._row_tops, top - self._row_height)
+        r1 = bisect.bisect_right(self._row_tops, bottom)
+        if r0 >= r1:
+            return range(0)
+        start = self._row_starts[r0]
+        end = self._row_starts[r1] if r1 < len(self._row_starts) else len(self._items)
+        return range(start, end)
 
     # ── Zoom (Ctrl + scroll) ─────────────────────────────────────────────────
 
@@ -779,84 +938,63 @@ class _ImageMosaic(QWidget):
             event.ignore()
             return
         factor = self.ZOOM_FACTOR if delta > 0 else (1.0 / self.ZOOM_FACTOR)
-        new_h = int(round(self._row_height * factor))
-        new_h = max(self.ROW_HEIGHT_MIN, min(self.ROW_HEIGHT_MAX, new_h))
-        if new_h != self._row_height:
-            self._row_height = new_h
-            self._recompute_layout()
+        self.set_row_height(int(round(self._row_height * factor)))
         event.accept()
 
-    # ── Worker callbacks ─────────────────────────────────────────────────────
+    # ── Thumbnails ────────────────────────────────────────────────────────────
 
-    @pyqtSlot(int, int, int, bool)
-    def _on_header_ready(self, idx: int, w: int, h: int, exact: bool = True):
-        # Stale callback from a task whose index was removed/remapped — ignore.
-        if idx not in self._pending_headers:
+    @pyqtSlot(str)
+    def _on_thumb_ready(self, path: str):
+        if self._stopped:
             return
-        self._pending_headers.discard(idx)
-        self._headers_done += 1
+        idx = self._index_by_path.get(path)
+        if idx is None:
+            return
+        self._requested.discard(path)
+        pm = self._store.get(path)
+        if pm is None or idx >= len(self._rects):
+            return
+        h = pm.height()
         if h > 0:
-            self._aspects[idx] = w / h
-            # Only persist real header dims, never the video/HEIC placeholders.
-            if exact:
-                dim_cache.put(self._source, self._items[idx].path, w, h)
-        # Drive the load bar (coarsely, plus a final exact tick).
-        total = len(self._items)
-        if self._headers_done >= total or self._headers_done % 25 == 0:
-            self.load_progress.emit(self._headers_done, total)
-        # Relayout while headers are still arriving (every 50) and once at the end.
-        if not self._pending_headers or len(self._pending_headers) % 50 == 0:
-            self._recompute_layout()
-        if not self._pending_headers and self._header_dispatch_i >= total:
-            dim_cache.flush(self._source)   # persist the freshly-measured sizes
+            actual = pm.width() / h
+            cached = self._aspects[idx]
+            # The decoded thumb is authoritative (EXIF rotation, RAW quirks):
+            # correct the tile and persist it so the next open is right.
+            if cached <= 0 or abs(actual - cached) / max(cached, 0.01) > 0.05:
+                self._aspects[idx] = actual
+                self._exact[idx] = True
+                item = self._items[idx]
+                if item.sig is not None:
+                    dim_cache.put_sig(self._source, item.path, pm.width(), h, item.sig)
+                    self._svc.note_dims(self._source)
+                self._relayout_timer.start()
+                return
+        self.update(self._rects[idx])
 
-    @pyqtSlot(int, QPixmap, int, int)
-    def _on_thumb_ready(self, idx: int, pm: QPixmap, w: int, h: int):
-        # Stale callback from a task whose index was removed/remapped — ignore.
-        if idx not in self._pending_thumbs:
+    def _schedule_visible(self):
+        """Request thumbs for the viewport (high priority) + look-ahead (lower),
+        and cancel queued decodes that fell out of range. Runs only when the
+        visible rect actually changed."""
+        vis = self.visibleRegion().boundingRect()
+        if vis.isEmpty() or vis == self._last_scan_rect:
             return
-        self._pending_thumbs.discard(idx)
-        self._pixmaps[idx] = pm
-        needs_relayout = False
-        if h > 0:
-            actual_aspect = w / h
-            cached = self._aspects.get(idx, 0)
-            # If the header lied (EXIF rotation, RAW handler quirks, etc.)
-            # the cached aspect can be wildly off — relayout this tile and
-            # neighbours so the pixmap fills its natural rect instead of
-            # being stretched into a placeholder one.
-            if cached <= 0 or abs(actual_aspect - cached) / max(cached, 0.01) > 0.05:
-                self._aspects[idx] = actual_aspect
-                needs_relayout = True
-                # The decoded thumb is authoritative on aspect (it accounts for
-                # EXIF rotation the header read missed) — persist the correction
-                # so the next open lays this tile out right without a reshuffle.
-                dim_cache.put(self._source, self._items[idx].path, w, h)
-        if needs_relayout:
-            self._schedule_relayout()
-            return
-        for tile_idx, rect in self._tiles:
-            if tile_idx == idx:
-                self.update(rect)
-                break
-
-    def _schedule_relayout(self):
-        """Debounce relayouts to coalesce bursts of corrected aspects."""
-        if getattr(self, "_relayout_timer", None) is None:
-            from PyQt6.QtCore import QTimer
-            self._relayout_timer = QTimer(self)
-            self._relayout_timer.setSingleShot(True)
-            self._relayout_timer.setInterval(80)
-            self._relayout_timer.timeout.connect(self._recompute_layout)
-        self._relayout_timer.start()
-
-    def _ensure_thumb(self, idx: int):
-        if idx in self._pixmaps or idx in self._pending_thumbs:
-            return
-        item = self._items[idx]
-        cf = thumb_cache_file(self._source, item.path)
-        self._pending_thumbs.add(idx)
-        self._pool.start(_ThumbTask(idx, item.path, cf, self._signals))
+        self._last_scan_rect = vis
+        wanted: set[str] = set()
+        store, svc = self._store, self._svc
+        items, rects = self._items, self._rects
+        la = self.LOOKAHEAD
+        for idx in self._index_range(vis.top() - la, vis.bottom() + la):
+            it = items[idx]
+            wanted.add(it.path)
+            if store.contains(it.path):
+                continue
+            pri = svc.PRI_VISIBLE if rects[idx].intersects(vis) else svc.PRI_NEAR
+            if svc.request(it.path, self._source, pri, it.sig):
+                self._requested.add(it.path)
+        stale = self._requested - wanted
+        for p in stale:
+            svc.cancel(p)
+        self._requested &= wanted
 
     # ── Painting ──────────────────────────────────────────────────────────────
 
@@ -865,28 +1003,31 @@ class _ImageMosaic(QWidget):
         p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         visible = event.rect()
         p.fillRect(visible, _qc("canvas_bg"))
-
-        # Schedule loads for visible + small lookahead so scrolling stays smooth.
-        margin = 600
-        margin_rect = visible.adjusted(0, -margin, 0, margin)
+        if not self._rects:
+            p.end()
+            return
+        self._schedule_visible()
 
         from .media import is_video
-        for idx, rect in self._tiles:
+        placeholder = _qc("tile_placeholder")
+        store = self._store
+        for idx in self._index_range(visible.top(), visible.bottom()):
+            rect = self._rects[idx]
             if not rect.intersects(visible):
-                if rect.intersects(margin_rect):
-                    self._ensure_thumb(idx)
                 continue
-            self._ensure_thumb(idx)
-            pm = self._pixmaps.get(idx)
-            if pm and not pm.isNull():
+            item = self._items[idx]
+            pm = store.get(item.path)
+            if pm is not None:
                 p.drawPixmap(rect, pm)
             else:
-                # Skeleton placeholder at the tile's real aspect (set from the
-                # header read), so nothing jumps when the thumbnail lands.
-                p.fillRect(rect, _qc("tile_placeholder"))
+                # Skeleton at the tile's real aspect, so nothing jumps on arrival.
+                p.fillRect(rect, placeholder)
 
-            if is_video(self._items[idx].path):
+            if is_video(item.path):
                 _draw_play_badge(p, rect)
+
+            if self._marked and item.name.lower() in self._marked:
+                self._draw_marked_badge(p, rect)
 
             selected = idx in self._selected
             if selected:
@@ -902,13 +1043,33 @@ class _ImageMosaic(QWidget):
                 inset = self.HOVER_BORDER // 2
                 p.drawRect(rect.adjusted(inset, inset, -inset, -inset))
 
-            # Keyboard focus ring — white dashed, drawn over any state above.
+            # Keyboard focus ring — drawn over any state above.
             if idx == self._cursor:
-                pen = QPen(QColor(255, 255, 255), 2, Qt.PenStyle.DashLine)
-                p.setBrush(Qt.BrushStyle.NoBrush)
-                p.setPen(pen)
-                p.drawRect(rect.adjusted(2, 2, -2, -2))
+                if self._sort_mode:
+                    p.setBrush(Qt.BrushStyle.NoBrush)
+                    p.setPen(QPen(_qc("accent"), 4))
+                    p.drawRect(rect.adjusted(2, 2, -2, -2))
+                else:
+                    pen = QPen(QColor(255, 255, 255), 2, Qt.PenStyle.DashLine)
+                    p.setBrush(Qt.BrushStyle.NoBrush)
+                    p.setPen(pen)
+                    p.drawRect(rect.adjusted(2, 2, -2, -2))
         p.end()
+
+    @staticmethod
+    def _draw_marked_badge(p: QPainter, rect: QRect) -> None:
+        """Green tick pill, top-right: this photo already exists in the destination."""
+        r = 10
+        cx = rect.right() - r - 6
+        cy = rect.top() + r + 6
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(34, 197, 94, 235))
+        p.drawEllipse(QPointF(float(cx), float(cy)), r, r)
+        pen = QPen(QColor(255, 255, 255), 2.0)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        p.setPen(pen)
+        p.drawPolyline(QPolygonF([QPointF(cx - 4.5, cy), QPointF(cx - 1, cy + 3.5),
+                                  QPointF(cx + 4.5, cy - 3.5)]))
 
     @staticmethod
     def _draw_check_badge(p: QPainter, rect: QRect) -> None:
@@ -931,37 +1092,37 @@ class _ImageMosaic(QWidget):
 
     # ── Hover + click ────────────────────────────────────────────────────────
 
+    def _update_idx(self, idx: int):
+        if 0 <= idx < len(self._rects):
+            self.update(self._rects[idx])
+
     def mouseMoveEvent(self, event):
         pos = event.position().toPoint()
-        new_hover = -1
-        for idx, rect in self._tiles:
-            if rect.contains(pos):
-                new_hover = idx
-                if idx < len(self._items):
-                    item = self._items[idx]
-                    self.setToolTip(os.path.basename(item.path))
-                break
-        else:
-            self.setToolTip("")
+        new_hover = self._idx_at(pos)
         if new_hover != self._hover_idx:
             old = self._hover_idx
             self._hover_idx = new_hover
-            for tile_idx, rect in self._tiles:
-                if tile_idx == old or tile_idx == new_hover:
-                    self.update(rect)
+            self.setToolTip(os.path.basename(self._items[new_hover].path)
+                            if new_hover >= 0 else "")
+            self._update_idx(old)
+            self._update_idx(new_hover)
 
     def leaveEvent(self, event):
         if self._hover_idx >= 0:
             old = self._hover_idx
             self._hover_idx = -1
-            for tile_idx, rect in self._tiles:
-                if tile_idx == old:
-                    self.update(rect)
-                    break
+            self._update_idx(old)
 
     def _idx_at(self, pos) -> int:
-        for idx, rect in self._tiles:
-            if rect.contains(pos):
+        if not self._row_tops:
+            return -1
+        r = bisect.bisect_right(self._row_tops, pos.y()) - 1
+        if r < 0:
+            return -1
+        start = self._row_starts[r]
+        end = self._row_starts[r + 1] if r + 1 < len(self._row_starts) else len(self._items)
+        for idx in range(start, end):
+            if self._rects[idx].contains(pos):
                 return idx
         return -1
 
@@ -971,6 +1132,22 @@ class _ImageMosaic(QWidget):
             self._selected = new
             self.selection_changed.emit(len(self._selected))
             self.update()
+
+    def set_cursor(self, idx: int, *, reveal: bool = True):
+        n = len(self._items)
+        if n == 0:
+            self._cursor = -1
+            return
+        idx = max(0, min(n - 1, idx))
+        old = self._cursor
+        self._cursor = idx
+        self._update_idx(old)
+        self._update_idx(idx)
+        if reveal and idx < len(self._rects):
+            r = self._rects[idx]
+            self.scroll_to.emit(r.center().x(), r.center().y())
+        if old != idx:
+            self.cursor_changed.emit(idx)
 
     def mousePressEvent(self, event):
         pos = event.position().toPoint()
@@ -998,8 +1175,8 @@ class _ImageMosaic(QWidget):
                 self._anchor = -1
             return
 
-        self._cursor = idx
         if shift:
+            self.set_cursor(idx, reveal=False)
             if self._anchor < 0:
                 self._anchor = idx
             lo, hi = sorted((self._anchor, idx))
@@ -1008,15 +1185,36 @@ class _ImageMosaic(QWidget):
                 sel |= self._selected
             self._set_selection(sel)
         elif ctrl:
+            self.set_cursor(idx, reveal=False)
             sel = set(self._selected)
             sel.symmetric_difference_update({idx})
             self._set_selection(sel)
             self._anchor = idx
+        elif self._sort_mode:
+            # Sort view: a click just focuses the tile (Space acts on it).
+            self._set_selection(set())
+            self._anchor = idx
+            self.set_cursor(idx, reveal=False)
         else:
-            # Plain click — preserve original behaviour: open the slideshow.
+            # Plain click — open the slideshow.
+            self._cursor = idx
             self._set_selection(set())
             self._anchor = idx
             self.clicked.emit(idx)
+
+    def mouseDoubleClickEvent(self, event):
+        if self._sort_mode and event.button() == Qt.MouseButton.LeftButton:
+            idx = self._idx_at(event.position().toPoint())
+            if idx >= 0:
+                self.set_cursor(idx, reveal=False)
+                self.enter_pressed.emit()
+            return
+        super().mouseDoubleClickEvent(event)
+
+    def focusInEvent(self, event):
+        super().focusInEvent(event)
+        if self._sort_mode and self._cursor < 0 and self._items:
+            self.set_cursor(0, reveal=False)
 
     def keyPressEvent(self, event):
         key = event.key()
@@ -1042,9 +1240,21 @@ class _ImageMosaic(QWidget):
         if key in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace) and self._selected:
             self._delete_paths(sorted(self._selected))
             return
+        if key in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace) and self._sort_mode \
+                and 0 <= self._cursor < n:
+            self._delete_paths([self._cursor])
+            return
 
         if n == 0:
-            super().keyPressEvent(event)
+            event.ignore() if self._sort_mode else super().keyPressEvent(event)
+            return
+
+        if self._sort_mode and key in (Qt.Key.Key_Plus, Qt.Key.Key_Equal, Qt.Key.Key_Minus):
+            f = self.ZOOM_FACTOR if key != Qt.Key.Key_Minus else 1 / self.ZOOM_FACTOR
+            self.set_row_height(int(round(self._row_height * f)))
+            if 0 <= self._cursor < len(self._rects):
+                r = self._rects[self._cursor]
+                self.scroll_to.emit(r.center().x(), r.center().y())
             return
 
         # ── Arrow / Home / End navigation with selection ───────────────────────
@@ -1063,12 +1273,21 @@ class _ImageMosaic(QWidget):
             target = 0
         elif key == Qt.Key.Key_End:
             target = n - 1
+        elif key == Qt.Key.Key_PageDown:
+            target = self._page_idx(cur, down=True)
+        elif key == Qt.Key.Key_PageUp:
+            target = self._page_idx(cur, down=False)
 
         if target is not None:
             self._move_cursor(target, shift=shift, ctrl=ctrl)
             return
 
         if key == Qt.Key.Key_Space:
+            if self._sort_mode:
+                if self._cursor < 0:
+                    self.set_cursor(0)
+                self.space_pressed.emit()
+                return
             # Toggle the focused tile in/out of the selection.
             if self._cursor < 0:
                 self._cursor = 0
@@ -1078,31 +1297,41 @@ class _ImageMosaic(QWidget):
             self._anchor = self._cursor
             return
         if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            if self._sort_mode:
+                if self._cursor >= 0:
+                    self.enter_pressed.emit()
+                return
             if self._cursor >= 0:
                 self.clicked.emit(self._cursor)
             return
 
+        if self._sort_mode:
+            event.ignore()      # let the sort view see Tab / Ctrl+Z / etc.
+            return
         super().keyPressEvent(event)
 
     def _vertical_idx(self, cur_idx: int, *, down: bool) -> int:
-        """Nearest tile one row up/down from `cur_idx`, matched by x-centre.
-        Rows share a y (uniform row height) so this lands in the adjacent row."""
-        rects = dict(self._tiles)
-        cur = rects.get(cur_idx)
-        if cur is None:
+        """Nearest tile one row up/down from `cur_idx`, matched by x-centre."""
+        if not (0 <= cur_idx < len(self._rects)) or not self._row_starts:
             return cur_idx
-        cx, cy = cur.center().x(), cur.center().y()
-        best, best_key = cur_idx, None
-        for i, r in self._tiles:
-            rcy = r.center().y()
-            if down and rcy <= cy:
-                continue
-            if not down and rcy >= cy:
-                continue
-            key = (abs(rcy - cy), abs(r.center().x() - cx))
-            if best_key is None or key < best_key:
-                best_key, best = key, i
-        return best
+        r = self._row_of(cur_idx) + (1 if down else -1)
+        if r < 0 or r >= len(self._row_starts):
+            return cur_idx
+        cx = self._rects[cur_idx].center().x()
+        start = self._row_starts[r]
+        end = self._row_starts[r + 1] if r + 1 < len(self._row_starts) else len(self._items)
+        return min(range(start, end), key=lambda i: abs(self._rects[i].center().x() - cx))
+
+    def _page_idx(self, cur_idx: int, *, down: bool) -> int:
+        rows = max(1, (self.visibleRegion().boundingRect().height() or 600)
+                   // (self._row_height + self.SPACING))
+        idx = cur_idx
+        for _ in range(rows):
+            nxt = self._vertical_idx(idx, down=down)
+            if nxt == idx:
+                break
+            idx = nxt
+        return idx
 
     def _move_cursor(self, target: int, *, shift: bool, ctrl: bool) -> None:
         target = max(0, min(len(self._items) - 1, target))
@@ -1113,15 +1342,13 @@ class _ImageMosaic(QWidget):
             self._set_selection(set(range(lo, hi + 1)))
         elif ctrl:
             pass  # move focus only; selection unchanged
+        elif self._sort_mode:
+            self._set_selection(set())    # cursor-driven: Space acts on the focus tile
+            self._anchor = target
         else:
             self._set_selection({target})
             self._anchor = target
-        self._cursor = target
-        self.update()
-        for i, r in self._tiles:
-            if i == target:
-                self.scroll_to.emit(r.center().x(), r.center().y())
-                break
+        self.set_cursor(target)
 
     # ── Context menu ───────────────────────────────────────────────────────────
 
@@ -1169,8 +1396,13 @@ class _ImageMosaic(QWidget):
 
         from . import external
 
-        act_open = menu.addAction(menu_icon("slideshow"), "Open in Slideshow")
-        act_open.triggered.connect(lambda: self.clicked.emit(targets[0]))
+        if self._sort_mode:
+            act_prev = menu.addAction(menu_icon("zoom"), "Preview  (Enter)")
+            act_prev.triggered.connect(lambda: (self.set_cursor(targets[0], reveal=False),
+                                                self.enter_pressed.emit()))
+        else:
+            act_open = menu.addAction(menu_icon("slideshow"), "Open in Slideshow")
+            act_open.triggered.connect(lambda: self.clicked.emit(targets[0]))
         menu.addSeparator()
 
         open_menu = menu.addMenu(menu_icon("photoshop"), "Open With" + (f" ({n})" if multi else ""))
@@ -1239,7 +1471,8 @@ class _ImageMosaic(QWidget):
         act_copy.triggered.connect(
             lambda: QApplication.clipboard().setText("\n".join(paths)))
 
-        act_reveal = menu.addAction(menu_icon("reveal"), "Reveal in Explorer")
+        from . import external as _ext
+        act_reveal = menu.addAction(menu_icon("reveal"), _ext.reveal_label())
         act_reveal.triggered.connect(lambda: self._reveal(paths[0]))
 
         menu.addSeparator()
@@ -1308,19 +1541,24 @@ class _ImageMosaic(QWidget):
 
     def _refresh_thumb_for_path(self, path):
         """Re-decode a single tile's thumbnail after its file changed on disk."""
-        norm = os.path.normcase(os.path.abspath(path))
+        norm = _npath(path)
         for idx, it in enumerate(self._items):
-            if os.path.normcase(os.path.abspath(it.path)) != norm:
+            if _npath(it.path) != norm:
                 continue
-            cf = thumb_cache_file(self._source, it.path)
+            # The disk cache keys on mtime+size, so the rewritten file misses it
+            # automatically; only the RAM copy (keyed by path) must be dropped.
+            self._store.invalidate(it.path)
+            # The listing's stat is stale now — refresh it so the new thumb and
+            # dims validate against the rewritten file.
             try:
-                if cf and os.path.isfile(cf):
-                    os.remove(cf)
+                st = os.stat(it.path)
+                self._items[idx] = ImageItem(path=it.path, name=it.name,
+                                             mtime=st.st_mtime, size=st.st_size)
             except OSError:
                 pass
-            self._pixmaps.pop(idx, None)
-            self._pending_thumbs.discard(idx)
-            self._ensure_thumb(idx)
+            self._exact[idx] = False
+            self._resolve_aspects([idx])
+            self._last_scan_rect = QRect()
             self.update()
             return
 
@@ -1416,20 +1654,19 @@ class _ImageMosaic(QWidget):
             self._remove_paths(deleted)
 
     def _reveal(self, path: str):
-        import subprocess
-        try:
-            subprocess.Popen(["explorer", "/select,", os.path.normpath(path)])
-        except Exception:
-            pass
+        from . import external
+        external.reveal_in_file_manager(path)
 
 
 # ── Browser view ───────────────────────────────────────────────────────────────
 
 class AlbumBrowserView(QWidget):
-    """Folder-tree browser. ``open_image`` carries (folder_path, idx) of the
-    image clicked in the current folder's image list."""
+    """Folder-tree browser. ``open_image`` carries (folder_path, file_path) of
+    the image clicked — by path, so filtered views and library-wide search
+    results open exactly the photo that was clicked."""
 
-    open_image = pyqtSignal(str, int)
+    open_image = pyqtSignal(str, str)
+    sort_requested = pyqtSignal(str)   # two-pane Sort with this folder as source
     back_requested = pyqtSignal()
     progress = pyqtSignal(str)  # internal: scanner emits current path
 
@@ -1446,11 +1683,33 @@ class AlbumBrowserView(QWidget):
         self._tile_by_cover: dict[str, QWidget] = {}
         self._folder_tile_by_path: dict[str, "FolderTile"] = {}
         self._focus_pending = False   # focus first tile after a navigation render
+        self._images_header: QLabel | None = None
 
-        self._signals = _CoverSignals()
-        self._signals.ready.connect(self._on_cover_ready)
-        self._pool = QThreadPool()
-        self._pool.setMaxThreadCount(max(2, (os.cpu_count() or 4) // 2))
+        # Covers come from the shared thumbnail service + RAM store.
+        self._svc = thumb_store.service()
+        self._svc.thumb_ready.connect(self._on_cover_ready)
+
+        # Async folder listing (never blocks the UI thread) + generation token.
+        self._list_signals = _ListSignals()
+        self._list_signals.listed.connect(self._on_listed)
+        self._list_gen = 0
+        self._list_wait_timer = QTimer(self)
+        self._list_wait_timer.setSingleShot(True)
+        self._list_wait_timer.setInterval(150)
+        self._list_wait_timer.timeout.connect(self._show_listing_strip)
+
+        # Hover-intent prefetch: resting on a folder tile warms its listing and
+        # its first screen of thumbnails before the click.
+        self._hover_timer = QTimer(self)
+        self._hover_timer.setSingleShot(True)
+        self._hover_timer.setInterval(120)
+        self._hover_timer.timeout.connect(self._prefetch_hovered)
+        self._hovered_folder: str | None = None
+
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(70)
+        self._search_timer.timeout.connect(self._apply_search_filter)
 
         # Lazy folder-stat streaming (deep counts/covers filled in after the
         # instant first paint). Its own single-thread pool so the sequential
@@ -1468,13 +1727,6 @@ class AlbumBrowserView(QWidget):
         self._stat_gen = 0
         self._stat_work: "_FolderStatWork | None" = None
 
-        self._cover_cache: "OrderedDict[str, QPixmap]" = OrderedDict()
-        self._cover_cache_max = 400
-
-        # Module-level cache (see top of file) so navigating back to a folder
-        # stays instant even after the slideshow tore down this view.
-        self._scan_cache = _SCAN_CACHE
-        self._scan_cache_max = _SCAN_CACHE_MAX
         self._was_cached = False  # for the "cached" status pill
 
         self._mosaic: _ImageMosaic | None = None
@@ -1599,6 +1851,20 @@ class AlbumBrowserView(QWidget):
         self._rescan_btn.clicked.connect(self._force_rescan)
         top_lay.addWidget(self._rescan_btn)
 
+        self._sort_btn = QPushButton("⇄ Sort")
+        self._sort_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._sort_btn.setToolTip(
+            "Two-pane Sort: this folder on the left, a destination folder on the\n"
+            "right — press Space to copy the focused photo across.")
+        self._sort_btn.setStyleSheet(
+            "QPushButton { background: #1d3a6e; color: #eaf1ff;"
+            " border: 1px solid #2f5fb3; border-radius: 6px;"
+            " padding: 6px 12px; font-size: 12px; font-weight: 600; }"
+            "QPushButton:hover { background: #24488a; border-color: #3b82f6; }"
+        )
+        self._sort_btn.clicked.connect(lambda: self.sort_requested.emit(self.current_path))
+        top_lay.addWidget(self._sort_btn)
+
         outer.addWidget(top)
 
         # Inline scan-progress strip (visible only while scanning)
@@ -1688,60 +1954,137 @@ class AlbumBrowserView(QWidget):
     def _scan_and_render(self, force: bool = False):
         path = self.current_path
         self._update_breadcrumb()
-        # Abandon any stat stream still running for the folder we're leaving.
+        # Abandon any stat stream / listing still running for the folder we're leaving.
         self._cancel_folder_stats()
+        self._list_gen += 1
+        self._list_wait_timer.stop()
 
-        # Cache hit — skip the disk walk entirely.
-        if not force and path in self._scan_cache:
-            self._folders, self._items = self._scan_cache[path]
-            self._scan_cache.move_to_end(path)
-            self._was_cached = True
-            self._scan_strip.hide()
+        hit = None if force else _cache_get(path)
+        if hit is not None:
+            folders, items, mtime = hit
             with log.timed("album.render", path=path, cached=True,
-                           folders=len(self._folders), images=len(self._items)):
-                self._render_grid()
-            self._update_count()
-            log.info("album.open", path=path, cached=True,
-                     folders=len(self._folders), images=len(self._items))
+                           folders=len(folders), images=len(items)):
+                self._apply_listing(path, folders, items, mtime, cached=True)
+            # Stale-while-revalidate: one stat tells us whether anything was
+            # added/removed/renamed since; if so, relist in the background and
+            # patch the grid in place.
+            if _dir_mtime(path) != mtime:
+                _list_pool().start(_ListTask(self._list_gen, path, self._list_signals), 10)
             return
 
-        # Fast scan: a single scandir lists subfolders (with placeholder counts)
-        # and the folder's own images. This is instant even on huge trees — the
-        # per-subfolder recursive walk that used to freeze the UI now runs in the
-        # background (see _start_folder_stats), streaming real counts + covers in.
-        with log.timed("album.scan", path=path, lazy=True):
-            self._folders, self._items = scan_path(path, deep=False)
-        self._was_cached = False
-        self._scan_strip.hide()
+        if force:
+            invalidate_scan_cache(path)
+        # Miss: list on a worker so a slow / network drive never freezes the
+        # window. The previous grid stays up for a fast listing (no blank flash);
+        # a slow one clears it and shows an "Opening…" strip after 150 ms.
+        self._list_wait_timer.start()
+        _list_pool().start(_ListTask(self._list_gen, path, self._list_signals), 10)
+
+    def _show_listing_strip(self):
+        self._scan_label.setText(f"Opening  {os.path.basename(self.current_path) or self.current_path}…")
+        self._scan_bar.setRange(0, 0)
+        self._scan_bar.show()
+        self._scan_strip.show()
+
+    @pyqtSlot(int, str, object)
+    def _on_listed(self, gen: int, path: str, result):
+        if gen != self._list_gen or path != self.current_path:
+            return
+        self._list_wait_timer.stop()
+        folders, items, mtime = result
+        if getattr(self, "_rendered_path", None) == path:
+            # Revalidation of a grid rendered from cache.
+            def shown(fs):   # folder paths not already known to be empty
+                out = []
+                for f in fs:
+                    st = album_mod.cached_folder_stat(f.path)
+                    if st is None or st[0] > 0:
+                        out.append(f.path)
+                return out
+            old_sig = [(it.path, it.mtime, it.size) for it in self._items]
+            new_sig = [(it.path, it.mtime, it.size) for it in items]
+            same_folders = shown(self._folders) == shown(folders)
+            self._listing_mtime = mtime
+            if old_sig == new_sig and same_folders:
+                self._cache_current(path)
+                return
+            album_mod.invalidate_folder_stats(path)
+            if same_folders and self._mosaic is not None and self._search_results is None:
+                self._items = items
+                self._mosaic.set_items(self._display_items())
+                self._refresh_images_header()
+                self._update_count()
+                self._cache_current(path)
+                return
         with log.timed("album.render", path=path, cached=False,
-                       folders=len(self._folders), images=len(self._items)):
-            self._render_grid()
+                       folders=len(folders), images=len(items)):
+            self._apply_listing(path, folders, items, mtime, cached=False)
+        log.info("album.open", path=path, cached=False,
+                 folders=len(self._folders), images=len(self._items))
+
+    def _apply_listing(self, path: str, folders, items, mtime: int, *, cached: bool):
+        """Render a listing. Recursive counts already computed by *any* earlier
+        walk (including a parent's) fill in instantly; known-empty folders are
+        dropped; only truly unknown ones stream in from the background."""
+        resolved: list[Folder] = []
+        for f in folders:
+            hit = album_mod.cached_folder_stat(f.path)
+            if hit is not None:
+                if hit[0] <= 0:
+                    continue
+                f = Folder(path=f.path, name=f.name, image_count=hit[0], cover_path=hit[1])
+            elif f.image_count >= 0:
+                # Count from an older walk whose stats were since invalidated.
+                f = Folder(path=f.path, name=f.name, image_count=-1, cover_path="")
+            resolved.append(f)
+        self._folders, self._items = resolved, items
+        self._listing_mtime = mtime
+        self._rendered_path = path
+        self._was_cached = cached
+        self._scan_strip.hide()
+        self._render_grid()
         self._update_count()
         self._start_folder_stats(path)
-        log.info("album.open", path=path, cached=False, lazy=True,
-                 folders=len(self._folders), images=len(self._items))
+        self._prefetch_children()
+
+    def _prefetch_children(self):
+        """Speculatively list the first subfolders into the cache (low priority)
+        so clicking into one renders from memory."""
+        paths = [f.path for f in self._folders[:32] if _cache_get(f.path) is None]
+        _list_pool().start(_PrefetchTask(paths, self._source), -5)
+
+    def _on_folder_hover(self, tile):
+        self._hovered_folder = tile.item.path
+        self._hover_timer.start()
+
+    def _prefetch_hovered(self):
+        p = self._hovered_folder
+        if not p:
+            return
+        hit = _cache_get(p)
+        if hit is None:
+            _list_pool().start(_PrefetchTask([p], self._source), 5)
+            return
+        # Warm the first screenful of that folder's thumbnails into RAM.
+        svc = self._svc
+        for it in hit[1][:40]:
+            svc.request(it.path, self._source, svc.PRI_PREFETCH, it.sig)
 
     # ── Lazy folder-stat streaming ──────────────────────────────────────────────
 
     def _cache_current(self, path: str):
-        """Store the current folder in the scan cache — but never while any tile
-        still holds a placeholder count, or a cache hit would render 'counting…'
-        forever (the hit path doesn't restart the background walk)."""
-        if any(f.image_count < 0 for f in self._folders):
-            self._scan_cache.pop(path, None)
-            return
-        self._scan_cache[path] = (self._folders, self._items)
-        self._scan_cache.move_to_end(path)
-        while len(self._scan_cache) > self._scan_cache_max:
-            self._scan_cache.popitem(last=False)
+        """Store the current listing (resolved counts included) in the scan cache.
+        Placeholder counts are fine to cache now: a cache-hit render re-resolves
+        them from the shared stat cache and restarts walkers for the rest."""
+        _cache_put(path, list(self._folders), list(self._items),
+                   getattr(self, "_listing_mtime", -1))
 
     def _start_folder_stats(self, path: str):
         """Walk each placeholder subfolder in the background for its real count +
         cover, feeding results into the tiles as they arrive."""
+        self._cache_current(path)
         pending = [f.path for f in self._folders if f.image_count < 0]
         if not pending:
-            # Nothing to resolve (all counts known) — safe to cache right now.
-            self._cache_current(path)
             return
         self._stat_gen += 1
         self._stat_path = path
@@ -1773,10 +2116,12 @@ class AlbumBrowserView(QWidget):
         tile.set_stat(count, cover)
         if not cover:
             return
-        if cover in self._cover_cache:
-            tile.set_cover(self._cover_cache[cover])
+        self._tile_by_cover[cover] = tile
+        pm = thumb_store.store().get(cover)
+        if pm is not None:
+            tile.set_cover(pm)
         else:
-            self._pool.start(_CoverTask(self._source, cover, self._signals))
+            self._svc.request(cover, self._source, self._svc.PRI_VISIBLE)
 
     @pyqtSlot(int)
     def _on_folder_stats_done(self, gen: int):
@@ -1799,7 +2144,7 @@ class AlbumBrowserView(QWidget):
         # Empty tiles were hidden in place, leaving grid gaps — one light
         # re-layout closes them (rare: only when a subfolder had no images).
         if had_empty:
-            self._render_grid()   # rebuilds tiles + reloads covers
+            self._render_grid()   # rebuilds tiles; covers come from the RAM store
         self._update_count()
 
     # ── Search ────────────────────────────────────────────────────────────────
@@ -1817,13 +2162,39 @@ class AlbumBrowserView(QWidget):
         return [it for it in self._items if t in it.name.lower()]
 
     def _on_search_text(self, text: str):
+        was_searching = self._is_searching() or self._search_results is not None
         self._filter_text = text
         # Typing always filters the current folder live; library results are only
         # produced on Enter, so drop any stale result set as soon as text changes.
         self._search_results = None
+        if was_searching != self._is_searching():
+            # Entering/leaving search mode shows/hides the folder section —
+            # that needs a real re-render (thumbs still come from RAM).
+            self._search_timer.stop()
+            self._render_grid()
+            self._update_count()
+            self._kick_mosaic_width()
+        else:
+            self._search_timer.start()   # coalesce fast typing
+
+    def _apply_search_filter(self):
+        """Refilter in place: the existing mosaic just swaps its item list."""
+        items = self._display_items()
+        if self._mosaic is not None and items and self._images_header is not None:
+            self._mosaic.set_items(items)
+            self._refresh_images_header()
+            self._update_count()
+            return
         self._render_grid()
         self._update_count()
         self._kick_mosaic_width()
+
+    def _refresh_images_header(self):
+        if self._images_header is None:
+            return
+        n = len(self._display_items())
+        self._images_header.setText(f"RESULTS ({n:,})" if self._is_searching()
+                                    else f"IMAGES ({n:,})")
 
     def _on_search_submit(self):
         """Enter — run a library-wide index search when that scope is active."""
@@ -1833,10 +2204,15 @@ class AlbumBrowserView(QWidget):
         try:
             from . import index as index_mod
             rows = index_mod.search(filename_like=text, order_by="date_taken", limit=2000)
-            self._search_results = [
-                ImageItem(path=r["path"], name=os.path.basename(r["path"]))
-                for r in rows if os.path.isfile(r["path"])
-            ]
+            results = []
+            for r in rows:
+                try:
+                    st = os.stat(r["path"])
+                except OSError:
+                    continue   # indexed but gone from disk
+                results.append(ImageItem(path=r["path"], name=os.path.basename(r["path"]),
+                                         mtime=st.st_mtime, size=st.st_size))
+            self._search_results = results
             log.info("library search", q=text, hits=len(self._search_results))
         except Exception as e:
             log.error("library search failed", err=str(e))
@@ -1902,9 +2278,17 @@ class AlbumBrowserView(QWidget):
             m._set_selection(set())
 
     def _force_rescan(self):
-        # Drop just the current folder from cache and rescan it.
-        self._scan_cache.pop(self.current_path, None)
+        # Drop just the current folder (and its recursive counts) and relist.
+        invalidate_scan_cache(self.current_path)
         self._scan_and_render(force=True)
+
+    def listing_names(self, folder: str) -> list[str] | None:
+        """Filenames of ``folder`` if this view already holds its listing — lets
+        the viewer open without listing the folder again."""
+        if folder == self.current_path and getattr(self, "_rendered_path", None) == folder:
+            return [it.name for it in self._items]
+        hit = _cache_get(folder)
+        return [it.name for it in hit[1]] if hit is not None else None
 
     def reload_current(self):
         """Public: re-scan just the current folder in place — used when files
@@ -1917,13 +2301,16 @@ class AlbumBrowserView(QWidget):
         cache in place — the mosaic already dropped its tiles, so we must NOT
         rebuild the grid (that would re-create the mosaic from scratch and
         re-decode every surviving thumbnail)."""
-        pathset = {os.path.normcase(os.path.abspath(p)) for p in paths}
-        self._items = [it for it in self._items
-                       if os.path.normcase(os.path.abspath(it.path)) not in pathset]
-        # Keep the in-memory scan cache consistent for back-navigation (skips the
-        # write if folder stats are still streaming, to avoid caching placeholders).
+        pathset = {_npath(p) for p in paths}
+        self._items = [it for it in self._items if _npath(it.path) not in pathset]
+        # Recursive counts of this folder and its ancestors just changed.
+        album_mod.invalidate_folder_stats(self.current_path)
+        # Keep the in-memory scan cache consistent for back-navigation; the dir
+        # mtime changed too, so record the new one (we already applied the diff).
+        self._listing_mtime = _dir_mtime(self.current_path)
         self._cache_current(self.current_path)
         self._was_cached = True
+        self._refresh_images_header()
         self._update_count()
 
     def _update_breadcrumb(self):
@@ -2011,6 +2398,7 @@ class AlbumBrowserView(QWidget):
         self._tiles.clear()
         self._tile_by_cover.clear()
         self._folder_tile_by_path.clear()
+        self._images_header = None
         if getattr(self, "_mosaic", None) is not None:
             try:
                 self._mosaic.cleanup()
@@ -2053,6 +2441,7 @@ class AlbumBrowserView(QWidget):
                 tile = FolderTile(f)
                 tile.clicked.connect(self._on_folder_clicked)
                 tile._nav_cb = self._folder_nav
+                tile._hover_cb = self._on_folder_hover
                 self._tiles.append(tile)
                 self._folder_tile_by_path[f.path] = tile
                 if f.cover_path:
@@ -2069,6 +2458,7 @@ class AlbumBrowserView(QWidget):
             label = (f"RESULTS ({len(items):,})" if searching
                      else f"IMAGES ({len(items):,})")
             header = self._make_section_header(label)
+            self._images_header = header
             self._grid.addWidget(header, row, 0, 1, cols)
             row += 1
             self._mosaic = _ImageMosaic(items, self._source, parent=self._grid_host)
@@ -2078,7 +2468,7 @@ class AlbumBrowserView(QWidget):
             self._mosaic.selection_changed.connect(self._on_selection_changed)
             self._mosaic.scroll_to.connect(self._scroll_mosaic_to)
             self._mosaic.load_progress.connect(self._set_load_progress)
-            self._set_load_progress(0, len(items))
+            self._set_load_progress(self._mosaic._headers_done, len(items))
             self._grid.addWidget(self._mosaic, row, 0, 1, max(cols, 1))
             # Push the row's column stretch so the mosaic spans full width.
             for c in range(max(cols, 1)):
@@ -2199,39 +2589,69 @@ class AlbumBrowserView(QWidget):
         # rows re-justify without rebuilding aspect/thumb caches.
         if self._mosaic is not None:
             self._kick_mosaic_width()
-        # Folder grid needs a full re-render only when the column count changes.
+        # Column count changed → re-flow the existing folder tiles in the layout
+        # (no widget rebuild, and the image mosaic keeps its state).
         if hasattr(self, "_grid") and self._folders:
             new_cols = self._columns()
             if new_cols != self._last_cols:
-                self._render_grid()
+                self._reflow_grid(new_cols)
+
+    def _reflow_grid(self, cols: int):
+        """Re-place the grid's existing widgets for a new column count."""
+        if not self._tiles:
+            self._render_grid()
+            return
+        widgets = []
+        while self._grid.count():
+            it = self._grid.takeAt(0)
+            if it.widget() is not None:
+                widgets.append(it.widget())
+        tile_set = set(map(id, self._tiles))
+        self._last_cols = cols
+        row = col = 0
+        for w in widgets:
+            if id(w) in tile_set:
+                self._grid.addWidget(w, row, col)
+                col += 1
+                if col >= cols:
+                    col = 0
+                    row += 1
+                continue
+            if col != 0:
+                col = 0
+                row += 1
+            self._grid.addWidget(w, row, 0, 1, cols)   # section header / mosaic / empty label
+            row += 1
+        for c in range(64):
+            self._grid.setColumnStretch(c, 1 if (self._mosaic is not None and c < cols) else 0)
+        self._kick_mosaic_width()
 
     # ── Cover loading ─────────────────────────────────────────────────────────
 
     def _load_covers(self):
+        store, svc = thumb_store.store(), self._svc
         for tile in self._tiles:
             cover = (tile.cover_path()
                      if isinstance(tile, FolderTile) else tile.item.path)
             if not cover:
                 continue
-            if cover in self._cover_cache:
-                tile.set_cover(self._cover_cache[cover])
-                continue
-            self._pool.start(_CoverTask(self._source, cover, self._signals))
-
-    @pyqtSlot(str, QPixmap)
-    def _on_cover_ready(self, cover_path: str, pm: QPixmap):
-        if pm.isNull():
-            return
-        self._cover_cache[cover_path] = pm
-        self._cover_cache.move_to_end(cover_path)
-        while len(self._cover_cache) > self._cover_cache_max:
-            self._cover_cache.popitem(last=False)
-        # Apply to whichever tile claims this cover (folder cover or image self).
-        for tile in self._tiles:
-            target = (tile.cover_path()
-                      if isinstance(tile, FolderTile) else tile.item.path)
-            if target == cover_path:
+            pm = store.get(cover)
+            if pm is not None:
                 tile.set_cover(pm)
+            else:
+                svc.request(cover, self._source, svc.PRI_VISIBLE)
+
+    @pyqtSlot(str)
+    def _on_cover_ready(self, cover_path: str):
+        tile = self._tile_by_cover.get(cover_path)
+        if tile is None:
+            return
+        pm = thumb_store.store().get(cover_path)
+        if pm is not None:
+            try:
+                tile.set_cover(pm)
+            except RuntimeError:
+                pass   # tile deleted by a re-render
 
     # ── Click handlers ────────────────────────────────────────────────────────
 
@@ -2240,7 +2660,12 @@ class AlbumBrowserView(QWidget):
         self._navigate_to(folder.path, push=True)
 
     def _on_image_clicked(self, idx: int):
-        self.open_image.emit(self.current_path, idx)
+        if self._mosaic is None:
+            return
+        items = self._mosaic.items()
+        if 0 <= idx < len(items):
+            path = items[idx].path
+            self.open_image.emit(os.path.dirname(path), path)
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -2251,8 +2676,14 @@ class AlbumBrowserView(QWidget):
             except Exception:
                 pass
             self._mosaic = None
+        self._list_gen += 1
+        self._hover_timer.stop()
+        self._search_timer.stop()
+        self._list_wait_timer.stop()
+        try:
+            self._svc.thumb_ready.disconnect(self._on_cover_ready)
+        except (TypeError, RuntimeError):
+            pass
         self._cancel_folder_stats()
         self._stat_pool.clear()
         self._stat_pool.waitForDone(200)
-        self._pool.clear()
-        self._pool.waitForDone(200)

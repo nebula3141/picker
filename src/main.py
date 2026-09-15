@@ -112,6 +112,7 @@ class MainWindow(QMainWindow):
         self._parked_source: str | None = None
         self._album_dirty: bool = False
         self._library_view = None
+        self._sort_view = None           # two-pane Sort (picker.sort_view.SortView)
 
         self._source_folder: str | None = manager.source_folder if manager else None
         self._current_folder: str | None = None
@@ -205,11 +206,14 @@ class MainWindow(QMainWindow):
             self._opened_from_explorer = True
             self._instant_open_file(str(p))
 
-    def _instant_open_file(self, file_path: str):
-        """Open image instantly — seed ±2 neighbors, scan rest in background."""
+    def _instant_open_file(self, file_path: str, names: list[str] | None = None):
+        """Open an image instantly. The folder listing is one scandir (or reused
+        from the folder browser via ``names``), so the viewer starts complete —
+        filmstrip and counter included — with no background re-scan."""
         from picker import log
         folder = str(Path(file_path).parent)
 
+        self._close_sort_view()
         if self._slideshow:
             self._slideshow.cleanup()
             self._slideshow = None
@@ -238,11 +242,12 @@ class MainWindow(QMainWindow):
             resolution_pct=self._resolution_pct,
             on_progress=_on_progress,
             on_complete=_on_complete,
+            names=names,
         )
         self._manager = mgr
-        log.info("instant open", file=file_path, seed_count=len(mgr.images))
+        log.info("instant open", file=file_path, count=len(mgr.images))
 
-        self._open_slideshow(seed_idx, filmstrip_hidden=True)
+        self._open_slideshow(seed_idx, filmstrip_hidden=not mgr.scan_complete)
         self._update_window_title()
 
         QTimer.singleShot(0, lambda: recent_mod.add(folder))
@@ -258,8 +263,6 @@ class MainWindow(QMainWindow):
 
     def _open_file_in_browser(self, file_path: str):
         """Open image from album browser — also uses instant open."""
-        fp = os.path.normcase(os.path.abspath(file_path))
-        folder = os.path.dirname(fp)
         self._instant_open_file(file_path)
 
     def _update_window_title(self):
@@ -300,7 +303,12 @@ class MainWindow(QMainWindow):
                     return
 
     def _swap_source(self, new_source: str):
-        """Switch to a new source folder and show its album browser."""
+        """Switch to a new source folder and show its album browser.
+
+        No loading screen: the browser paints its chrome at once and lists the
+        folder on a worker (usually from the in-memory listing cache), so there's
+        nothing to wait for — the old splash + processEvents() only added delay."""
+        self._close_sort_view()
         self._discard_parked_album()
         if self._slideshow:
             self._slideshow.cleanup()
@@ -312,14 +320,8 @@ class MainWindow(QMainWindow):
             self._album_browser.cleanup()
             self._album_browser = None
 
-        app = QApplication.instance()
-        src_label = os.path.basename(new_source.rstrip("/\\")) or new_source
         from picker import log
         log.info("opening folder", path=new_source)
-        loading = LoadingScreen(sub=f"Opening {src_label}…", parent=self)
-        loading.show()
-        loading.set_text("Building folder browser…")
-        app.processEvents()
 
         # Inherit prior destinations/mode/resolution if a manager already existed,
         # otherwise pull defaults from settings.
@@ -332,13 +334,14 @@ class MainWindow(QMainWindow):
         self._manager = None
         self._current_folder = None
 
-        recent_mod.add(new_source)
-        library_mod.push_recent(new_source)
-        settings_mod.set_value("last_folder", new_source)
-
         self._show_album_browser()
-        app.processEvents()
-        loading.close_smoothly()
+
+        # Bookkeeping (JSON writes) after the browser is up, not before.
+        def _remember(src=new_source):
+            recent_mod.add(src)
+            library_mod.push_recent(src)
+            settings_mod.set_value("last_folder", src)
+        QTimer.singleShot(0, _remember)
 
     # ── Folder-tree browser ───────────────────────────────────────────────────
 
@@ -359,6 +362,7 @@ class MainWindow(QMainWindow):
         if self._source_folder is None:
             self._show_library_view()
             return
+        self._close_sort_view()
         self._discard_parked_album()
         if self._slideshow:
             self._slideshow.cleanup()
@@ -372,6 +376,7 @@ class MainWindow(QMainWindow):
         self._current_folder = None
         self._album_browser = AlbumBrowserView(self._source_folder, self)
         self._album_browser.open_image.connect(self._open_image_in_folder)
+        self._album_browser.sort_requested.connect(self._start_two_pane_sort)
         self._album_browser.back_requested.connect(self._show_library_view)
         self._set_central(self._album_browser)
         # Focus a tile once shown so the grid is keyboard-drivable without a click.
@@ -380,50 +385,121 @@ class MainWindow(QMainWindow):
         bar = self.statusBar()
         bar.showMessage(f"  {self._source_folder}")
 
-    @pyqtSlot(str, int)
-    def _open_image_in_folder(self, folder_path: str, image_idx: int):
-        """User clicked an image in the folder browser — instant open."""
-        from picker.image_manager import active_extensions
-        exts = active_extensions(settings_mod.get("file_types"))
-        try:
-            files = sorted(
-                f for f in os.listdir(folder_path)
-                if os.path.isfile(os.path.join(folder_path, f))
-                and os.path.splitext(f)[1].lower() in exts
-            )
-        except OSError:
-            files = []
-        if not files:
-            # Nothing to open — leave the browser exactly as it is (don't park).
-            QMessageBox.information(
-                self, "No images",
-                f"No supported media files found in:\n\n{folder_path}",
-            )
-            return
-        if 0 <= image_idx < len(files):
-            target = os.path.join(folder_path, files[image_idx])
-        else:
-            idx = settings_mod.get_position(folder_path)
-            idx = max(0, min(idx, len(files) - 1))
-            target = os.path.join(folder_path, files[idx])
-
-        # Now that we're committed to opening, park the live browser so Escape
-        # restores it instantly (no rescan).
-        self._album_dirty = False
+    def _park_album_browser(self):
+        """Detach the live browser WITHOUT deleting it so returning is instant:
+        setCentralWidget() would deleteLater() the outgoing central widget;
+        takeCentralWidget hands ownership back so the instance stays alive."""
         if self._album_browser is not None:
             self._discard_parked_album()   # drop any earlier stale parked view
-            # Detach it WITHOUT deleting: setCentralWidget() (when the slideshow
-            # opens) would otherwise deleteLater() the outgoing central widget,
-            # destroying the very browser we intend to restore. takeCentralWidget
-            # hands ownership back to us so the instance stays alive, parked.
             self.takeCentralWidget()
             self._album_browser.hide()
             self._parked_album = self._album_browser
             self._parked_source = self._source_folder
-            self._album_browser = None     # stop _instant_open_file destroying it
+            self._album_browser = None     # stop teardown paths destroying it
+
+    @pyqtSlot(str, str)
+    def _open_image_in_folder(self, folder_path: str, target: str):
+        """User clicked an image in the folder browser — instant open, by path.
+        The browser already holds the folder listing, so the viewer reuses it
+        instead of listing (and stat-ing) the folder again."""
+        if not target or not os.path.isfile(target):
+            # Gone since it was listed — leave the browser exactly as it is.
+            QMessageBox.information(self, "Not found",
+                                    f"This file no longer exists:\n\n{target}")
+            if self._album_browser is not None:
+                self._album_browser.reload_current()
+            return
+        names = None
+        if self._album_browser is not None:
+            names = self._album_browser.listing_names(folder_path)
+
+        # Now that we're committed to opening, park the live browser so Escape
+        # restores it instantly (no rescan).
+        self._album_dirty = False
+        self._park_album_browser()
 
         self._opened_from_explorer = False
-        self._instant_open_file(target)
+        self._instant_open_file(target, names=names)
+
+    # ── Two-pane Sort ───────────────────────────────────────────────────────────
+
+    def _start_two_pane_sort(self, source: str | None = None):
+        """Open the two-pane Sort view: source mosaic ⇄ destination mosaic.
+        Source defaults to the folder being browsed (or the last one sorted);
+        destination to the last one used — otherwise a folder picker asks."""
+        from PyQt6.QtWidgets import QFileDialog
+        from picker.sort_view import SortView
+        if not isinstance(source, str) or not source:
+            if self._album_browser is not None:
+                source = self._album_browser.current_path
+            else:
+                source = settings_mod.get("sort_last_source") or ""
+        if not source or not os.path.isdir(source):
+            source = QFileDialog.getExistingDirectory(
+                self, "Sort — choose the SOURCE folder",
+                self._source_folder or os.path.expanduser("~"))
+            if not source:
+                return
+        dest = settings_mod.get("sort_last_destination") or ""
+        norm = lambda p: os.path.normcase(os.path.abspath(p))  # noqa: E731
+        if not dest or not os.path.isdir(dest) or norm(dest) == norm(source):
+            dest = QFileDialog.getExistingDirectory(
+                self, "Sort — choose the DESTINATION folder (Space copies photos here)",
+                os.path.dirname(source.rstrip("/\\")) or source)
+            if not dest:
+                return
+            if norm(dest) == norm(source):
+                QMessageBox.information(self, "Sort",
+                                        "Source and destination must be different folders.")
+                return
+        settings_mod.set_value("sort_last_source", source)
+        settings_mod.set_value("sort_last_destination", dest)
+
+        # Reuse the browser's thumbnail cache when the source lives under it.
+        cache_root = None
+        root = self._source_folder
+        if root and norm(source).startswith(norm(root)):
+            cache_root = root
+
+        self._close_sort_view()
+        if self._slideshow:
+            self._slideshow.cleanup()
+            self._slideshow = None
+        if self._gallery:
+            self._gallery.cleanup()
+            self._gallery = None
+        self._park_album_browser()
+        resolution = self._manager.resolution_pct if self._manager else self._resolution_pct
+        view = SortView(source, dest, self, cache_root=cache_root, resolution_pct=resolution)
+        view.closed.connect(self._on_sort_closed)
+        self._sort_view = view
+        self._set_central(view)
+        self.statusBar().showMessage(f"  Sort:  {source}   →   {dest}")
+        QTimer.singleShot(0, view.focus_source)
+
+    def _close_sort_view(self):
+        if self._sort_view is not None:
+            try:
+                self._sort_view.cleanup()
+            except Exception:
+                pass
+            self._sort_view = None
+
+    def _on_sort_closed(self):
+        self._close_sort_view()
+        if self._parked_album is not None:
+            self._album_browser = self._parked_album
+            self._parked_album = None
+            self._source_folder = self._parked_source
+            self._parked_source = None
+            self._album_browser.show()
+            self._set_central(self._album_browser)
+            # Copies may have landed in (or been deleted from) folders it shows.
+            self._album_browser.reload_current()
+            self._album_browser.focus_content()
+            self.statusBar().showMessage(f"  {self._source_folder or ''}")
+            return
+        self._show_library_view()
 
     # ── Menu ───────────────────────────────────────────────────────────────────
 
@@ -441,10 +517,17 @@ class MainWindow(QMainWindow):
         open_folder_action.triggered.connect(self._open_folder)
         file_menu.addAction(open_folder_action)
 
-        sort_action = QAction("Sort Photos…", self)
+        sort_action = QAction("Sort…", self)
         sort_action.setShortcut("Ctrl+Shift+S")
-        sort_action.triggered.connect(self._change_source)
+        sort_action.setStatusTip("Two panes: source ⇄ destination — Space copies the focused photo")
+        sort_action.triggered.connect(lambda: self._start_two_pane_sort(None))
         file_menu.addAction(sort_action)
+
+        sort_multi_action = QAction("Sort-Multi…", self)
+        sort_multi_action.setShortcut("Ctrl+Alt+S")
+        sort_multi_action.setStatusTip("Sort one folder into up to 9 destinations with number keys")
+        sort_multi_action.triggered.connect(self._change_source)
+        file_menu.addAction(sort_multi_action)
 
         file_menu.addSeparator()
 
@@ -529,6 +612,7 @@ class MainWindow(QMainWindow):
     # ── Gallery ────────────────────────────────────────────────────────────────
 
     def _build_gallery(self):
+        self._close_sort_view()
         self._discard_parked_album()
         if self._gallery:
             self._gallery.cleanup()
@@ -547,6 +631,7 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot(int)
     def _open_slideshow(self, idx: int, filmstrip_hidden: bool = False):
+        self._close_sort_view()
         if self._slideshow:
             self._slideshow.cleanup()
             self._slideshow = None
@@ -625,7 +710,7 @@ class MainWindow(QMainWindow):
                 self._gallery.scroll_to(last_idx)
                 self._update_status()
 
-    def _fade_in(self, widget, duration: int = 250):
+    def _fade_in(self, widget, duration: int = 160):
         effect = QGraphicsOpacityEffect(widget)
         widget.setGraphicsEffect(effect)
         anim = QPropertyAnimation(effect, b"opacity")
@@ -659,7 +744,7 @@ class MainWindow(QMainWindow):
                 self._fade_in(widget)
             return
 
-        self._fade_in(widget, duration=300)
+        self._fade_in(widget, duration=170)
 
         # Outgoing snapshot laid over the new view, faded to transparent.
         overlay = QLabel(widget)
@@ -676,7 +761,7 @@ class MainWindow(QMainWindow):
             eff = QGraphicsOpacityEffect(overlay)
             overlay.setGraphicsEffect(eff)
             anim = QPropertyAnimation(eff, b"opacity", overlay)
-            anim.setDuration(300)
+            anim.setDuration(170)
             anim.setStartValue(1.0)
             anim.setEndValue(0.0)
             anim.setEasingCurve(QEasingCurve.Type.InOutCubic)
@@ -725,6 +810,7 @@ class MainWindow(QMainWindow):
         if not data:
             return
 
+        self._close_sort_view()
         self._discard_parked_album()
         if self._slideshow:
             self._slideshow.cleanup()
@@ -858,6 +944,7 @@ class MainWindow(QMainWindow):
     def _show_library_view(self):
         """Swap central widget to the library home screen."""
         from picker.library_view import LibraryView
+        self._close_sort_view()
         self._discard_parked_album()
         if self._slideshow:
             self._slideshow.cleanup()
@@ -1189,6 +1276,7 @@ class MainWindow(QMainWindow):
                 event.ignore()
                 return
         self._save_window_geometry()
+        self._close_sort_view()
         if self._gallery:
             self._gallery.cleanup()
         if self._album_browser:
@@ -1197,10 +1285,13 @@ class MainWindow(QMainWindow):
         if self._slideshow:
             self._slideshow.cleanup()
         # Catch-all: persist any image dimensions measured but not yet flushed
-        # (e.g. a folder still mid-load) so the next launch opens instantly.
+        # (e.g. a folder still mid-load) and the lazily-written viewer positions,
+        # so the next launch opens instantly and resumes where you were.
         try:
-            from picker import dim_cache
+            from picker import dim_cache, thumb_store
+            thumb_store.service().shutdown(wait_ms=150)
             dim_cache.flush()
+            settings_mod.flush_positions()
         except Exception:
             pass
         super().closeEvent(event)

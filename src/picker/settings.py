@@ -85,6 +85,8 @@ DEFAULTS = {
     "group_by": "flat",                  # "flat"|"date"|"folder"|"camera"
     "date_group_granularity": "day",     # "year"|"month"|"day"
     "sort_order": "date_taken",          # filename|date_taken|mtime|size|rating|random
+    "sort_last_source": "",              # two-pane Sort: last source folder
+    "sort_last_destination": "",         # two-pane Sort: last destination folder
 
     # ── Editing (crop/rotate save)
     "edit_save_mode": "ask",             # "ask"|"new"|"overwrite"
@@ -166,44 +168,99 @@ def _run_migrations(data: dict) -> dict:
 
 _POS_CACHE_MAX = 200
 
+# Positions are saved on *every* image navigation. That used to re-read, rewrite
+# and fsync positions.json on the UI thread per arrow-key press — a real disk
+# stall while flicking through photos. Now the map lives in memory and is
+# written by a debounced background thread (and flushed on exit).
+import threading as _threading
+
+_pos_lock = _threading.Lock()
+_pos_mem: dict | None = None
+_pos_mem_path: str | None = None
+_pos_dirty = False
+_pos_timer: "_threading.Timer | None" = None
+_POS_WRITE_DELAY = 1.5
+
+
 def _positions_file():
     return _config_dir() / "positions.json"
 
+
+def _positions_locked() -> dict:
+    """In-memory positions for the current config dir (call under _pos_lock)."""
+    global _pos_mem, _pos_mem_path
+    cur = str(_positions_file())
+    if _pos_mem is None or _pos_mem_path != cur:
+        data: dict = {}
+        try:
+            p = Path(cur)
+            if p.exists():
+                raw = json.loads(p.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    data = raw
+        except Exception:
+            pass
+        _pos_mem, _pos_mem_path = data, cur
+    return _pos_mem
+
+
 def load_positions() -> dict:
-    try:
-        p = _positions_file()
-        if p.exists():
-            raw = json.loads(p.read_text(encoding="utf-8"))
-            if isinstance(raw, dict):
-                return raw
-    except Exception:
-        pass
-    return {}
+    with _pos_lock:
+        return dict(_positions_locked())
+
 
 def save_position(folder: str, idx: int) -> None:
-    try:
-        data = load_positions()
-        data[os.path.normcase(os.path.abspath(folder))] = idx
+    global _pos_dirty, _pos_timer
+    key = os.path.normcase(os.path.abspath(folder))
+    with _pos_lock:
+        data = _positions_locked()
+        if data.get(key) == idx:
+            return
+        data.pop(key, None)          # re-insert so the most recent sits last (LRU)
+        data[key] = idx
         while len(data) > _POS_CACHE_MAX:
-            first_key = next(iter(data))
-            del data[first_key]
-        target = _positions_file()
+            del data[next(iter(data))]
+        _pos_dirty = True
+        if _pos_timer is None:
+            _pos_timer = _threading.Timer(_POS_WRITE_DELAY, flush_positions)
+            _pos_timer.daemon = True
+            _pos_timer.start()
+
+
+def flush_positions() -> None:
+    """Write pending positions to disk now (atomic). Safe from any thread."""
+    global _pos_dirty, _pos_timer
+    with _pos_lock:
+        _pos_timer = None
+        if not _pos_dirty or _pos_mem_path is None:
+            return
+        payload = json.dumps(_pos_mem)
+        target = Path(_pos_mem_path)
+        _pos_dirty = False
+    try:
         tmp = target.with_suffix(target.suffix + ".tmp")
         with open(tmp, "w", encoding="utf-8") as f:
-            f.write(json.dumps(data))
-            try:
-                f.flush()
-                os.fsync(f.fileno())
-            except OSError:
-                pass
+            f.write(payload)
         os.replace(str(tmp), str(target))
     except Exception as e:
         from . import log
         log.warn("position save failed", err=str(e))
 
+
+def clear_positions() -> None:
+    """Forget all remembered positions (memory + disk)."""
+    global _pos_mem, _pos_mem_path, _pos_dirty
+    with _pos_lock:
+        _pos_mem, _pos_mem_path, _pos_dirty = {}, str(_positions_file()), False
+    try:
+        _positions_file().unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def get_position(folder: str) -> int:
-    data = load_positions()
-    return data.get(os.path.normcase(os.path.abspath(folder)), 0)
+    with _pos_lock:
+        return _positions_locked().get(os.path.normcase(os.path.abspath(folder)), 0)
 
 
 def _config_dir() -> Path:
@@ -211,8 +268,10 @@ def _config_dir() -> Path:
         return _portable_dir
     if os.name == "nt":
         base = Path(os.environ.get("APPDATA", Path.home()))
+    elif sys.platform == "darwin":
+        base = Path.home() / "Library" / "Application Support"
     else:
-        base = Path.home() / ".config"
+        base = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
     d = base / "PICker"
     try:
         d.mkdir(parents=True, exist_ok=True)

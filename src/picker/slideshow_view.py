@@ -18,11 +18,21 @@ from PyQt6.QtGui import (
     QPainter, QPen, QBrush, QMouseEvent, QTransform
 )
 
-try:
-    import numpy as np
-    _HAVE_NUMPY = True
-except Exception:
-    _HAVE_NUMPY = False
+# numpy only powers the histogram / focus-peaking overlays — import it on first
+# use rather than at app start.
+np = None
+_HAVE_NUMPY = True   # optimistic until the first import attempt
+
+
+def _ensure_numpy() -> bool:
+    global np, _HAVE_NUMPY
+    if np is None and _HAVE_NUMPY:
+        try:
+            import numpy
+            np = numpy
+        except Exception:
+            _HAVE_NUMPY = False
+    return _HAVE_NUMPY
 
 from .image_manager import ImageManager, STATUS_UNREVIEWED
 from .gallery_view import cache_file as gallery_cache_file, THUMB_MAX_DIM
@@ -30,6 +40,7 @@ from . import external
 from . import exif as exif_mod
 from . import raw_loader
 from . import heif_loader
+from . import ratings as ratings_mod
 from . import settings as settings_mod
 from . import conflict_dialog
 from . import theme as theme_mod
@@ -123,77 +134,157 @@ def _smart_scaled_size(src_w: int, src_h: int, pct: int) -> tuple[int, int] | No
 # ── Background full-res loader (QThreadPool) ───────────────────────────────────
 
 class _LoaderSignals(QObject):
-    image_ready = pyqtSignal(int, QImage)
+    image_ready = pyqtSignal(str, QImage)     # path, decoded frame (null = failed)
 
 
 class ImageLoadTask(QRunnable):
-    def __init__(self, manager: ImageManager, idx: int, signals: _LoaderSignals):
+    """Decode one display frame. Captures the *path* at dispatch time — indices
+    shift when files are moved/deleted mid-decode, paths don't."""
+
+    def __init__(self, path: str, pct: int, signals: _LoaderSignals):
         super().__init__()
-        self._manager = manager
-        self._idx = idx
+        self._path = path
+        self._pct = pct
         self._signals = signals
-        self.setAutoDelete(True)
+        self.setAutoDelete(False)   # the view keeps a ref so queued work can be cancelled
 
     def run(self):
-        img = self._load(self._idx)
+        img = decode_display_image(self._path, self._pct)
         # QPixmap can't be constructed off-main-thread; emit QImage instead
-        self._signals.image_ready.emit(self._idx, img)
+        try:
+            self._signals.image_ready.emit(self._path, img)
+        except RuntimeError:
+            pass
 
-    def _load(self, idx: int) -> QImage:
-        if idx < 0 or idx >= len(self._manager.images):
-            return QImage()
-        rec = self._manager.images[idx]
-        # If the user set "Disable resolution limit" in Settings, decode at
-        # native size regardless of the per-source pct.
-        if bool(settings_mod.get("display_full_resolution")):
-            pct = 100
-        else:
-            pct = self._manager.resolution_pct
 
-        if raw_loader.is_raw(rec.path) and raw_loader.available():
-            prefer_thumb = (settings_mod.get("raw_preference") or "embedded") == "embedded"
-            img = raw_loader.load_raw(rec.path, prefer_thumb=prefer_thumb)
-            if img is not None and not img.isNull():
-                ssz = _smart_scaled_size(img.width(), img.height(), pct)
-                if ssz is not None:
-                    img = img.scaled(ssz[0], ssz[1],
-                                     Qt.AspectRatioMode.KeepAspectRatio,
-                                     Qt.TransformationMode.SmoothTransformation)
-                return img
+def display_pct(manager_pct: int) -> int:
+    """The decode percentage honouring "Disable resolution limit"."""
+    return 100 if bool(settings_mod.get("display_full_resolution")) else manager_pct
 
-        if heif_loader.is_heif(rec.path) and heif_loader.available():
-            img = heif_loader.load_heif(rec.path)
-            if img is not None and not img.isNull():
-                ssz = _smart_scaled_size(img.width(), img.height(), pct)
-                if ssz is not None:
-                    img = img.scaled(ssz[0], ssz[1],
-                                     Qt.AspectRatioMode.KeepAspectRatio,
-                                     Qt.TransformationMode.SmoothTransformation)
-                return img
 
-        reader = QImageReader(rec.path)
-        reader.setAutoTransform(True)
-        size = reader.size()
-        if os.path.splitext(rec.path)[1].lower() in (".svg", ".svgz"):
-            # Vector: rasterize crisp at the display floor (its intrinsic size is
-            # often tiny and would look blurry fit to a large window).
-            if size.isValid() and size.width() > 0 and size.height() > 0:
-                floor = _min_decode_edge()
-                long_edge = max(size.width(), size.height())
-                scale = floor / long_edge if long_edge else 1.0
-                if scale > 1.0:
-                    reader.setScaledSize(QSize(max(1, round(size.width() * scale)),
-                                               max(1, round(size.height() * scale))))
-        elif size.isValid():
-            ssz = _smart_scaled_size(size.width(), size.height(), pct)
+def decode_display_image(path: str, pct: int) -> QImage:
+    """Smart-scaled full-view decode for any supported still (RAW, HEIF, SVG,
+    raster). Returns a null QImage on failure. Safe on worker threads."""
+    if raw_loader.is_raw(path) and raw_loader.available():
+        prefer_thumb = (settings_mod.get("raw_preference") or "embedded") == "embedded"
+        img = raw_loader.load_raw(path, prefer_thumb=prefer_thumb)
+        if img is not None and not img.isNull():
+            ssz = _smart_scaled_size(img.width(), img.height(), pct)
             if ssz is not None:
-                reader.setScaledSize(QSize(ssz[0], ssz[1]))
-        img = reader.read()
-        if img.isNull():
-            # Signal failure with a null image — the view shows a one-line error
-            # instead of a blank grey box.
-            return QImage()
-        return img
+                img = img.scaled(ssz[0], ssz[1],
+                                 Qt.AspectRatioMode.KeepAspectRatio,
+                                 Qt.TransformationMode.SmoothTransformation)
+            return img
+
+    if heif_loader.is_heif(path) and heif_loader.available():
+        img = heif_loader.load_heif(path)
+        if img is not None and not img.isNull():
+            ssz = _smart_scaled_size(img.width(), img.height(), pct)
+            if ssz is not None:
+                img = img.scaled(ssz[0], ssz[1],
+                                 Qt.AspectRatioMode.KeepAspectRatio,
+                                 Qt.TransformationMode.SmoothTransformation)
+            return img
+
+    reader = QImageReader(path)
+    reader.setAutoTransform(True)
+    size = reader.size()
+    if os.path.splitext(path)[1].lower() in (".svg", ".svgz"):
+        # Vector: rasterize crisp at the display floor (its intrinsic size is
+        # often tiny and would look blurry fit to a large window).
+        if size.isValid() and size.width() > 0 and size.height() > 0:
+            floor = _min_decode_edge()
+            long_edge = max(size.width(), size.height())
+            scale = floor / long_edge if long_edge else 1.0
+            if scale > 1.0:
+                reader.setScaledSize(QSize(max(1, round(size.width() * scale)),
+                                           max(1, round(size.height() * scale))))
+    elif size.isValid():
+        ssz = _smart_scaled_size(size.width(), size.height(), pct)
+        if ssz is not None:
+            reader.setScaledSize(QSize(ssz[0], ssz[1]))
+    img = reader.read()
+    if img.isNull():
+        # Signal failure with a null image — the view shows a one-line error
+        # instead of a blank grey box.
+        return QImage()
+    return img
+
+
+# ── Decoded-frame memory ───────────────────────────────────────────────────────
+
+class _FrameCache:
+    """Full-view decoded frames keyed by ``(path, mtime)``.
+
+    Module-level, so it outlives any one SlideshowView: going back to the folder
+    and re-opening a photo — or reopening the viewer after a sort — shows frames
+    already decoded without touching the disk. The byte budget is a share of the
+    RAM that is *currently available* (refreshed as it fills), instead of a
+    fixed 512 MB / 12-frame cap that wasted big machines and could starve small
+    ones. Keys are paths, not indices, so moves/deletes never alias a frame onto
+    the wrong photo."""
+
+    FRACTION = 0.30
+    FLOOR = 256 * 1024 * 1024
+    CEILING = 8 * 1024 * 1024 * 1024
+    MAX_ENTRIES = 96
+
+    def __init__(self):
+        self._lru: "OrderedDict[tuple, QPixmap]" = OrderedDict()
+        self._bytes = 0
+        self._budget = None
+
+    def _refresh_budget(self):
+        from . import sysmem
+        self._budget = sysmem.budget(self.FRACTION, self.FLOOR, self.CEILING)
+
+    def get(self, key):
+        pm = self._lru.get(key)
+        if pm is not None:
+            self._lru.move_to_end(key)
+        return pm
+
+    def __contains__(self, key):
+        return key in self._lru
+
+    def put(self, key, pm: QPixmap):
+        if self._budget is None or len(self._lru) % 8 == 0:
+            self._refresh_budget()
+        old = self._lru.pop(key, None)
+        if old is not None:
+            self._bytes -= _pixmap_bytes(old)
+        self._lru[key] = pm
+        self._bytes += _pixmap_bytes(pm)
+        while len(self._lru) > 1 and (self._bytes > self._budget
+                                       or len(self._lru) > self.MAX_ENTRIES):
+            _, ev = self._lru.popitem(last=False)
+            self._bytes -= _pixmap_bytes(ev)
+
+    def drop_path(self, path: str):
+        for k in [k for k in self._lru if k[0] == path]:
+            self._bytes -= _pixmap_bytes(self._lru.pop(k))
+
+
+_FRAMES = _FrameCache()
+_DECODE_POOL: QThreadPool | None = None
+
+
+def _decode_pool() -> QThreadPool:
+    """One app-wide pool for full-view decodes. Per-view pools had to be drained
+    with a blocking waitForDone() on close (and QThreadPool's destructor waits
+    too); a shared pool lets a closing view just cancel its queued work."""
+    global _DECODE_POOL
+    if _DECODE_POOL is None:
+        _DECODE_POOL = QThreadPool()
+        _DECODE_POOL.setMaxThreadCount(max(2, min(6, (os.cpu_count() or 4) - 1)))
+    return _DECODE_POOL
+
+
+def _frame_key(path: str) -> tuple:
+    try:
+        return (path, int(os.path.getmtime(path)))
+    except OSError:
+        return (path, 0)
 
 
 # ── Image canvas — zoom anchored at cursor, pan via drag ───────────────────────
@@ -230,6 +321,7 @@ class ImageCanvas(QWidget):
         self._double_click_enabled = False
         self._raw_loading = False
         self._error_text: str | None = None    # single-line load-failure message
+        self._rating = 0                        # 0–5 stars, drawn bottom-centre
 
         # "Sent" feedback — a brief accent edge-flash after move/copy/send.
         self._flash_phase = 0.0
@@ -452,6 +544,10 @@ class ImageCanvas(QWidget):
             (p.y() - self._offset.y()) / self._zoom,
         )
 
+    def set_rating(self, stars: int):
+        self._rating = max(0, min(5, int(stars)))
+        self.update()
+
     def set_error(self, message: str):
         """Show a single-line failure message in place of the image."""
         self._error_text = message
@@ -579,7 +675,7 @@ class ImageCanvas(QWidget):
 
     def _qimage_to_np(self, img: QImage) -> "np.ndarray | None":
         """Return H×W×4 BGRA uint8 view. Format_RGB32 on Qt = BGRA little-endian."""
-        if not _HAVE_NUMPY or img.isNull():
+        if not _ensure_numpy() or img.isNull():
             return None
         src = img.convertToFormat(QImage.Format.Format_RGB32)
         bits = src.bits()
@@ -596,7 +692,7 @@ class ImageCanvas(QWidget):
                              Qt.AspectRatioMode.KeepAspectRatio,
                              Qt.TransformationMode.FastTransformation)
         style = settings_mod.get("histogram_style") or "additive"
-        if _HAVE_NUMPY:
+        if _ensure_numpy():
             arr = self._qimage_to_np(src)
             if arr is None:
                 return
@@ -637,7 +733,7 @@ class ImageCanvas(QWidget):
 
     def _compute_peaking(self):
         """Edge detect via neighbor diff. Red overlay where edges strong."""
-        if self._pixmap is None or self._pixmap.isNull() or not _HAVE_NUMPY:
+        if self._pixmap is None or self._pixmap.isNull() or not _ensure_numpy():
             return
         src = self._pixmap.toImage()
         max_dim = 600
@@ -770,6 +866,10 @@ class ImageCanvas(QWidget):
         # EXIF overlay — top-right
         if self._show_exif and self._exif_lines:
             self._paint_exif(p)
+
+        # Star rating — bottom-centre, only when rated
+        if self._rating > 0:
+            self._paint_rating(p)
 
         # Rotation indicator
         if self._rotation != 0:
@@ -921,6 +1021,21 @@ class ImageCanvas(QWidget):
         p.drawText(QRectF(W / 2 - 300, H - 54, 600, 32),
                    Qt.AlignmentFlag.AlignCenter,
                    "CROP — drag to draw · drag inside to move · handles to resize · Enter apply · Esc cancel")
+
+    def _paint_rating(self, p: QPainter):
+        """Gold star pill, bottom-centre."""
+        text = "★" * self._rating + "☆" * (5 - self._rating)
+        f = p.font(); f.setPointSize(15); f.setBold(False); p.setFont(f)
+        fm = p.fontMetrics()
+        tw = fm.horizontalAdvance(text)
+        bw, bh = tw + 22, fm.height() + 8
+        bx = (self.width() - bw) // 2
+        by = self.height() - bh - 16
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(0, 0, 0, 150))
+        p.drawRoundedRect(bx, by, bw, bh, 9, 9)
+        p.setPen(QColor(250, 200, 60))
+        p.drawText(QRect(bx, by, bw, bh), Qt.AlignmentFlag.AlignCenter, text)
 
     def _paint_exif(self, p: QPainter):
         f = p.font()
@@ -1276,97 +1391,18 @@ class ShortcutPanel(QWidget):
 
 # ── Filmstrip bar ──────────────────────────────────────────────────────────────
 
-class _FilmThumbSignals(QObject):
-    ready = pyqtSignal(int, QPixmap)
-
-
-class _FilmThumbTask(QRunnable):
-    """Generates a filmstrip thumbnail on cache miss.
-
-    For images: reads via QImageReader with scaled size so full-res DSLR files
-    aren't decoded into memory.
-
-    For videos: shells out to ffmpeg via `video_thumb.extract_thumb` and writes
-    a sibling `<key>.v.jpg` cache file so future filmstrip / mosaic / gallery
-    visits all hit the same on-disk artifact.
-    """
-    def __init__(self, idx: int, path: str, cache_file: Path, signals: _FilmThumbSignals):
-        super().__init__()
-        self._idx = idx
-        self._path = path
-        self._cache_file = cache_file   # image cache path (.jpg)
-        self._signals = signals
-        self.setAutoDelete(True)
-
-    def run(self):
-        from .media import is_video
-        if is_video(self._path):
-            self._run_video()
-            return
-        self._run_image()
-
-    def _run_image(self):
-        img: QImage | None = None
-        if self._cache_file.exists():
-            img = QImage(str(self._cache_file))
-            if img.isNull():
-                img = None
-        if img is None:
-            reader = QImageReader(self._path)
-            reader.setAutoTransform(True)
-            size = reader.size()
-            if size.isValid() and size.width() > 0 and size.height() > 0:
-                longest = max(size.width(), size.height())
-                if longest > THUMB_MAX_DIM:
-                    scale = THUMB_MAX_DIM / longest
-                    reader.setScaledSize(QSize(
-                        max(1, int(size.width() * scale)),
-                        max(1, int(size.height() * scale)),
-                    ))
-            img = reader.read()
-            if img is None or img.isNull():
-                return
-            try:
-                self._cache_file.parent.mkdir(parents=True, exist_ok=True)
-                img.save(str(self._cache_file), "JPEG", 82)
-            except Exception:
-                pass
-        self._signals.ready.emit(self._idx, QPixmap.fromImage(img))
-
-    def _run_video(self):
-        from .video_thumb import extract_thumb, cache_path_for_video
-        # cache_file path looks like <source>/.picker_cache/<key>.jpg — use the
-        # source folder to compute the dedicated <key>.v.jpg video-thumb path.
-        try:
-            source_folder = self._cache_file.parent.parent
-        except Exception:
-            source_folder = self._cache_file.parent
-        v_cache = cache_path_for_video(str(source_folder), self._path)
-
-        img: QImage | None = None
-        if v_cache.exists():
-            img = QImage(str(v_cache))
-            if img.isNull():
-                img = None
-        if img is None:
-            img = extract_thumb(self._path, v_cache)
-        if img is None or img.isNull():
-            # ffmpeg missing or decode failed → emit a dark placeholder so the
-            # filmstrip still has a tile to draw the play badge on.
-            img = QImage(THUMB_MAX_DIM, int(THUMB_MAX_DIM * 9 / 16),
-                         QImage.Format.Format_RGB32)
-            img.fill(QColor(28, 28, 28))
-        self._signals.ready.emit(self._idx, QPixmap.fromImage(img))
-
-
 class FilmstripBar(QWidget):
+    """Neighbour thumbnails under the viewer. Thumbs come from the shared RAM
+    store (so anything the folder mosaic already decoded shows instantly) and
+    misses go to the shared decode service — no private pools, and nothing is
+    ever decoded on the UI thread."""
+
     jumped = pyqtSignal(int)
 
     HEIGHT = 92
     THUMB_H = 78
     SPACING = 4
     CURRENT_BORDER = 3
-    THUMB_CACHE_MAX = 200
     WHEEL_PAN_STEP = 160
 
     DEST_COLORS = [
@@ -1377,24 +1413,19 @@ class FilmstripBar(QWidget):
 
     def __init__(self, manager: ImageManager, parent=None):
         super().__init__(parent)
+        from . import thumb_store
         self._manager = manager
         self._current = 0
-        self._thumbs: "OrderedDict[int, QPixmap]" = OrderedDict()
+        self._store = thumb_store.store()
+        self._svc = thumb_store.service()
+        self._svc.thumb_ready.connect(self._on_thumb_ready)
         self._rects: list[tuple[int, QRect]] = []
         self._pan = 0                    # extra x offset from manual drag
         self._drag_active = False
         self._drag_start_x = 0
         self._drag_start_pan = 0
         self._drag_moved = False
-        self._pending: set[int] = set()
-        self._signals = _FilmThumbSignals()
-        self._signals.ready.connect(self._on_thumb_ready)
-        self._pool = QThreadPool()
-        self._pool.setMaxThreadCount(2)
-        # Separate single-slot pool for ffmpeg jobs — phone HEVC seeks can take
-        # 10–30s; running 2 in parallel on the same disk just makes both slow.
-        self._video_pool = QThreadPool()
-        self._video_pool.setMaxThreadCount(1)
+        self._pending: set[str] = set()  # paths requested from the service
         self.setFixedHeight(self.HEIGHT)
         self.setAutoFillBackground(True)
         self._apply_bg()
@@ -1443,75 +1474,48 @@ class FilmstripBar(QWidget):
             self._pan = 0
             self.update()
 
-    def _load_visible(self):
-        half = 30
+    def _load_visible(self, half: int = 30):
+        n = len(self._manager.images)
         lo = max(0, self._current - half)
-        hi = min(len(self._manager.images), self._current + half + 1)
-        for i in range(lo, hi):
-            self._ensure_thumb(i)
+        hi = min(n, self._current + half + 1)
+        wanted = set()
+        # Nearest first, so the tiles next to the current photo land first.
+        for d in range(0, half + 1):
+            for i in (self._current + d, self._current - d) if d else (self._current,):
+                if lo <= i < hi:
+                    wanted.add(self._manager.images[i].path)
+                    self._ensure_thumb(i, priority=self._svc.PRI_NEAR - min(d, 4))
+        # Drop queued decodes the strip scrolled away from.
+        for p in self._pending - wanted:
+            self._svc.cancel(p)
+        self._pending &= wanted
 
-    def _ensure_thumb(self, i: int):
-        if i in self._thumbs:
-            self._thumbs.move_to_end(i)
+    def _ensure_thumb(self, i: int, priority: int | None = None):
+        if not (0 <= i < len(self._manager.images)):
             return
-        if i in self._pending:
+        path = self._manager.images[i].path
+        if self._store.contains(path) or path in self._pending:
             return
-        rec = self._manager.images[i]
-        cf = gallery_cache_file(self._manager.source_folder, rec.path)
+        pri = self._svc.PRI_NEAR if priority is None else priority
+        if self._svc.request(path, self._manager.source_folder, pri):
+            self._pending.add(path)
 
-        # For videos, the on-disk thumb lives at <key>.v.jpg (separate from
-        # the image cache namespace). Probe that first so cache hits don't
-        # round-trip through ffmpeg.
-        from .media import is_video
-        if is_video(rec.path):
-            from .video_thumb import cache_path_for_video
-            from . import log
-            v_cache = cache_path_for_video(self._manager.source_folder, rec.path)
-            if v_cache.exists():
-                img = QImage(str(v_cache))
-                if not img.isNull():
-                    self._thumbs[i] = QPixmap.fromImage(img)
-                    while len(self._thumbs) > self.THUMB_CACHE_MAX:
-                        self._thumbs.popitem(last=False)
-                    return
-                log.warn("filmstrip: cached video thumb is unreadable",
-                         cache=str(v_cache))
-            # Cache miss for video — worker will run ffmpeg. Use the
-            # single-slot video pool so ffmpeg invocations queue instead of
-            # competing for the same disk.
-            log.info("filmstrip: dispatching ffmpeg for video",
-                     idx=i, path=rec.path, target=str(v_cache))
-            self._pending.add(i)
-            self._video_pool.start(_FilmThumbTask(i, rec.path, cf, self._signals))
-            return
+    def clear_cache(self):
+        """Forget pending requests (thumbs themselves stay in the shared store)."""
+        self._pending.clear()
 
-        # Image: cache hit — read synchronously (fast).
-        if cf.exists():
-            img = QImage(str(cf))
-            if not img.isNull():
-                self._thumbs[i] = QPixmap.fromImage(img)
-                while len(self._thumbs) > self.THUMB_CACHE_MAX:
-                    self._thumbs.popitem(last=False)
-                return
-        # Cache miss — dispatch a background worker so the tile loads even when
-        # the gallery hasn't scrolled this image into view yet.
-        self._pending.add(i)
-        self._pool.start(_FilmThumbTask(i, rec.path, cf, self._signals))
-
-    @pyqtSlot(int, QPixmap)
-    def _on_thumb_ready(self, idx: int, pm: QPixmap):
-        self._pending.discard(idx)
-        if pm.isNull():
+    @pyqtSlot(str)
+    def _on_thumb_ready(self, path: str):
+        if path not in self._pending:
             return
-        self._thumbs[idx] = pm
-        while len(self._thumbs) > self.THUMB_CACHE_MAX:
-            self._thumbs.popitem(last=False)
+        self._pending.discard(path)
         if self.isVisible():
             self.update()
 
     def _thumb_width(self, idx: int) -> int:
-        pm = self._thumbs.get(idx)
-        if pm and pm.height() > 0:
+        pm = self._store.get(self._manager.images[idx].path) \
+            if 0 <= idx < len(self._manager.images) else None
+        if pm is not None and pm.height() > 0:
             return max(40, int(self.THUMB_H * pm.width() / pm.height()))
         return int(self.THUMB_H * 1.5)   # fallback 3:2
 
@@ -1556,8 +1560,8 @@ class FilmstripBar(QWidget):
         p.end()
 
     def _draw_tile(self, p: QPainter, idx: int, rect: QRect, is_current: bool):
-        pm = self._thumbs.get(idx)
-        if pm and not pm.isNull():
+        pm = self._store.get(self._manager.images[idx].path)
+        if pm is not None:
             p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
             p.drawPixmap(rect, pm)
         else:
@@ -1641,9 +1645,9 @@ class FilmstripBar(QWidget):
         act_copy = menu.addAction("Copy Path")
         act_copy.triggered.connect(lambda: QApplication.clipboard().setText(path))
         menu.addSeparator()
-        act_reveal = menu.addAction("Reveal in Explorer")
+        act_reveal = menu.addAction(external.reveal_label())
         act_reveal.triggered.connect(
-            lambda: __import__("subprocess").Popen(["explorer", "/select,", os.path.normpath(path)])
+            lambda: external.reveal_in_file_manager(path)
         )
         menu.exec(global_pos)
 
@@ -1655,8 +1659,8 @@ class FilmstripBar(QWidget):
                 if r.contains(pos):
                     rec = self._manager.images[idx]
                     tip = os.path.basename(rec.path)
-                    pm = self._thumbs.get(idx)
-                    if pm and pm.height() > 0:
+                    pm = self._store.get(rec.path)
+                    if pm is not None and pm.height() > 0:
                         tip += f"\n{pm.width()}×{pm.height()}"
                     self.setToolTip(tip)
                     return
@@ -1790,8 +1794,8 @@ class SlideshowView(QWidget):
     title_changed = pyqtSignal()
     files_changed = pyqtSignal()   # a move/delete changed the folder's file set
 
-    PIXMAP_CACHE_MAX = 12
-    PIXMAP_CACHE_MAX_BYTES = 512 * 1024 * 1024  # 512 MB
+    # Decode priorities: the photo on screen always jumps the queue.
+    _PRI_CURRENT = 100
 
     def __init__(self, manager: ImageManager, start_idx: int, parent=None,
                  filmstrip_hidden: bool = False):
@@ -1800,10 +1804,12 @@ class SlideshowView(QWidget):
         self._idx = start_idx
         self._current_dest = 0
         self._last_transfer: dict | None = None   # one-level undo for move/copy/delete
-        self._pixmap_cache: "OrderedDict[int, QPixmap]" = OrderedDict()
-        self._pixmap_cache_bytes = 0
-        self._inflight: set[int] = set()
-        self._load_t0: dict[int, float] = {}   # idx → perf_counter at dispatch
+        # Decoded frames live in the module-level _FRAMES cache (path-keyed, RAM
+        # budgeted, survives this view). In-flight decodes are tracked by path
+        # so stale queued ones can be cancelled when navigation outruns them.
+        self._inflight: dict[str, ImageLoadTask] = {}
+        self._load_t0: dict[str, float] = {}   # path → perf_counter at dispatch
+        self._nav_dir = 1                      # +1 forward / -1 back: biases preloading
         self._info_panel_visible = False
         self._compare_view = None
         self._filmstrip_deferred = filmstrip_hidden
@@ -1824,8 +1830,7 @@ class SlideshowView(QWidget):
 
         self._loader_signals = _LoaderSignals()
         self._loader_signals.image_ready.connect(self._on_image_ready)
-        self._pool = QThreadPool()
-        self._pool.setMaxThreadCount(max(2, (os.cpu_count() or 4) // 2))
+        self._pool = _decode_pool()
 
         # Keyboard focus so arrow/ESC reach this widget once embedded.
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -1905,12 +1910,11 @@ class SlideshowView(QWidget):
         self._canvas.set_double_click_enabled(True)
         self._viewer_stack.addWidget(self._canvas)
 
-        from .video_view import VideoView, available as video_available
-        self._video_view = VideoView()
-        self._video_view.playback_finished.connect(self._on_video_finished)
-        self._video_view.error_occurred.connect(self._on_video_error)
-        self._viewer_stack.addWidget(self._video_view)
-        self._video_available = video_available()
+        # The video player (QtMultimedia import + QMediaPlayer/audio output
+        # construction) is expensive and most folders have no videos — build it
+        # on the first video instead of on every viewer open.
+        self._video_view = None
+        self._video_available = None
 
         mid_layout.addWidget(self._viewer_stack, stretch=1)
 
@@ -2021,24 +2025,10 @@ class SlideshowView(QWidget):
     def on_scan_complete(self):
         if hasattr(self, "_scan_progress"):
             self._scan_progress.setVisible(False)
-        old_idx = self._idx
         if self._current_path:
             self._idx = self._manager.current_index_of(self._current_path)
         self._scan_total = len(self._manager.images)
-
-        # Remap pixmap cache: old seed indices → new post-scan indices.
-        # Keep the current image pixmap so there's no flash.
-        if old_idx != self._idx and old_idx in self._pixmap_cache:
-            pm = self._pixmap_cache.pop(old_idx)
-            self._pixmap_cache[self._idx] = pm
-        # Drop other stale seed entries (their indices shifted)
-        stale = [k for k in self._pixmap_cache if k != self._idx]
-        for k in stale:
-            self._pixmap_cache_bytes -= _pixmap_bytes(self._pixmap_cache.pop(k))
-        self._inflight.clear()
-
-        self._filmstrip._thumbs.clear()
-        self._filmstrip._pending.clear()
+        # Frames and thumbs are keyed by path, so shifted indices need no remap.
         self._filmstrip._current = self._idx
         self._filmstrip._pan = 0
         if self._filmstrip_deferred and self._show_filmstrip:
@@ -2068,7 +2058,9 @@ class SlideshowView(QWidget):
         import time as _time
         elapsed = _time.monotonic() - self._filmstrip_reveal_start
         has_pending = bool(self._filmstrip._pending)
-        if has_pending and elapsed < 10.0:
+        # Brief grace so the strip doesn't slide in empty — but never hold it
+        # back for seconds waiting on slow decodes (they fill in live).
+        if has_pending and elapsed < 0.35:
             return
         self._filmstrip_check_timer.stop()
         self._filmstrip_check_timer.deleteLater()
@@ -2159,21 +2151,18 @@ class SlideshowView(QWidget):
     def _cache_key(self, idx: int) -> tuple | None:
         if idx < 0 or idx >= len(self._manager.images):
             return None
-        rec = self._manager.images[idx]
-        try:
-            mtime = int(os.path.getmtime(rec.path))
-        except OSError:
-            mtime = 0
-        return (rec.path, mtime)
+        return _frame_key(self._manager.images[idx].path)
 
     def _load_image(self, idx: int):
         if idx < 0 or idx >= len(self._manager.images):
             return
         self._stop_movie()   # halt any animation from the image we're leaving
+        if idx != self._idx:
+            self._nav_dir = 1 if idx > self._idx else -1
         self._idx = idx
         rec = self._manager.images[idx]
         self._current_path = rec.path
-        settings_mod.save_position(self._manager.source_folder, idx)
+        settings_mod.save_position(self._manager.source_folder, idx)   # in-memory; written lazily
         self._filmstrip.set_current(idx)
 
         from .media import is_video
@@ -2182,13 +2171,15 @@ class SlideshowView(QWidget):
             return
 
         # Came from a video item — make sure playback stops before we paint a still.
-        try:
-            self._video_view.cleanup()
-        except Exception:
-            pass
+        if self._video_view is not None:
+            try:
+                self._video_view.cleanup()
+            except Exception:
+                pass
         self._viewer_stack.setCurrentWidget(self._canvas)
+        self._canvas.set_rating(self._current_rating())
 
-        key = self._cache_key(idx)
+        key = _frame_key(rec.path)
         rotation = self._manager.rotations.get(rec.filename, 0)
 
         # Animated GIF / WEBP / APNG → play frames via QMovie instead of a still.
@@ -2205,35 +2196,49 @@ class SlideshowView(QWidget):
         # Overlay positions read once on slideshow init (settings rarely change mid-session)
         self._canvas.set_overlay_positions(self._exif_pos, self._hist_pos)
 
-        if idx in self._pixmap_cache:
-            self._pixmap_cache.move_to_end(idx)
+        pm = _FRAMES.get(key)
+        if pm is not None:
             self._canvas.set_raw_loading(False)
-            self._canvas.set_pixmap(self._pixmap_cache[idx], key=key, rotation=rotation)
+            self._canvas.set_pixmap(pm, key=key, rotation=rotation)
             self._maybe_show_peaking_toast()
             self._update_status()
             return
 
-        # Progressive: show cached thumbnail first, then load full-res
-        cf = gallery_cache_file(self._manager.source_folder, rec.path)
-        if cf.exists():
-            ph = QPixmap(str(cf))
-            if ph.isNull():
-                ph = QPixmap(400, 300)
-                ph.fill(QColor(20, 20, 20))
-        else:
+        # Progressive: show the thumbnail first (RAM store — usually already
+        # decoded by the folder mosaic or filmstrip), then the full frame.
+        from . import thumb_store
+        ph = thumb_store.store().get(rec.path)
+        if ph is None:
+            try:
+                cf = gallery_cache_file(self._manager.source_folder, rec.path)
+                ph = QPixmap(str(cf)) if cf.exists() else None
+            except OSError:
+                ph = None
+        if ph is None or ph.isNull():
             ph = QPixmap(400, 300)
             ph.fill(QColor(20, 20, 20))
         self._canvas.set_pixmap(ph, key=None, rotation=rotation)
         is_raw = raw_loader.is_raw(rec.path) and raw_loader.available()
         self._canvas.set_raw_loading(is_raw)
         self._update_status()
-        self._start_load(idx)
+        self._start_load(idx, self._PRI_CURRENT)
 
     _VIDEO_SIZE_WARN_BYTES = 4 * 1024 * 1024 * 1024  # 4 GB
 
+    def _ensure_video_view(self) -> bool:
+        if self._video_available is None:
+            from .video_view import VideoView, available as video_available
+            self._video_available = video_available()
+            if self._video_available:
+                self._video_view = VideoView()
+                self._video_view.playback_finished.connect(self._on_video_finished)
+                self._video_view.error_occurred.connect(self._on_video_error)
+                self._viewer_stack.addWidget(self._video_view)
+        return bool(self._video_available)
+
     def _load_video(self, rec):
         """Switch the viewer stack to the video player and start playback."""
-        if not self._video_available:
+        if not self._ensure_video_view():
             self._viewer_stack.setCurrentWidget(self._canvas)
             self._canvas.set_error("Video playback unavailable — the multimedia "
                                    "component is missing")
@@ -2250,25 +2255,32 @@ class SlideshowView(QWidget):
         self._video_view.load(rec.path, autoplay=True)
         self._update_status()
 
-    def _start_load(self, idx: int):
+    def _start_load(self, idx: int, priority: int = 0):
         if idx < 0 or idx >= len(self._manager.images):
             return
-        if idx in self._pixmap_cache or idx in self._inflight:
+        path = self._manager.images[idx].path
+        pend = self._inflight.get(path)
+        if pend is not None:
+            # Already queued: if it's now the photo on screen, jump the queue.
+            if priority >= self._PRI_CURRENT and self._pool.tryTake(pend):
+                self._pool.start(pend, priority)
             return
         # Don't dispatch the image loader for video files — videos are streamed
         # directly through QMediaPlayer.
         from .media import is_video
-        path = self._manager.images[idx].path
         if is_video(path):
+            return
+        if _frame_key(path) in _FRAMES:
             return
         # Animated images play through QMovie, not the static decoder — skip so
         # preloading GIF/WEBP neighbours doesn't waste a decode.
         if self._is_animated_cached(path):
             return
-        self._inflight.add(idx)
-        self._load_t0[idx] = time.perf_counter()
-        task = ImageLoadTask(self._manager, idx, self._loader_signals)
-        self._pool.start(task)
+        task = ImageLoadTask(path, display_pct(self._manager.resolution_pct),
+                             self._loader_signals)
+        self._inflight[path] = task
+        self._load_t0[path] = time.perf_counter()
+        self._pool.start(task, priority)
 
     @pyqtSlot()
     def _on_video_finished(self):
@@ -2284,49 +2296,43 @@ class SlideshowView(QWidget):
                                "or use an unsupported codec")
         self._update_status()
 
-    def _preload(self, idx: int):
-        self._start_load(idx)
+    def _preload(self, idx: int, priority: int = 0):
+        self._start_load(idx, priority)
 
-    @pyqtSlot(int, QImage)
-    def _on_image_ready(self, idx: int, img: QImage):
-        self._inflight.discard(idx)
-        t0 = self._load_t0.pop(idx, None)
+    def _current_index_is(self, path: str) -> bool:
+        return (0 <= self._idx < len(self._manager.images)
+                and self._manager.images[self._idx].path == path)
+
+    @pyqtSlot(str, QImage)
+    def _on_image_ready(self, path: str, img: QImage):
+        self._inflight.pop(path, None)
+        t0 = self._load_t0.pop(path, None)
+        is_current = self._current_index_is(path)
         # Null image = decode failed. Don't cache it; show a one-line error if
         # it's the photo currently on screen (a failed preload just stays absent
         # so it retries when navigated to).
         if img.isNull():
             if t0 is not None:
-                rec = self._manager.images[idx] if idx < len(self._manager.images) else None
-                log.warn("image.decode failed",
-                         file=os.path.basename(rec.path) if rec else "?", idx=idx)
-            if idx == self._idx:
+                log.warn("image.decode failed", file=os.path.basename(path))
+            if is_current:
                 self._canvas.set_error("Couldn't open this image — the file may be "
                                        "corrupt or an unsupported format")
                 self._update_status()
             return
         if t0 is not None:
             ms = (time.perf_counter() - t0) * 1000
-            rec = self._manager.images[idx] if idx < len(self._manager.images) else None
-            log.info("image.decode", file=os.path.basename(rec.path) if rec else "?",
-                     idx=idx, current=(idx == self._idx),
+            log.info("image.decode", file=os.path.basename(path), current=is_current,
                      px=f"{img.width()}x{img.height()}", ms=f"{ms:.1f}")
         pixmap = QPixmap.fromImage(img)
-        self._pixmap_cache[idx] = pixmap
-        self._pixmap_cache.move_to_end(idx)
-        self._pixmap_cache_bytes += _pixmap_bytes(pixmap)
-        while (len(self._pixmap_cache) > self.PIXMAP_CACHE_MAX
-               or self._pixmap_cache_bytes > self.PIXMAP_CACHE_MAX_BYTES):
-            if len(self._pixmap_cache) <= 1:
-                break
-            _, evicted = self._pixmap_cache.popitem(last=False)
-            self._pixmap_cache_bytes -= _pixmap_bytes(evicted)
-        if idx == self._idx:
-            rec = self._manager.images[idx]
+        key = _frame_key(path)
+        _FRAMES.put(key, pixmap)
+        if is_current:
+            rec = self._manager.images[self._idx]
             rotation = self._manager.rotations.get(rec.filename, 0)
             self._canvas.set_raw_loading(False)
-            self._canvas.set_pixmap(pixmap, key=self._cache_key(idx), rotation=rotation)
+            self._canvas.set_pixmap(pixmap, key=key, rotation=rotation)
             self._maybe_show_peaking_toast()
-        self._update_status()
+            self._update_status()
 
     def _maybe_show_peaking_toast(self):
         if self._canvas.show_peaking:
@@ -2335,9 +2341,32 @@ class SlideshowView(QWidget):
     # ── Navigation & actions ───────────────────────────────────────────────────
 
     def _preload_neighbors(self):
-        for off in range(1, self._preload_count + 1):
-            self._preload(self._idx + off)
-            self._preload(self._idx - off)
+        """Pre-decode around the current photo, biased toward the direction of
+        travel (people flick forward far more than back). With RAM to spare the
+        look-ahead grows. Queued decodes that fell outside the window are
+        cancelled so holding an arrow key never builds a backlog."""
+        from . import sysmem
+        n = len(self._manager.images)
+        base = self._preload_count
+        roomy = sysmem.available_bytes() > 6 * 1024 ** 3
+        ahead = base * (3 if roomy else 2)
+        behind = base
+        d = self._nav_dir
+        window: list[tuple[int, int]] = []   # (idx, priority)
+        for off in range(1, ahead + 1):
+            window.append((self._idx + d * off, 50 - off))
+        for off in range(1, behind + 1):
+            window.append((self._idx - d * off, 40 - off))
+        keep = {self._manager.images[i].path for i, _ in window if 0 <= i < n}
+        if 0 <= self._idx < n:
+            keep.add(self._manager.images[self._idx].path)
+        for path, task in list(self._inflight.items()):
+            if path not in keep and self._pool.tryTake(task):
+                self._inflight.pop(path, None)
+                self._load_t0.pop(path, None)
+        for i, pri in window:
+            if 0 <= i < n:
+                self._start_load(i, pri)
 
     # Only these container formats can hold multiple frames — everything else
     # (jpg/heic/tiff/raw/svg/…) skips the frame-count probe entirely.
@@ -2444,6 +2473,25 @@ class SlideshowView(QWidget):
         dest_name = self._manager.destinations[self._current_dest]["name"]
         self._toast.show_message(f"Destination: {dest_name}", ms=1000)
 
+    def _current_rating(self) -> int:
+        if 0 <= self._idx < len(self._manager.images):
+            return ratings_mod.get(self._manager.source_folder,
+                                   self._manager.images[self._idx].path)
+        return 0
+
+    def _set_rating(self, stars: int):
+        """Set the current image's star rating; pressing the same value clears it."""
+        if self._idx < 0 or self._idx >= len(self._manager.images):
+            return
+        path = self._manager.images[self._idx].path
+        if ratings_mod.get(self._manager.source_folder, path) == stars:
+            stars = 0   # toggle off
+        applied = ratings_mod.set_rating(self._manager.source_folder, path, stars)
+        self._canvas.set_rating(applied)
+        self._filmstrip.refresh()
+        self._toast.show_message("☆ Rating cleared" if applied == 0
+                                 else "★" * applied + "☆" * (5 - applied), ms=900)
+
     def _send_to(self, dest_idx: int):
         if dest_idx < 0 or dest_idx >= len(self._manager.destinations):
             return
@@ -2534,10 +2582,10 @@ class SlideshowView(QWidget):
         self._toast.show_message(f"✓  Saved: {name}", ms=1800)
         if reset_rotation:
             self._manager.rotations.pop(rec.filename, None)
-        evicted = self._pixmap_cache.pop(self._idx, None)
-        if evicted is not None:
-            self._pixmap_cache_bytes -= _pixmap_bytes(evicted)
-        self._inflight.discard(self._idx)
+        _FRAMES.drop_path(rec.path)
+        self._inflight.pop(rec.path, None)
+        from . import thumb_store
+        thumb_store.store().invalidate(rec.path)   # overwrite changed the pixels
         if overwrite:
             self._load_image(self._idx)
         else:
@@ -2623,7 +2671,8 @@ class SlideshowView(QWidget):
 
         # ── Video-mode key intercepts ────────────────────────────────────────
         from .media import is_video as _is_video
-        cur_is_video = _is_video(self._manager.images[self._idx].path)
+        cur_is_video = (self._video_view is not None
+                        and _is_video(self._manager.images[self._idx].path))
         if cur_is_video:
             if not ctrl:
                 if key == Qt.Key.Key_Space:
@@ -2740,15 +2789,12 @@ class SlideshowView(QWidget):
                 self._toast.show_message(
                     "No Selection locations yet — right-click → Selection", ms=2500)
         elif ctrl and Qt.Key.Key_1 <= key <= Qt.Key.Key_9:
-            self._send_to_location(key - Qt.Key.Key_1)    # Ctrl+1..9
+            self._send_to_location(key - Qt.Key.Key_1)    # Ctrl+1..9 = cull to Selection
+        elif not ctrl and Qt.Key.Key_1 <= key <= Qt.Key.Key_5:
+            # 1..5 set the star rating (press the same number again to clear).
+            self._set_rating(key - Qt.Key.Key_0)
         elif has_dest and key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
             self._send_to(self._current_dest)
-        elif has_dest and key == Qt.Key.Key_1:
-            self._send_to(0)
-        elif has_dest and key == Qt.Key.Key_2:
-            self._send_to(1)
-        elif has_dest and key == Qt.Key.Key_3:
-            self._send_to(2)
         elif has_dest and key == Qt.Key.Key_Tab:
             self._cycle_dest()
         elif ctrl and key == Qt.Key.Key_C:
@@ -2822,7 +2868,7 @@ class SlideshowView(QWidget):
                 ("O", "System default"),
                 ("Ctrl+O", "Open with…"),
                 ("Ctrl+C", "Copy image to clipboard"),
-                ("E", "Reveal in Explorer"),
+                ("E", external.reveal_label()),
             ]),
             ("COMPARE", [
                 ("V", "Side-by-side compare"),
@@ -2907,12 +2953,11 @@ class SlideshowView(QWidget):
         if self._idx < 0 or self._idx >= len(self._manager.images):
             return
         path = self._manager.images[self._idx].path
-        import subprocess
-        try:
-            subprocess.Popen(["explorer", "/select,", os.path.normpath(path)])
-            self._toast.show_message("Opened in Explorer", ms=1200)
-        except Exception as exc:
-            self._toast.show_message(f"Error: {exc}", ms=3000)
+        err = external.reveal_in_file_manager(path)
+        if err:
+            self._toast.show_message(f"Error: {err}", ms=3000)
+        else:
+            self._toast.show_message("Revealed", ms=1200)
 
     # ── Right-click menu (all actions) ───────────────────────────────────────
 
@@ -3031,7 +3076,7 @@ class SlideshowView(QWidget):
             act_copy_img.triggered.connect(self._copy_image_to_clipboard)
         act_copy = menu.addAction(menu_icon("copy_path"), "Copy Path")
         act_copy.triggered.connect(lambda: QApplication.clipboard().setText(path))
-        act_reveal = menu.addAction(menu_icon("reveal"), "Reveal in Explorer")
+        act_reveal = menu.addAction(menu_icon("reveal"), external.reveal_label())
         act_reveal.setShortcut("E")
         act_reveal.triggered.connect(self._reveal_in_explorer)
 
@@ -3314,28 +3359,36 @@ class SlideshowView(QWidget):
         """Called by MainWindow before this view is removed from the stack.
         Embedded widgets don't get closeEvent — do worker pool teardown here."""
         self._stop_movie()
+        ratings_mod.flush(self._manager.source_folder)   # persist star ratings
         if self._compare_view is not None:
             self._compare_view.cleanup()
             self._compare_view = None
+        # Cancel our queued decodes on the shared pool — no blocking wait; a
+        # decode already running just finishes into the frame cache.
+        for task in list(self._inflight.values()):
+            try:
+                self._pool.tryTake(task)
+            except Exception:
+                pass
+        self._inflight.clear()
         try:
-            self._pool.clear()
-            self._pool.waitForDone(200)
-        except Exception:
+            self._loader_signals.image_ready.disconnect(self._on_image_ready)
+        except (TypeError, RuntimeError):
             pass
-        # Drain filmstrip thumb pools too (image + ffmpeg pools live on the
-        # FilmstripBar; without explicit waitForDone, queued ffmpeg jobs
-        # would keep running after the slideshow tore down).
+        # Filmstrip: cancel its queued thumbnail requests on the shared service.
         try:
             if hasattr(self, "_filmstrip"):
                 fs = self._filmstrip
-                fs._pool.clear(); fs._pool.waitForDone(200)
-                fs._video_pool.clear(); fs._video_pool.waitForDone(500)
+                for p in fs._pending:
+                    fs._svc.cancel(p)
+                fs._pending.clear()
+                fs._svc.thumb_ready.disconnect(fs._on_thumb_ready)
         except Exception:
             pass
         # Stop the video player so it releases the file handle (Windows holds
         # an exclusive lock on open media files until the source is cleared).
         try:
-            if hasattr(self, "_video_view"):
+            if self._video_view is not None:
                 self._video_view.cleanup()
         except Exception:
             pass
@@ -3364,8 +3417,7 @@ class CompareView(QWidget):
         self._dims: dict[str, tuple[int, int]] = {}   # side -> (w, h) once loaded
         self._loader_signals = _LoaderSignals()
         self._loader_signals.image_ready.connect(self._on_image_ready)
-        self._pool = QThreadPool()
-        self._pool.setMaxThreadCount(2)
+        self._pool = _decode_pool()
 
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self._build_ui()
@@ -3500,30 +3552,48 @@ class CompareView(QWidget):
         self._head_a.setText(self._head_html("a", self._idx_a))
         self._head_b.setText(self._head_html("b", self._idx_b))
 
-    def _start_load(self, idx: int, slot: str):
-        if idx < 0 or idx >= len(self._manager.images):
-            return
-        task = ImageLoadTask(self._manager, idx, self._loader_signals)
-        self._pool.start(task)
+    def _path_at(self, idx: int) -> str | None:
+        imgs = self._manager.images
+        return imgs[idx].path if 0 <= idx < len(imgs) else None
 
-    @pyqtSlot(int, QImage)
-    def _on_image_ready(self, idx: int, img: QImage):
+    def _start_load(self, idx: int, slot: str):
+        path = self._path_at(idx)
+        if path is None:
+            return
+        # Frames already decoded by the viewer (or an earlier compare) are instant.
+        pm = _FRAMES.get(_frame_key(path))
+        if pm is not None:
+            self._apply(path, pm)
+            return
+        self._tasks = getattr(self, "_tasks", [])
+        task = ImageLoadTask(path, display_pct(self._manager.resolution_pct),
+                             self._loader_signals)
+        self._tasks.append(task)
+        self._pool.start(task, 60)
+
+    def _apply(self, path: str, pm: QPixmap):
+        if path == self._path_at(self._idx_a):
+            self._dims["a"] = (pm.width(), pm.height())
+            self._canvas_a.set_pixmap(pm, key=("cmp_a", path))
+        if path == self._path_at(self._idx_b):
+            self._dims["b"] = (pm.width(), pm.height())
+            self._canvas_b.set_pixmap(pm, key=("cmp_b", path))
+        self._update_header()
+
+    @pyqtSlot(str, QImage)
+    def _on_image_ready(self, path: str, img: QImage):
+        self._tasks = [t for t in getattr(self, "_tasks", []) if t._path != path]
         # Null image = decode failed — show the one-line error, not a blank pane.
         if img.isNull():
-            if idx == self._idx_a:
+            if path == self._path_at(self._idx_a):
                 self._canvas_a.set_error("Couldn't open this image")
-            if idx == self._idx_b:
+            if path == self._path_at(self._idx_b):
                 self._canvas_b.set_error("Couldn't open this image")
             self._update_header()
             return
         pm = QPixmap.fromImage(img)
-        if idx == self._idx_a:
-            self._dims["a"] = (img.width(), img.height())
-            self._canvas_a.set_pixmap(pm, key=("cmp_a", idx))
-        if idx == self._idx_b:
-            self._dims["b"] = (img.width(), img.height())
-            self._canvas_b.set_pixmap(pm, key=("cmp_b", idx))
-        self._update_header()
+        _FRAMES.put(_frame_key(path), pm)
+        self._apply(path, pm)
 
     # ── Navigation ─────────────────────────────────────────────────────────────
     def _nav_active(self, delta: int):
@@ -3599,8 +3669,13 @@ class CompareView(QWidget):
             super().keyPressEvent(event)
 
     def cleanup(self):
+        for task in getattr(self, "_tasks", []):
+            try:
+                self._pool.tryTake(task)
+            except Exception:
+                pass
+        self._tasks = []
         try:
-            self._pool.clear()
-            self._pool.waitForDone(200)
-        except Exception:
+            self._loader_signals.image_ready.disconnect(self._on_image_ready)
+        except (TypeError, RuntimeError):
             pass

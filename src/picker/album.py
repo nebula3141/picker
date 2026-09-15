@@ -36,9 +36,19 @@ class Folder:
 
 @dataclass(frozen=True)
 class ImageItem:
-    """An image file directly inside the currently-browsed folder."""
+    """An image file directly inside the currently-browsed folder.
+
+    ``mtime``/``size`` come straight from the directory listing (free on Windows,
+    where scandir returns them with the name), so caches can validate entries
+    without a per-file ``stat`` syscall on the UI thread."""
     path: str
     name: str
+    mtime: float | None = None
+    size: int = 0
+
+    @property
+    def sig(self) -> tuple[int, int] | None:
+        return (int(self.mtime), int(self.size)) if self.mtime is not None else None
 
 
 def _is_hidden(name: str) -> bool:
@@ -103,40 +113,111 @@ def scan_albums(
 
 # ── Folder-tree (Picasa-style) browsing ───────────────────────────────────────
 
+# Recursive (count, cover) per folder, filled as a side effect of every walk.
+# Walking folder X records the result for X *and every folder beneath it*, so
+# drilling down the tree never re-walks a subtree that was already counted one
+# level up (the old code re-walked the whole subtree at every depth).
+import threading as _threading
+
+_STAT_CACHE: dict[str, tuple[int, str]] = {}
+_STAT_LOCK = _threading.Lock()
+_STAT_CACHE_MAX = 50_000
+
+
+def _nkey(p: str) -> str:
+    return os.path.normcase(os.path.abspath(p))
+
+
+def cached_folder_stat(folder: str) -> tuple[int, str] | None:
+    with _STAT_LOCK:
+        return _STAT_CACHE.get(_nkey(folder))
+
+
+def invalidate_folder_stats(path: str | None = None) -> None:
+    """Forget cached counts for ``path`` and all its ancestors (their recursive
+    totals include it), or everything when ``path`` is None."""
+    with _STAT_LOCK:
+        if path is None:
+            _STAT_CACHE.clear()
+            return
+        cur = _nkey(path)
+        while True:
+            _STAT_CACHE.pop(cur, None)
+            parent = os.path.dirname(cur)
+            if parent == cur:
+                break
+            cur = parent
+
+
 def _walk_count_and_cover(
     folder: str,
     exts: set[str],
     exclude_hidden: bool,
+    cancelled: Callable[[], bool] | None = None,
 ) -> tuple[int, str]:
     """Recursive count + best cover-file path under ``folder``.
 
     Cover preference: an image (cheap to decode via QImageReader) over a video
     (requires ffmpeg). Falls back to a video only if the subtree contains no
-    image at all.
+    image at all. Every sub-folder's own result is memoised on the way back up.
     """
     from .image_manager import SUPPORTED_EXTENSIONS as _IMAGE_EXTS
-    count = 0
-    image_cover = ""
-    video_cover = ""
-    for dirpath, dirnames, filenames in os.walk(folder, followlinks=False):
-        if exclude_hidden:
-            dirnames[:] = [
-                n for n in dirnames
-                if not _is_hidden(n) and n != ".picker_cache"
-            ]
-            filenames = [n for n in filenames if not n.startswith(".")]
-        files = sorted(n for n in filenames if Path(n).suffix.lower() in exts)
-        if not files:
-            continue
-        count += len(files)
-        if not image_cover:
-            for n in files:
-                if Path(n).suffix.lower() in _IMAGE_EXTS:
-                    image_cover = os.path.join(dirpath, n)
-                    break
-        if not video_cover:
-            video_cover = os.path.join(dirpath, files[0])
-    return count, (image_cover or video_cover)
+    results: dict[str, tuple[int, str]] = {}
+
+    def walk(path: str, depth: int) -> tuple[int, str, str]:
+        key = _nkey(path)
+        with _STAT_LOCK:
+            hit = _STAT_CACHE.get(key)
+        if hit is not None:
+            cov = hit[1]
+            is_img = bool(cov) and Path(cov).suffix.lower() in _IMAGE_EXTS
+            return hit[0], (cov if is_img else ""), ("" if is_img else cov)
+        if (cancelled is not None and cancelled()) or depth > 64:
+            return 0, "", ""
+        try:
+            entries = sorted(os.scandir(path), key=lambda e: e.name.lower())
+        except OSError:
+            return 0, "", ""
+        count = 0
+        image_cover = ""
+        video_cover = ""
+        subdirs = []
+        for e in entries:
+            name = e.name
+            try:
+                if e.is_dir(follow_symlinks=False):
+                    if exclude_hidden and (_is_hidden(name) or name == ".picker_cache"):
+                        continue
+                    subdirs.append(e.path)
+                elif e.is_file(follow_symlinks=False):
+                    if exclude_hidden and name.startswith("."):
+                        continue
+                    ext = os.path.splitext(name)[1].lower()
+                    if ext not in exts:
+                        continue
+                    count += 1
+                    if not image_cover and ext in _IMAGE_EXTS:
+                        image_cover = e.path
+                    elif not video_cover:
+                        video_cover = e.path
+            except OSError:
+                continue
+        for sd in subdirs:
+            c, ic, vc = walk(sd, depth + 1)
+            count += c
+            image_cover = image_cover or ic
+            video_cover = video_cover or vc
+        if not (cancelled is not None and cancelled()):
+            results[key] = (count, image_cover or video_cover)
+        return count, image_cover, video_cover
+
+    count, ic, vc = walk(folder, 0)
+    if results:
+        with _STAT_LOCK:
+            if len(_STAT_CACHE) + len(results) > _STAT_CACHE_MAX:
+                _STAT_CACHE.clear()
+            _STAT_CACHE.update(results)
+    return count, (ic or vc)
 
 
 def _resolve_scan_opts(extensions, exclude_hidden):
@@ -204,19 +285,34 @@ def scan_path(
                     ))
             elif e.is_file(follow_symlinks=False):
                 if Path(name).suffix.lower() in extensions:
-                    images.append(ImageItem(path=e.path, name=name))
+                    try:
+                        st = e.stat(follow_symlinks=False)   # cached by scandir on Windows
+                        mtime, size = st.st_mtime, st.st_size
+                    except OSError:
+                        mtime, size = None, 0
+                    images.append(ImageItem(path=e.path, name=name, mtime=mtime, size=size))
         except OSError:
             continue
 
     return folders, images
 
 
+def list_images(path: str, extensions: set[str] | None = None,
+                exclude_hidden: bool | None = None) -> list[ImageItem]:
+    """The media files directly inside ``path`` (sorted, with stat fields)."""
+    return scan_path(path, extensions, exclude_hidden, deep=False)[1]
+
+
 def folder_stat(
     folder_path: str,
     extensions: set[str] | None = None,
     exclude_hidden: bool | None = None,
+    cancelled: Callable[[], bool] | None = None,
 ) -> tuple[int, str]:
     """Recursive image count + best cover for a single folder. Runs off the UI
     thread to fill in tiles produced by ``scan_path(deep=False)``."""
+    hit = cached_folder_stat(folder_path)
+    if hit is not None:
+        return hit
     extensions, exclude_hidden = _resolve_scan_opts(extensions, exclude_hidden)
-    return _walk_count_and_cover(folder_path, extensions, exclude_hidden)
+    return _walk_count_and_cover(folder_path, extensions, exclude_hidden, cancelled)

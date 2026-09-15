@@ -6,8 +6,8 @@ gallery of one folder" behavior as the default startup view.
 """
 import os
 
-from PyQt6.QtCore import Qt, QSize, pyqtSignal
-from PyQt6.QtGui import QPixmap, QFont, QColor, QPainter
+from PyQt6.QtCore import Qt, QSize, QObject, QRunnable, QThreadPool, pyqtSignal
+from PyQt6.QtGui import QPixmap, QFont, QColor, QPainter, QImage, QImageReader
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QScrollArea,
     QGridLayout, QFrame, QSizePolicy,
@@ -23,6 +23,57 @@ CARD_H = 220
 COVER_H = 150
 MIN_COLS = 1
 MAX_COLS = 8
+
+
+# ── Background card data ───────────────────────────────────────────────────────
+# Each card used to run two index queries AND decode its cover photo at full
+# resolution (a 24-50 MP JPEG) on the UI thread while the home screen was being
+# built — the app's very first screen stalled for every library folder. Now the
+# cards paint immediately and a worker fills in count + a screen-sized cover.
+
+class _CardSignals(QObject):
+    ready = pyqtSignal(str, int, QImage)   # root path, photo count, cover (may be null)
+
+
+class _CardTask(QRunnable):
+    def __init__(self, root: dict, signals: _CardSignals):
+        super().__init__()
+        self._root, self._signals = dict(root), signals
+        self.setAutoDelete(True)
+
+    def run(self):
+        from .thumb_store import lower_worker_priority
+        lower_worker_priority()
+        path = self._root.get("path", "")
+        try:
+            n = index_mod.folder_count_recursive(path)
+        except Exception:
+            n = 0
+        cover = self._root.get("cover") or ""
+        if not (cover and os.path.isfile(cover)):
+            cover = ""
+            try:
+                rows = index_mod.search(root=path, order_by="date_taken", limit=1)
+                if rows:
+                    cover = rows[0]["path"]
+            except Exception:
+                cover = ""
+        img = QImage()
+        if cover:
+            reader = QImageReader(cover)
+            reader.setAutoTransform(True)
+            size = reader.size()
+            if size.isValid() and size.width() > 0 and size.height() > 0:
+                # Decode straight to ~2x card size (crisp on HiDPI) — never full-res.
+                s = max((CARD_W * 2) / size.width(), (COVER_H * 2) / size.height())
+                if s < 1.0:
+                    reader.setScaledSize(QSize(max(1, round(size.width() * s)),
+                                               max(1, round(size.height() * s))))
+            img = reader.read()
+        try:
+            self._signals.ready.emit(path, n, img)
+        except RuntimeError:
+            pass
 
 
 class _RootCard(QFrame):
@@ -58,7 +109,7 @@ class _RootCard(QFrame):
         self._cover.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._cover.setScaledContents(False)
         root_layout.addWidget(self._cover)
-        self._set_cover_pixmap()
+        self._set_cover_pixmap(None)
 
         # Text block
         text = QWidget()
@@ -71,31 +122,19 @@ class _RootCard(QFrame):
         self._label_lbl.setObjectName("label")
         tlay.addWidget(self._label_lbl)
 
-        try:
-            n = index_mod.folder_count_recursive(root["path"])
-        except Exception:
-            n = 0
-        meta = f"{n:,} photo{'s' if n != 1 else ''}" if n else "tap to scan"
-        meta_lbl = QLabel(meta)
-        meta_lbl.setObjectName("meta")
-        tlay.addWidget(meta_lbl)
+        self._meta_lbl = QLabel("…")
+        self._meta_lbl.setObjectName("meta")
+        tlay.addWidget(self._meta_lbl)
 
         root_layout.addWidget(text)
 
-    def _set_cover_pixmap(self):
-        pix = None
-        cover = self._root.get("cover")
-        if cover and os.path.isfile(cover):
-            pix = QPixmap(cover)
-        if pix is None or pix.isNull():
-            try:
-                rows = index_mod.search(
-                    root=self._root["path"], order_by="date_taken", limit=1,
-                )
-                if rows:
-                    pix = QPixmap(rows[0]["path"])
-            except Exception:
-                pix = None
+    def apply_data(self, n: int, cover: QImage):
+        """Worker results: photo count + pre-scaled cover."""
+        self._meta_lbl.setText(f"{n:,} photo{'s' if n != 1 else ''}" if n else "tap to scan")
+        if cover is not None and not cover.isNull():
+            self._set_cover_pixmap(QPixmap.fromImage(cover))
+
+    def _set_cover_pixmap(self, pix: QPixmap | None):
         if pix is None or pix.isNull():
             placeholder = QPixmap(CARD_W, COVER_H)
             placeholder.fill(QColor("#141414"))
@@ -220,7 +259,20 @@ class LibraryView(QWidget):
         self._recents_layout.setSpacing(10)
         outer.addWidget(self._recents_bar)
 
+        self._card_signals = _CardSignals()
+        self._card_signals.ready.connect(self._on_card_data)
+        self._cards_by_path: dict[str, _RootCard] = {}
+
         self.reload()
+
+    def _on_card_data(self, path: str, n: int, cover: QImage):
+        card = self._cards_by_path.get(path)
+        if card is None:
+            return
+        try:
+            card.apply_data(n, cover)
+        except RuntimeError:
+            pass   # card rebuilt / deleted meanwhile
 
     def reload(self):
         """Rebuild card grid and recents row from current library state."""
@@ -255,10 +307,13 @@ class LibraryView(QWidget):
             self._grid.setSpacing(16)
             self._grid.setContentsMargins(0, 0, 0, 0)
             self._cards = []
+            self._cards_by_path = {}
             for r in roots:
                 card = _RootCard(r)
                 card.clicked.connect(self.open_folder.emit)
                 self._cards.append(card)
+                self._cards_by_path[r["path"]] = card
+                QThreadPool.globalInstance().start(_CardTask(r, self._card_signals))
             self._place_cards()
             grid_host = QWidget()
             grid_host.setLayout(self._grid)

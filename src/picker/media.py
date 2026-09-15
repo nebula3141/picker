@@ -75,18 +75,23 @@ def _find_binary(name: str) -> str | None:
     try:
         # When frozen by PyInstaller, sys.executable is the .exe location.
         import sys
+        # Try both the Windows (.exe) and Unix (bare) binary names everywhere.
+        _names = [f"{name}.exe", name] if sys.platform == "win32" else [name, f"{name}.exe"]
         if getattr(sys, "frozen", False):
             # Bundled binaries live in the PyInstaller extraction dir (_MEIPASS):
-            # onefile → a temp dir; onedir → the "_internal" folder. The spec
-            # ships them under a "bin/" subfolder.
+            # onefile → a temp dir; onedir → the "_internal" folder; macOS .app →
+            # Contents/MacOS or Contents/Frameworks. The spec ships them under "bin/".
             meipass = getattr(sys, "_MEIPASS", None)
-            if meipass:
-                candidates.append(Path(meipass) / "bin" / f"{name}.exe")
-                candidates.append(Path(meipass) / f"{name}.exe")
-            # Also honor a binary the user drops next to the executable.
             exe_dir = Path(sys.executable).parent
-            candidates.append(exe_dir / f"{name}.exe")
-            candidates.append(exe_dir / "bin" / f"{name}.exe")
+            for _n in _names:
+                if meipass:
+                    candidates.append(Path(meipass) / "bin" / _n)
+                    candidates.append(Path(meipass) / _n)
+                # Also honor a binary the user drops next to the executable.
+                candidates.append(exe_dir / _n)
+                candidates.append(exe_dir / "bin" / _n)
+                # macOS .app: binary usually sits in Contents/Resources/bin.
+                candidates.append(exe_dir.parent / "Resources" / "bin" / _n)
         else:
             # Dev runs: repo-root bin/ (bundled ffmpeg/ffprobe) then src/.
             here = Path(__file__).resolve()
