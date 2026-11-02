@@ -45,7 +45,7 @@ it's yours too. If it saves you an evening of album-sorting, a ⭐ makes my day.
 | 🏜️ **Runs on anything** | Smart decoding: small images stay pixel-perfect, huge RAW files are decoded just enough to look sharp on *your* screen. A 60 MP file opens instantly on 8 GB RAM. |
 | 📷 **Every RAW format** | Canon CR2/CR3 · Nikon NEF · Sony ARW · DNG · Fuji RAF · Olympus ORF · Panasonic RW2 · Pentax PEF · Samsung SRW — plus JPEG, PNG, TIFF, WEBP, BMP, and **SVG**. |
 | 🔎 **Search that's actually there** | `Ctrl+F` filters the current folder as you type, or flip the scope to **Whole library** and search every indexed photo. |
-| 📁 **Selection** | Save your sorting folders once. Then one click — or `Ctrl+Space` / `Ctrl+1…9` — sends the photo there, copy or move, instantly, with one-tap **Undo**. |
+| 📁 **Selection** | Save your sorting folders once. Then one click — or `Ctrl+Space` / `1…9` — sends the photo there, copy or move, instantly, with one-tap **Undo**. |
 | ⌨️ **Cull at typing speed** | `1/2/3` sorts into destination folders, `Enter` sends, `Ctrl+Z` undoes, arrows navigate. Tear through a 3,000-photo shoot without touching the mouse. |
 | 🔍 **Photographer's tools** | RGB histogram with clipping warning, focus peaking, 1:1 pixel zoom, crop & rotate, EXIF panel, side-by-side **compare** with synced loupe. |
 | 🎞️ **Video, inline** | MP4/MOV/MKV sit right next to your stills — frame-step, scrub, loop, 0.25–4× speed, same filmstrip, same workflow. |
@@ -125,10 +125,11 @@ video thumbnails, nothing crashes.
 ### Sorting
 | Key | Action |
 |-----|--------|
-| `1` / `2` / `3` | Send to destination |
+| `1`…`9` | In Multi Sort: send to that destination (keys are set per destination) |
 | `Enter` | Send to active destination |
 | `Tab` | Cycle destination (drag ⠿ in Sort Photos to reorder) |
-| `Ctrl+Space` / `Ctrl+1…9` | Send to a saved **Selection** location |
+| `Ctrl+Space` / `1…9` | Outside Multi Sort: send to a saved **Selection** location |
+| `Ctrl+1…5` | Star rating (same again clears) |
 | `Ctrl+Z` | Undo |
 
 ### Video
