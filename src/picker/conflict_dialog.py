@@ -13,10 +13,13 @@ from . import theme as theme_mod
 
 
 # Only the rules unique to this dialog; the base comes from theme.dialog_qss().
-_EXTRA_QSS = """
-QLabel#caption { color: #cfcfd6; font-size: 12px; font-weight: 600; }
-QLabel#meta { color: #6f6f78; font-size: 11px; }
-QLabel#preview { background: #0d0d0f; border: 1px solid #26262c; border-radius: 10px; }
+def _extra_qss() -> str:
+    t = theme_mod
+    return f"""
+QLabel#caption {{ color: {t.hexc('fg')}; font-size: 12px; font-weight: 600; }}
+QLabel#meta {{ color: {t.hexc('muted')}; font-size: 11px; }}
+QLabel#preview {{ background: {t.hexc('well')}; border: 1px solid {t.hexc('rail')};
+    border-radius: {t.RADIUS}px; }}
 """
 
 
@@ -27,7 +30,7 @@ class ConflictDialog(QDialog):
         super().__init__(parent)
         self._choice = "cancel"
         self.setWindowTitle("File already exists")
-        self.setStyleSheet(theme_mod.dialog_qss() + _EXTRA_QSS)
+        theme_mod.bind(self, lambda: theme_mod.dialog_qss() + _extra_qss())
         self.setModal(True)
         self.setMinimumWidth(780)
         self._build(src_path, dest_path)

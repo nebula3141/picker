@@ -30,6 +30,9 @@ from PyQt6.QtWidgets import (
     QSizePolicy, QComboBox, QStyle, QStyleOptionSlider,
 )
 
+from . import instrument as inst
+from . import theme as theme_mod
+
 
 class _JumpSlider(QSlider):
     """QSlider variant where a click on the track immediately moves the handle
@@ -146,47 +149,42 @@ class VideoView(QWidget):
             "Install with:  pip install PyQt6-Multimedia"
         )
         msg.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        msg.setStyleSheet("color: #c0c0c0; font-size: 14px; padding: 60px;")
+        theme_mod.bind(msg, lambda: f"color: {theme_mod.hexc('muted')}; font-size: 14px; padding: 60px;")
         outer.addWidget(msg, stretch=1)
 
     def _build_chrome(self) -> QFrame:
         frame = QFrame()
         frame.setObjectName("videoChrome")
-        frame.setStyleSheet("""
-            QFrame#videoChrome {
-                background: rgba(15, 15, 15, 230);
-                border-top: 1px solid rgba(255, 255, 255, 0.06);
-            }
-            QPushButton {
-                background: #2a2a2a; color: #f0f0f0;
-                border: 1px solid #3a3a3a; border-radius: 6px;
-                padding: 6px 12px; font-size: 13px; font-weight: 600;
-                min-width: 38px;
-            }
-            QPushButton:hover { background: #353535; border-color: #4a4a4a; }
-            QPushButton:checked { background: #2f6fe0; border-color: #3b82f6; }
-            QPushButton:disabled { color: #666; background: #1f1f1f; }
-            QLabel { color: #d0d0d0; font-size: 12px; }
-            QComboBox {
-                background: #2a2a2a; color: #f0f0f0;
-                border: 1px solid #3a3a3a; border-radius: 6px;
+        # Transport chrome floats over the picture: a scrim, not glass, so the
+        # controls stay legible on any frame.
+        frame.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        theme_mod.bind(frame, lambda: f"""
+            QFrame#videoChrome {{
+                background: {theme_mod.hexc('scrim')};
+                border-top: 1px solid {theme_mod.hexc('rail')};
+            }}
+            QLabel {{ color: {theme_mod.hexc('fg')}; font-family: "{theme_mod.mono_family()}";
+                      font-size: 12px; background: transparent; }}
+            QComboBox {{
+                background: {theme_mod.hexc('cap_dark')}; color: {theme_mod.hexc('fg')};
+                border: 1px solid {theme_mod.hexc('rail')}; border-radius: {theme_mod.RADIUS}px;
                 padding: 4px 10px; font-size: 12px;
-            }
-            QComboBox::drop-down { border: 0; width: 16px; }
-            QSlider::groove:horizontal {
-                height: 6px; background: #2a2a2a; border-radius: 3px;
-            }
-            QSlider::sub-page:horizontal { background: #3b82f6; border-radius: 3px; }
-            QSlider::handle:horizontal {
-                background: #ffffff; width: 12px; margin: -4px 0;
-                border-radius: 6px;
-            }
+            }}
+            QComboBox::drop-down {{ border: 0; width: 16px; }}
+            QSlider::groove:horizontal {{
+                height: 4px; background: {theme_mod.hexc('rail_light')}; border-radius: 2px;
+            }}
+            QSlider::sub-page:horizontal {{ background: {theme_mod.ACCENT_HEX}; border-radius: 2px; }}
+            QSlider::handle:horizontal {{
+                background: #ffffff; width: 12px; margin: -4px 0; border-radius: 6px;
+            }}
         """)
         lay = QHBoxLayout(frame)
         lay.setContentsMargins(12, 8, 12, 10)
         lay.setSpacing(10)
 
-        self._btn_play = QPushButton("▶")
+        self._btn_play = inst.KeyCap("", variant="dark", icon="play")
+        self._btn_play.setAccessibleName("Play")
         self._btn_play.setCursor(Qt.CursorShape.PointingHandCursor)
         self._btn_play.setToolTip("Play / pause (Space)")
         self._btn_play.clicked.connect(self.toggle_play)
@@ -206,13 +204,15 @@ class VideoView(QWidget):
         self._scrub.sliderReleased.connect(self._on_scrub_released)
         lay.addWidget(self._scrub, stretch=1)
 
-        self._btn_skip_back = QPushButton("⏪")
+        self._btn_skip_back = inst.KeyCap("", variant="dark", icon="skip_back")
+        self._btn_skip_back.setAccessibleName("Back 10 seconds")
         self._btn_skip_back.setCursor(Qt.CursorShape.PointingHandCursor)
         self._btn_skip_back.setToolTip("Back 10s (J)")
         self._btn_skip_back.clicked.connect(lambda: self.step_seconds(-10))
         lay.addWidget(self._btn_skip_back)
 
-        self._btn_skip_fwd = QPushButton("⏩")
+        self._btn_skip_fwd = inst.KeyCap("", variant="dark", icon="skip_fwd")
+        self._btn_skip_fwd.setAccessibleName("Forward 10 seconds")
         self._btn_skip_fwd.setCursor(Qt.CursorShape.PointingHandCursor)
         self._btn_skip_fwd.setToolTip("Forward 10s (L)")
         self._btn_skip_fwd.clicked.connect(lambda: self.step_seconds(10))
@@ -227,14 +227,16 @@ class VideoView(QWidget):
         self._cmb_speed.setToolTip("Playback speed ([ / ])")
         lay.addWidget(self._cmb_speed)
 
-        self._btn_loop = QPushButton("🔁")
+        self._btn_loop = inst.KeyCap("", variant="dark", icon="loop")
+        self._btn_loop.setAccessibleName("Loop")
         self._btn_loop.setCursor(Qt.CursorShape.PointingHandCursor)
         self._btn_loop.setToolTip("Loop (Ctrl+L)")
         self._btn_loop.setCheckable(True)
         self._btn_loop.clicked.connect(self._on_loop_toggled)
         lay.addWidget(self._btn_loop)
 
-        self._btn_mute = QPushButton("🔊")
+        self._btn_mute = inst.KeyCap("", variant="dark", icon="volume")
+        self._btn_mute.setAccessibleName("Mute")
         self._btn_mute.setCursor(Qt.CursorShape.PointingHandCursor)
         self._btn_mute.setToolTip("Mute (M)")
         self._btn_mute.clicked.connect(self.toggle_mute)
@@ -286,7 +288,7 @@ class VideoView(QWidget):
             return
         muted = not self._audio.isMuted()
         self._audio.setMuted(muted)
-        self._btn_mute.setText("🔇" if muted else "🔊")
+        self._btn_mute.set_icon("mute" if muted else "volume", "Unmute" if muted else "Mute")
 
     def step_seconds(self, delta: float):
         """Seek by ±N seconds."""
@@ -379,7 +381,7 @@ class VideoView(QWidget):
 
     def _on_state(self, state):
         playing = state == QMediaPlayer.PlaybackState.PlayingState
-        self._btn_play.setText("⏸" if playing else "▶")
+        self._btn_play.set_icon("pause" if playing else "play", "Pause" if playing else "Play")
 
     def _on_error(self, err):
         if err == QMediaPlayer.Error.NoError:
@@ -424,7 +426,7 @@ class VideoView(QWidget):
         self._audio.setVolume(value / 100.0)
         if value == 0 and not self._audio.isMuted():
             self._audio.setMuted(True)
-            self._btn_mute.setText("🔇")
+            self._btn_mute.set_icon("mute", "Unmute")
         elif value > 0 and self._audio.isMuted():
             self._audio.setMuted(False)
-            self._btn_mute.setText("🔊")
+            self._btn_mute.set_icon("volume", "Mute")

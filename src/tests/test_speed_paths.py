@@ -138,6 +138,84 @@ def qapp():
     return QApplication.instance() or QApplication([])
 
 
+def test_recursive_count_uses_prefix_range(index_dir, tmp_path):
+    """Counting a folder's photos must include subfolders — the query moved off
+    `path LIKE` (unindexable) to a primary-key range scan."""
+    from picker import index
+    from PIL import Image
+    root = tmp_path / "lib"
+    (root / "a").mkdir(parents=True)
+    Image.new("RGB", (4, 4)).save(str(root / "top.jpg"), "JPEG")
+    Image.new("RGB", (4, 4)).save(str(root / "a" / "deep.jpg"), "JPEG")
+    index.scan_root(str(root))
+    assert index.folder_count_recursive(str(root)) == 2
+    assert index.folder_count_recursive(str(root / "a")) == 1
+    assert len(index.files_in_folder(str(root), recursive=True)) == 2
+    assert len(index.files_in_folder(str(root), recursive=False)) == 1
+    # A sibling whose name merely starts with the same characters must not match.
+    lo, hi = index._prefix_range(index._norm(str(root / "a")))
+    assert lo < index._norm(str(root / "a" / "deep.jpg")) < hi
+    assert not (lo < index._norm(str(root / "ab" / "x.jpg")) < hi)
+
+
+def test_listing_cache_roundtrip_and_mtime_guard(settings_dir, tmp_path, monkeypatch):
+    """The folder index survives a restart, but only while the folder is
+    untouched — a changed directory must fall back to a real scan."""
+    from picker import album_browser_view as abv, listing_cache
+    from picker.album import scan_path
+    from PIL import Image
+    folder = tmp_path / "shoot"
+    folder.mkdir()
+    for i in range(3):
+        Image.new("RGB", (6, 4)).save(str(folder / f"p{i}.jpg"), "JPEG")
+    folders, items = scan_path(str(folder), extensions={".jpg"}, exclude_hidden=True)
+    abv._cache_put(str(folder), folders, items, abv._dir_mtime(str(folder)),
+                   {items[0].path: (6, 4)})
+    listing_cache.mark_dirty()
+    listing_cache.save()
+    assert (settings_dir / "listings.json").is_file()
+
+    abv.invalidate_scan_cache()
+    listing_cache._loaded = False
+    listing_cache.load()
+    hit = abv._cache_get(str(folder))
+    assert hit is not None and len(hit[1]) == 3
+    assert hit[3][items[0].path] == (6, 4)          # dimensions came back too
+    assert {it.name for it in hit[1]} == {"p0.jpg", "p1.jpg", "p2.jpg"}
+
+    # Add a file → directory mtime changes → the stale listing is not restored.
+    abv.invalidate_scan_cache()
+    listing_cache._loaded = False
+    Image.new("RGB", (6, 4)).save(str(folder / "new.jpg"), "JPEG")
+    os.utime(folder, (os.path.getmtime(folder) + 10, os.path.getmtime(folder) + 10))
+    listing_cache.load()
+    assert abv._cache_get(str(folder)) is None
+
+
+def test_mosaic_reads_only_nearby_headers(qapp, tmp_path, settings_dir):
+    """A folder with unknown sizes must not read every header up front; only
+    tiles near the viewport are resolved."""
+    from picker import album_browser_view as abv, dim_cache
+    from picker.album import scan_path
+    from PIL import Image
+    dim_cache.reset()
+    folder = tmp_path / "many"
+    folder.mkdir()
+    for i in range(40):
+        Image.new("RGB", (60, 40) if i % 2 else (40, 60)).save(
+            str(folder / f"i{i:03d}.jpg"), "JPEG")
+    _f, items = scan_path(str(folder), extensions={".jpg"}, exclude_hidden=True)
+    m = abv._ImageMosaic(items, str(folder))
+    try:
+        assert len(m._unknown) == len(items)      # nothing known yet
+        assert m._dims_pending == set()           # and nothing queued
+        assert m._headers_done == len(items)      # no "loading" state to report
+        m._request_visible_dims(range(0, 3))
+        assert len(m._dims_pending) == 3          # only what was asked for
+    finally:
+        m.cleanup()
+
+
 def test_store_lru_budget_and_signature(qapp):
     from PyQt6.QtGui import QPixmap
     from picker.thumb_store import ThumbStore

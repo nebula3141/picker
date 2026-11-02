@@ -64,7 +64,7 @@ class WelcomeDialog(QDialog):
         self.setWindowTitle("Welcome to PICker")
         self.setModal(True)
         self.setFixedWidth(_BANNER.width() + 56)
-        self.setStyleSheet(theme_mod.dialog_qss())
+        theme_mod.bind(self, lambda: theme_mod.dialog_qss())
         self._page = 0
 
         outer = QVBoxLayout(self)
@@ -74,8 +74,7 @@ class WelcomeDialog(QDialog):
         self._banner = QLabel()
         self._banner.setFixedSize(_BANNER)
         self._banner.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._banner.setStyleSheet(
-            f"background: {theme_mod.c('bg').name()};"
+        theme_mod.bind(self._banner, lambda: f"background: {theme_mod.c('bg').name()};"
             " border-radius: 12px;")
         outer.addWidget(self._banner, 0, Qt.AlignmentFlag.AlignHCenter)
 
@@ -86,8 +85,7 @@ class WelcomeDialog(QDialog):
 
         self._body = QLabel()
         self._body.setWordWrap(True)
-        self._body.setStyleSheet(
-            f"color: {theme_mod.c('muted').name()}; font-size: 13px; line-height: 150%;")
+        theme_mod.bind(self._body, lambda: f"color: {theme_mod.c('muted').name()}; font-size: 13px; line-height: 150%;")
         self._body.setMinimumHeight(78)
         self._body.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
         outer.addWidget(self._body)
@@ -129,8 +127,7 @@ class WelcomeDialog(QDialog):
             # No screenshot yet — show a subtle numbered placeholder.
             self._banner.setPixmap(QPixmap())
             self._banner.setText(f"{self._page + 1} / {len(_PAGES)}")
-            self._banner.setStyleSheet(
-                f"background: {theme_mod.c('bg').name()};"
+            theme_mod.bind(self._banner, lambda: f"background: {theme_mod.c('bg').name()};"
                 f" color: {theme_mod.c('muted').name()};"
                 " border-radius: 12px; font-size: 32px; font-weight: 800;")
         self._dots.setText("  ".join(

@@ -1,16 +1,40 @@
-"""EXIF extraction via Pillow. Graceful fallback if Pillow missing."""
+"""EXIF extraction via Pillow. Graceful fallback if Pillow missing.
+
+Pillow is imported on first use, not at module import: loading PIL.Image cost
+~50 ms of every app start even though EXIF is only read when the info panel,
+the map action or the library indexer asks for it.
+"""
+import importlib.util
 import os
+import threading
 from collections import OrderedDict
 from fractions import Fraction
 
-try:
-    from PIL import Image, ExifTags
-    _HAVE_PIL = True
-except Exception:
-    _HAVE_PIL = False
+Image = None
+ExifTags = None
+_HAVE_PIL = importlib.util.find_spec("PIL") is not None
+_TAG: dict = {}
+_pil_loaded = False
+_pil_lock = threading.Lock()
 
 
-_TAG = {v: k for k, v in ExifTags.TAGS.items()} if _HAVE_PIL else {}
+def _ensure_pil() -> bool:
+    global Image, ExifTags, _HAVE_PIL, _TAG, _pil_loaded
+    if _pil_loaded:
+        return _HAVE_PIL
+    with _pil_lock:
+        if not _pil_loaded:
+            try:
+                from PIL import Image as _Image, ExifTags as _ExifTags
+                Image, ExifTags = _Image, _ExifTags
+                _TAG = {v: k for k, v in ExifTags.TAGS.items()}
+                _HAVE_PIL = True
+            except Exception:
+                _HAVE_PIL = False
+            # Last, so a concurrent reader never sees "loaded" with _TAG still
+            # empty (it would cache blank camera/date data for the indexer).
+            _pil_loaded = True
+    return _HAVE_PIL
 
 # LRU cache keyed by (path, mtime) — EXIF reads are expensive for RAW files
 _CACHE_MAX = 200
@@ -43,7 +67,7 @@ def _fmt_focal(val) -> str:
 
 def read_exif(path: str) -> dict:
     """Return simplified EXIF dict. Empty dict if unavailable."""
-    if not _HAVE_PIL:
+    if not _ensure_pil():
         return {}
     try:
         mtime = int(os.path.getmtime(path))

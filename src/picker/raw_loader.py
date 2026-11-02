@@ -43,7 +43,8 @@ RAW_EXTENSIONS = {".cr2", ".cr3", ".nef", ".arw", ".dng", ".raf", ".orf", ".rw2"
 
 
 def is_raw(path: str) -> bool:
-    return Path(path).suffix.lower() in RAW_EXTENSIONS
+    import os
+    return os.path.splitext(path)[1].lower() in RAW_EXTENSIONS
 
 
 def available() -> bool:

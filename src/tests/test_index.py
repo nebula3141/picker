@@ -102,3 +102,30 @@ class TestSearch:
         index.scan_root(folder)
         results = index.search(parent=folder, exts=[".png"])
         assert len(results) == 0
+
+
+def test_busy_database_is_never_quarantined(index_dir, monkeypatch):
+    """Lock contention is not corruption: after the retries the error must be
+    raised, and the healthy index file must still be where it was."""
+    import sqlite3
+    from picker import index
+    index.connect().close()                      # create a healthy index
+    path = index.db_path()
+    assert path.exists()
+    real = sqlite3.connect
+
+    def always_busy(*a, **k):
+        conn = real(*a, **k)
+        class Busy:
+            def execute(self, *_a, **_k):
+                raise sqlite3.OperationalError("database is locked")
+            def close(self):
+                conn.close()
+        return Busy()
+    monkeypatch.setattr(index.sqlite3, "connect", always_busy)
+    monkeypatch.setattr(index.time, "sleep", lambda s: None)
+    import pytest
+    with pytest.raises(sqlite3.OperationalError):
+        index.connect()
+    assert path.exists()
+    assert not path.with_suffix(path.suffix + ".corrupt").exists()

@@ -87,3 +87,35 @@ class TestPositions:
             settings_mod.save_position(f"/folder/{i}", i)
         data = settings_mod.load_positions()
         assert len(data) <= settings_mod._POS_CACHE_MAX
+
+
+def test_upgrade_keeps_animation_off(settings_file):
+    """5.0 merges the viewer's animation checkbox into one Animation switch; a
+    4.x user who had animation off must not find it switched back on."""
+    import json
+    from picker import settings
+    settings_file.write_text(json.dumps({"settings_version": 3, "slideshow_animation": False}))
+    data = settings.load()
+    assert data["ui_motion"] is False
+    assert data["settings_version"] == settings.SETTINGS_VERSION
+
+
+def test_new_file_types_switch_on_for_old_settings(settings_file):
+    """SVG (4.9) and HEIC (4.10) were added without an upgrade step, so a
+    File types list saved by 4.8 or earlier skipped them: an SVG folder showed
+    'no photos'. New types switch on; types you've seen and turned off don't."""
+    import json
+    from picker import settings
+    settings_file.write_text(json.dumps({"settings_version": 3,
+                                         "file_types": ["jpeg", "png", "raw"]}))
+    data = settings.load()
+    assert "svg" in data["file_types"] and "heif" in data["file_types"]
+    assert "tiff" not in data["file_types"]        # was offered, stayed off
+    # and a later load keeps a deliberate "off" for a type now known
+    settings._mem = None
+    settings_file.write_text(json.dumps({"settings_version": 4,
+                                         "file_types": ["jpeg"],
+                                         "file_types_known": ["jpeg", "png", "tiff", "webp",
+                                                              "bmp", "heif", "svg", "raw"]}))
+    data = settings.load()
+    assert data["file_types"] == ["jpeg"]

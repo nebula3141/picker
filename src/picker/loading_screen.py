@@ -11,6 +11,8 @@ from PyQt6.QtGui import QPainter, QColor, QFont, QPen, QFontMetrics
 
 from picker.icon import app_icon
 
+from . import theme as theme_mod
+
 
 class ScanCancelled(Exception):
     """Raised out of a scan's progress callback when the user hits Cancel."""
@@ -56,12 +58,11 @@ class LoadingScreen(QDialog):
         if cancellable:
             self._cancel_btn = QPushButton("Cancel", self)
             self._cancel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            self._cancel_btn.setStyleSheet(
-                "QPushButton { background:#1f1f25; color:#cfcfd6;"
-                " border:1px solid #2a2a30; border-radius:8px;"
-                " padding:6px 16px; font-size:12px; }"
-                "QPushButton:hover { border-color:#ef6b6b; color:#fff; }"
-            )
+            theme_mod.bind(self._cancel_btn, lambda: (
+                f"QPushButton {{ background: {theme_mod.hexc('cap_alt')}; color: {theme_mod.hexc('fg')};"
+                f" border: 1px solid {theme_mod.hexc('rail')}; border-radius: {theme_mod.RADIUS}px;"
+                " padding: 6px 16px; font-size: 12px; }"
+                f"QPushButton:hover {{ border-color: {theme_mod.hexc('danger')}; }}"))
             self._cancel_btn.adjustSize()
             self._cancel_btn.move(self.WIDTH - self._cancel_btn.width() - 22,
                                   self.HEIGHT - self._cancel_btn.height() - 16)

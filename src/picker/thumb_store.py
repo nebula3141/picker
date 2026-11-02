@@ -58,8 +58,24 @@ def lower_worker_priority():
         th.setPriority(QThread.Priority.LowestPriority)
 
 
+_npath_memo: dict[str, str] = {}
+_NPATH_MEMO_MAX = 200_000
+
+
 def npath(path: str) -> str:
-    return os.path.normcase(os.path.abspath(path))
+    """Normalised cache key for a path.
+
+    Called for every tile on every paint, so it avoids ``abspath`` (which calls
+    ``getcwd`` and re-normalises) whenever the path is already absolute — every
+    path the scanners produce is — and memoises the rest."""
+    key = _npath_memo.get(path)
+    if key is None:
+        key = (os.path.normcase(path) if os.path.isabs(path)
+               else os.path.normcase(os.path.abspath(path)))
+        if len(_npath_memo) >= _NPATH_MEMO_MAX:
+            _npath_memo.clear()
+        _npath_memo[path] = key
+    return key
 
 
 def stat_sig(path: str) -> tuple[int, int] | None:
@@ -107,6 +123,7 @@ def decode_thumbnail(path: str, source_folder: str,
         if img.isNull():
             img = QImage(THUMB_MAX_DIM, int(THUMB_MAX_DIM * 9 / 16), QImage.Format.Format_RGB32)
             img.fill(QColor(28, 28, 28))
+            img.setText(PLACEHOLDER_KEY, "1")
         return img
 
     if cf.exists():
@@ -151,14 +168,24 @@ def decode_thumbnail(path: str, source_folder: str,
                                            max(1, round(size.height() * scale))))
         img = reader.read()
     if img is None or img.isNull():
-        img = QImage(THUMB_MAX_DIM, int(THUMB_MAX_DIM * 2 / 3), QImage.Format.Format_RGB32)
-        img.fill(QColor(40, 40, 40))
-        return img   # don't persist a placeholder as if it were the real thumb
+        return placeholder_image()   # never persisted as if it were the real thumb
     try:
         cf.parent.mkdir(parents=True, exist_ok=True)
         img.save(str(cf), "JPEG", 82)
     except Exception:
         pass
+    return img
+
+
+PLACEHOLDER_KEY = "picker-placeholder"
+
+
+def placeholder_image() -> QImage:
+    """Grey tile for an image that couldn't be decoded. Tagged, so nothing
+    downstream mistakes its 3:2 shape for the photo's real size."""
+    img = QImage(THUMB_MAX_DIM, int(THUMB_MAX_DIM * 2 / 3), QImage.Format.Format_RGB32)
+    img.fill(QColor(40, 40, 40))
+    img.setText(PLACEHOLDER_KEY, "1")
     return img
 
 
@@ -172,11 +199,12 @@ def read_dimensions(path: str) -> tuple[int, int, bool]:
     sz = reader.size()
     if sz.isValid() and sz.width() > 0 and sz.height() > 0:
         w, h = sz.width(), sz.height()
+        # Qt reports the *stored* size; a 90/270 EXIF rotation swaps it.
+        # Every rotating transform has the Rotate90 bit (value 4) set. (PyQt6
+        # enums don't convert with int() — that TypeError used to be swallowed
+        # here, so every rotated portrait was measured as landscape.)
         try:
-            from PyQt6.QtGui import QImageIOHandler
-            rot = (QImageIOHandler.Transformation.TransformationRotate90
-                   | QImageIOHandler.Transformation.TransformationRotate270)
-            if int(reader.transformation()) & int(rot):
+            if reader.transformation().value & 4:
                 w, h = h, w
         except Exception:
             pass
@@ -202,6 +230,7 @@ class ThumbStore:
         self._bytes = 0
         self._budget = sysmem.budget(self.FRACTION, self.FLOOR, self.CEILING)
         self._puts = 0
+        self._placeholders: set[str] = set()
 
     def get(self, path: str, sig: tuple[int, int] | None = None) -> QPixmap | None:
         key = npath(path)
@@ -217,10 +246,20 @@ class ThumbStore:
     def contains(self, path: str) -> bool:
         return npath(path) in self._lru
 
-    def put(self, path: str, pm: QPixmap, sig: tuple[int, int] | None = None) -> None:
+    def is_placeholder(self, path: str) -> bool:
+        """True if ``path``'s entry is the grey can't-decode tile — its shape
+        says nothing about the photo, so layouts must not learn from it."""
+        return npath(path) in self._placeholders
+
+    def put(self, path: str, pm: QPixmap, sig: tuple[int, int] | None = None, *,
+            placeholder: bool = False) -> None:
         if pm is None or pm.isNull():
             return
         key = npath(path)
+        if placeholder:
+            self._placeholders.add(key)
+        else:
+            self._placeholders.discard(key)
         if key in self._lru:
             self._drop(key)
         self._lru[key] = (sig, pm)
@@ -275,7 +314,11 @@ class _ThumbTask(QRunnable):
             img = decode_thumbnail(self.path, self.source, sig)
         except Exception:
             img = None
-        self.signals.thumb.emit(self.key, self.path, img if img is not None else QImage(), sig)
+        try:
+            self.signals.thumb.emit(self.key, self.path,
+                                    img if img is not None else QImage(), sig)
+        except RuntimeError:
+            pass   # app shutting down: the receiver is already gone
 
 
 class _DimsTask(QRunnable):
@@ -293,7 +336,10 @@ class _DimsTask(QRunnable):
             except Exception:
                 w, h, exact = 3, 2, False
             out.append((p, w, h, exact, stat_sig(p) if exact else None))
-        self.signals.dims.emit(self.source, out)
+        try:
+            self.signals.dims.emit(self.source, out)
+        except RuntimeError:
+            pass   # app shutting down: the receiver is already gone
 
 
 class ThumbService(QObject):
@@ -370,7 +416,8 @@ class ThumbService(QObject):
         self._pending.pop(key, None)
         if img.isNull():
             return
-        _STORE.put(path, QPixmap.fromImage(img), sig)
+        _STORE.put(path, QPixmap.fromImage(img), sig,
+                   placeholder=img.text(PLACEHOLDER_KEY) == "1")
         self.thumb_ready.emit(path)
 
     # ── dimensions ───────────────────────────────────────────────────────────

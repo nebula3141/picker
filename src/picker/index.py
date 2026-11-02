@@ -9,6 +9,7 @@ Kept module-level (functions, not a class) so callers can open/close a
 connection per operation and avoid threading locks.
 """
 import os
+import sys
 import sqlite3
 import time
 from pathlib import Path
@@ -39,7 +40,10 @@ def db_path() -> Path:
     return _config_dir() / "index.sqlite"
 
 
+import threading
+
 _schema_ready: set[str] = set()   # DB paths already backed-up/migrated this process
+_schema_lock = threading.Lock()   # first-open setup races when cards query in parallel
 
 
 # ── Schema ─────────────────────────────────────────────────────────────────────
@@ -125,21 +129,46 @@ def connect() -> sqlite3.Connection:
     because of a half-flushed sqlite from a previous power loss."""
     path = db_path()
     key = str(path)
+    conn = None
+    busy: sqlite3.OperationalError | None = None
     try:
-        conn = sqlite3.connect(path, timeout=10.0, isolation_level=None)
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("PRAGMA synchronous=NORMAL;")
-        conn.execute("PRAGMA foreign_keys=ON;")
-        if key not in _schema_ready:
-            # Backup + schema + migration used to run on EVERY connect — i.e. a
-            # full copy of index.sqlite per search or per library card. Once per
-            # database per process is all that's needed.
-            _backup_db(path)
-            conn.executescript(_SCHEMA)
-            _migrate(conn)
-            _schema_ready.add(key)
-        conn.row_factory = sqlite3.Row
-        return conn
+        for attempt in range(4):
+            try:
+                conn = sqlite3.connect(path, timeout=10.0, isolation_level=None)
+                conn.execute("PRAGMA journal_mode=WAL;")
+                conn.execute("PRAGMA synchronous=NORMAL;")
+                conn.execute("PRAGMA foreign_keys=ON;")
+                with _schema_lock:
+                    if key not in _schema_ready:
+                        # Backup + schema + migration used to run on EVERY connect —
+                        # i.e. a full copy of index.sqlite per search or per library
+                        # card. Once per database per process is all that's needed.
+                        _backup_db(path)
+                        conn.executescript(_SCHEMA)
+                        _migrate(conn)
+                        _schema_ready.add(key)
+                break
+            except sqlite3.OperationalError:
+                # "database is locked" / "busy" — contention, NOT corruption.
+                # Quarantining here would throw away a healthy index just
+                # because two threads opened it at once.
+                try:
+                    if conn is not None:
+                        conn.close()
+                except Exception:
+                    pass
+                conn = None
+                if attempt == 3:
+                    # Still busy: report it, but OUTSIDE this try — an
+                    # OperationalError is a DatabaseError, and re-raising here
+                    # would land in the quarantine below and discard a healthy
+                    # index over lock contention.
+                    busy = sys.exc_info()[1]
+                    break
+                time.sleep(0.05 * (attempt + 1))
+        if busy is None:
+            conn.row_factory = sqlite3.Row
+            return conn
     except sqlite3.DatabaseError:
         _schema_ready.discard(key)
         try:
@@ -171,6 +200,7 @@ def connect() -> sqlite3.Connection:
         conn.executescript(_SCHEMA)
         conn.row_factory = sqlite3.Row
         return conn
+    raise busy
 
 
 def _norm(p: str) -> str:
@@ -367,14 +397,25 @@ def remove_root_entries(root: str) -> int:
 
 # ── Queries ────────────────────────────────────────────────────────────────────
 
+def _prefix_range(folder_norm: str) -> tuple[str, str]:
+    """Half-open [lo, hi) covering every path under ``folder_norm``.
+
+    A range scan on the primary key, unlike ``path LIKE 'prefix%'``, which
+    SQLite cannot serve from an index — that turned every "how many photos are
+    in this library folder?" question into a full table scan."""
+    lo = folder_norm + os.sep
+    return lo, lo[:-1] + chr(ord(lo[-1]) + 1)
+
+
 def files_in_folder(parent: str, *, recursive: bool = False) -> list[sqlite3.Row]:
     parent_norm = _norm(parent)
     conn = connect()
     try:
         if recursive:
+            lo, hi = _prefix_range(parent_norm)
             cur = conn.execute(
-                "SELECT * FROM files WHERE path LIKE ? ORDER BY filename",
-                (parent_norm + os.sep + "%",),
+                "SELECT * FROM files WHERE path >= ? AND path < ? ORDER BY filename",
+                (lo, hi),
             )
         else:
             cur = conn.execute(
@@ -401,9 +442,9 @@ def folder_count_recursive(folder: str) -> int:
     folder_norm = _norm(folder)
     conn = connect()
     try:
+        lo, hi = _prefix_range(folder_norm)
         cur = conn.execute(
-            "SELECT COUNT(*) FROM files WHERE path LIKE ?",
-            (folder_norm + os.sep + "%",),
+            "SELECT COUNT(*) FROM files WHERE path >= ? AND path < ?", (lo, hi),
         )
         return int(cur.fetchone()[0])
     finally:
@@ -447,8 +488,9 @@ def search(
         params.append(_norm(root))
     if parent:
         if recursive:
-            clauses.append("path LIKE ?")
-            params.append(_norm(parent) + os.sep + "%")
+            lo, hi = _prefix_range(_norm(parent))
+            clauses.append("path >= ? AND path < ?")
+            params.extend((lo, hi))
         else:
             clauses.append("parent = ?")
             params.append(_norm(parent))

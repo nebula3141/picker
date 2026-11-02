@@ -1,4 +1,5 @@
 import math
+import html
 import os
 import time
 from collections import OrderedDict
@@ -15,7 +16,7 @@ from PyQt6.QtCore import (
 )
 from PyQt6.QtGui import (
     QPixmap, QImageReader, QKeyEvent, QWheelEvent, QImage, QColor, QFont,
-    QPainter, QPen, QBrush, QMouseEvent, QTransform
+    QFontMetrics, QPainter, QPen, QBrush, QMouseEvent, QTransform
 )
 
 # numpy only powers the histogram / focus-peaking overlays — import it on first
@@ -44,6 +45,7 @@ from . import ratings as ratings_mod
 from . import settings as settings_mod
 from . import conflict_dialog
 from . import theme as theme_mod
+from . import motion as motion_mod
 from . import edits as edits_mod
 from . import save_dialog as save_dialog_mod
 from . import send_locations as loc_mod
@@ -280,11 +282,35 @@ def _decode_pool() -> QThreadPool:
     return _DECODE_POOL
 
 
+_mtime_memo: dict[str, tuple[int, float]] = {}
+_MTIME_TTL = 2.0   # seconds a memoised mtime is trusted
+
+
 def _frame_key(path: str) -> tuple:
+    """Cache key for a decoded frame.
+
+    The mtime is memoised briefly: this runs several times per keypress
+    (current + every preload candidate), and a burst of navigation shouldn't
+    stat the same file over and over. But files change behind the viewer's
+    back — a rotate from the folder browser, a Sort "replace", an external
+    editor — so the memo expires after a couple of seconds and the next look
+    re-checks the disk, making the old decoded frame miss."""
+    now = time.monotonic()
+    hit = _mtime_memo.get(path)
+    if hit is not None and now - hit[1] < _MTIME_TTL:
+        return (path, hit[0])
     try:
-        return (path, int(os.path.getmtime(path)))
+        mt = int(os.path.getmtime(path))
     except OSError:
-        return (path, 0)
+        mt = 0
+    if len(_mtime_memo) > 50_000:
+        _mtime_memo.clear()
+    _mtime_memo[path] = (mt, now)
+    return (path, mt)
+
+
+def _forget_mtime(path: str) -> None:
+    _mtime_memo.pop(path, None)
 
 
 # ── Image canvas — zoom anchored at cursor, pan via drag ───────────────────────
@@ -835,7 +861,7 @@ class ImageCanvas(QWidget):
                 f.setPointSize(13)
                 p.setFont(f)
                 p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter,
-                           f"⚠  {self._error_text}")
+                           self._error_text)
             p.end()
             return
         p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
@@ -946,7 +972,7 @@ class ImageCanvas(QWidget):
             p.setFont(f)
             p.drawText(QRect(x, y - 18, w - 14, 16),
                        Qt.AlignmentFlag.AlignRight,
-                       "⚠ CLIPPED")
+                       "CLIPPED")
 
         r, g, b = self._histogram
         peak = max(max(r), max(g), max(b), 1)
@@ -1024,7 +1050,7 @@ class ImageCanvas(QWidget):
 
     def _paint_rating(self, p: QPainter):
         """Gold star pill, bottom-centre."""
-        text = "★" * self._rating + "☆" * (5 - self._rating)
+        text = f"Rated {self._rating}"
         f = p.font(); f.setPointSize(15); f.setBold(False); p.setFont(f)
         fm = p.fontMetrics()
         tw = fm.horizontalAdvance(text)
@@ -1206,30 +1232,33 @@ class ImageCanvas(QWidget):
 # ── Toast notification ─────────────────────────────────────────────────────────
 
 class ToastWidget(QWidget):
+    """Transient confirmation, drawn as a small panel plate — not a floating pill."""
+
     action_clicked = pyqtSignal()
 
     def __init__(self, parent: QWidget):
         super().__init__(parent)
-        self.setStyleSheet(
-            "background: rgba(30, 30, 30, 220);"
-            "border-radius: 8px;"
-        )
+        # Floats over photographs, so its plate is flattened to an opaque
+        # colour (glass over an arbitrary picture can't guarantee contrast).
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        theme_mod.bind(self, lambda: f"background: {theme_mod.solid_hex('deck_high')};"
+            f" border: 1px solid {theme_mod.hexc('glass_edge')};"
+            f" border-radius: {theme_mod.RADIUS}px;")
         self.hide()
 
         lay = QHBoxLayout(self)
-        lay.setContentsMargins(16, 10, 16, 10)
+        lay.setContentsMargins(14, 9, 14, 9)
         lay.setSpacing(12)
 
         self._label = QLabel()
-        self._label.setStyleSheet("color: #ffffff; font-size: 15px; font-weight: bold; background: transparent;")
+        self._label.setFont(theme_mod.legend_font(10, bold=False, tracking=0.0))
+        theme_mod.bind(self._label, lambda: f"color: {theme_mod.hexc('fg')}; background: transparent; border: 0;")
         lay.addWidget(self._label)
 
         self._action_btn = QLabel()
-        self._action_btn.setStyleSheet(
-            "color: #5a9bff; font-size: 13px; font-weight: 700;"
-            " background: rgba(255,255,255,0.08); border-radius: 4px;"
-            " padding: 4px 12px;"
-        )
+        self._action_btn.setFont(theme_mod.legend_font(9, tracking=1.0))
+        theme_mod.bind(self._action_btn, lambda: f"color: #ffffff; background: {theme_mod.ACCENT_SOLID};"
+            f" border-radius: 4px; padding: 4px 10px;")
         self._action_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._action_btn.hide()
         lay.addWidget(self._action_btn)
@@ -1270,17 +1299,21 @@ class ToastWidget(QWidget):
         rest = self.pos()
         self.show()
         self.raise_()
-        # Fade + a gentle 14px rise into place.
-        self._opacity.setOpacity(0.0)
-        self.move(rest.x(), rest.y() + 14)
-        self._fade.setDuration(200)
-        self._fade.setStartValue(0.0)
-        self._fade.setEndValue(1.0)
-        self._fade.start()
-        self._slide.setDuration(240)
-        self._slide.setStartValue(self.pos())
-        self._slide.setEndValue(rest)
-        self._slide.start()
+        # Fade + a gentle 10px rise into place — or straight in with motion off.
+        ms_in = motion_mod.dur(motion_mod.SHORT)
+        if ms_in <= 0:
+            self._opacity.setOpacity(1.0)
+        else:
+            self._opacity.setOpacity(0.0)
+            self.move(rest.x(), rest.y() + 10)
+            self._fade.setDuration(ms_in)
+            self._fade.setStartValue(0.0)
+            self._fade.setEndValue(1.0)
+            self._fade.start()
+            self._slide.setDuration(ms_in + 40)
+            self._slide.setStartValue(self.pos())
+            self._slide.setEndValue(rest)
+            self._slide.start()
         self._hide_timer.start(ms)
 
     def _on_fade_finished(self):
@@ -1309,9 +1342,13 @@ class ToastWidget(QWidget):
             self.move(x, y)
 
     def _fade_out(self):
-        self._fading_out = True
         self._fade.stop()
-        self._fade.setDuration(420)
+        ms_out = motion_mod.dur(motion_mod.VIEW)
+        if ms_out <= 0:
+            self.hide()
+            return
+        self._fading_out = True
+        self._fade.setDuration(ms_out)
         self._fade.setStartValue(self._opacity.opacity())
         self._fade.setEndValue(0.0)
         self._fade.start()
@@ -1348,43 +1385,40 @@ class ShortcutPanel(QWidget):
             self.raise_()
 
     def paintEvent(self, event):
+        """The key map, drawn as the panel it describes: a deck of real keycaps
+        with their legends beside them."""
+        from . import instrument as inst
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         W, H = self.width(), self.height()
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QColor(12, 12, 12, 210))
-        p.drawRoundedRect(0, 0, W, H, 14, 14)
-        p.setPen(QPen(QColor(255, 255, 255, 25), 1))
+        p.fillRect(0, 0, W, H, theme_mod.c("deck"))
+        p.setPen(QPen(theme_mod.c("rail"), 1))
         p.setBrush(Qt.BrushStyle.NoBrush)
-        p.drawRoundedRect(1, 1, W - 2, H - 2, 14, 14)
+        p.drawRect(0, 0, W - 1, H - 1)
+        p.setPen(QPen(theme_mod.c("rail_light"), 1))
+        p.drawLine(1, 0, W - 2, 0)
 
-        y = 20
+        y = 18
         for section_title, pairs in self._sections:
-            p.setPen(QColor(120, 165, 255))
-            f = p.font()
-            f.setPointSize(10)
-            f.setBold(True)
-            p.setFont(f)
-            p.drawText(QRect(18, y, W - 36, 18), Qt.AlignmentFlag.AlignLeft, section_title)
-            y += 27
-
-            f.setBold(False)
-            f.setPointSize(10)
-            p.setFont(f)
+            p.setFont(theme_mod.legend_font(8, tracking=1.8))
+            p.setPen(theme_mod.c("muted"))
+            p.drawText(QRect(16, y, W - 32, 16), Qt.AlignmentFlag.AlignLeft, section_title)
+            y += 22
             for key, desc in pairs:
-                p.setPen(QColor(220, 220, 220))
-                p.setBrush(QColor(255, 255, 255, 18))
-                fm = p.fontMetrics()
-                kw = fm.horizontalAdvance(key) + 16
-                p.drawRoundedRect(22, y, kw, 22, 5, 5)
-                p.setPen(QColor(255, 255, 255))
-                p.drawText(QRect(22, y, kw, 22), Qt.AlignmentFlag.AlignCenter, key)
-                p.setPen(QColor(190, 190, 190))
-                p.setBrush(Qt.BrushStyle.NoBrush)
-                p.drawText(QRect(22 + kw + 12, y, W - kw - 54, 22),
+                kf = theme_mod.legend_font(9, tracking=0.8)
+                p.setFont(kf)
+                kw = max(30, QFontMetrics(kf).horizontalAdvance(key) + 18)
+                cap = QRect(18, y, kw, 22)
+                body = inst.draw_keycap(p, cap, variant="bone")
+                p.setPen(theme_mod.c("legend"))
+                p.setFont(kf)
+                p.drawText(body, Qt.AlignmentFlag.AlignCenter, key)
+                p.setPen(theme_mod.c("fg"))
+                p.setFont(theme_mod.legend_font(9, bold=False, tracking=0.4))
+                p.drawText(QRect(18 + kw + 12, y, W - kw - 48, 22),
                            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, desc)
-                y += 28
-            y += 14
+                y += 26
+            y += 12
 
         p.end()
 
@@ -1404,6 +1438,7 @@ class FilmstripBar(QWidget):
     SPACING = 4
     CURRENT_BORDER = 3
     WHEEL_PAN_STEP = 160
+    SCALED_MAX = 300           # strip-height copies kept ready to blit
 
     DEST_COLORS = [
         QColor(60, 200, 80),
@@ -1426,6 +1461,7 @@ class FilmstripBar(QWidget):
         self._drag_start_pan = 0
         self._drag_moved = False
         self._pending: set[str] = set()  # paths requested from the service
+        self._scaled: "OrderedDict[str, tuple[int, QPixmap]]" = OrderedDict()
         self.setFixedHeight(self.HEIGHT)
         self.setAutoFillBackground(True)
         self._apply_bg()
@@ -1559,11 +1595,29 @@ class FilmstripBar(QWidget):
 
         p.end()
 
+    def _scaled_for(self, path: str, pm: QPixmap) -> QPixmap:
+        """Thumbnails are cached at 360px but drawn at 78px high. Smooth-scaling
+        every visible tile on every repaint was the single biggest cost of
+        navigating; scale once and keep the strip-sized copy."""
+        # Keyed on the source pixmap too: after a rotate/save the store holds a
+        # new thumbnail, and serving the old strip copy would draw it squashed.
+        key = pm.cacheKey()
+        hit = self._scaled.get(path)
+        if hit is None or hit[0] != key or hit[1].height() != self.THUMB_H:
+            hit = (key, pm.scaledToHeight(self.THUMB_H, Qt.TransformationMode.SmoothTransformation))
+            self._scaled[path] = hit
+            self._scaled.move_to_end(path)
+            while len(self._scaled) > self.SCALED_MAX:
+                self._scaled.popitem(last=False)
+        else:
+            self._scaled.move_to_end(path)
+        return hit[1]
+
     def _draw_tile(self, p: QPainter, idx: int, rect: QRect, is_current: bool):
-        pm = self._store.get(self._manager.images[idx].path)
+        path = self._manager.images[idx].path
+        pm = self._store.get(path)
         if pm is not None:
-            p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-            p.drawPixmap(rect, pm)
+            p.drawPixmap(rect, self._scaled_for(path, pm))
         else:
             p.fillRect(rect, QColor(30, 30, 30))
 
@@ -1574,20 +1628,21 @@ class FilmstripBar(QWidget):
         if is_video(rec.path):
             self._draw_filmstrip_play_badge(p, rect)
 
-        # Dest badge
+        # A filed frame carries its destination's colour as a bottom bar — the
+        # photograph itself stays untouched.
         color = self._status_color(rec.status)
         if color:
-            pen = QPen(color, 2)
-            p.setPen(pen)
-            inset = 1
-            p.drawRect(rect.adjusted(inset, inset, -inset, -inset))
+            p.fillRect(QRect(rect.left(), rect.bottom() - 2, rect.width(), 3), color)
 
-        # Highlight current — accent ring reads more modern than a plain white box.
+        # The frame under the head: registration brackets plus a lit shoe.
         if is_current:
-            pen = QPen(theme_mod.c("accent"), self.CURRENT_BORDER)
-            p.setPen(pen)
-            inset = self.CURRENT_BORDER // 2
-            p.drawRect(rect.adjusted(inset, inset, -inset, -inset))
+            from . import instrument as inst
+            accent = theme_mod.c("focus")
+            inst.draw_brackets(p, rect, accent, arm=13, width=2, inset=2)
+            p.setPen(QPen(accent, 1))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawRect(rect.adjusted(0, 0, -1, -1))
+            p.fillRect(QRect(rect.left(), rect.bottom() - 2, rect.width(), 3), accent)
 
     def _draw_filmstrip_play_badge(self, p: QPainter, rect: QRect) -> None:
         size = 18
@@ -1730,7 +1785,7 @@ class FilmstripBar(QWidget):
 
 class _LocationRow(QWidget):
     """One saved location in the Selection menu:
-    📁 name · Copy/Move · shortcut · ✕. Clicking sends; ✕ removes."""
+    name, action and shortcut, plus a REMOVE key. Clicking sends."""
 
     send = pyqtSignal()
     remove = pyqtSignal()
@@ -1739,7 +1794,8 @@ class _LocationRow(QWidget):
         super().__init__(parent)
         self.setObjectName("locrow")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        self.setStyleSheet("#locrow:hover { background:#26262c; border-radius:8px; }")
+        theme_mod.bind(self, lambda: f"#locrow:hover {{ background: {theme_mod.hexc('deck_high')};"
+                                     f" border-radius: {theme_mod.RADIUS}px; }}")
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setToolTip(f"{loc.get('action', 'copy').capitalize()} to {loc.get('path', '')}")
 
@@ -1752,30 +1808,29 @@ class _LocationRow(QWidget):
         lay.addWidget(icon)
 
         name = QLabel(_elide_middle(loc.get("name", "?"), 26))
-        name.setStyleSheet("color:#e6e6ea; font-size:13px; background:transparent;")
+        theme_mod.bind(name, lambda: f"color: {theme_mod.hexc('fg')}; font-size: 13px; background: transparent;")
         lay.addWidget(name)
 
         is_move = loc.get("action") == "move"
         tag = QLabel("Move" if is_move else "Copy")
-        tag.setStyleSheet(
-            f"color:{'#f0a868' if is_move else '#7bb2f7'}; font-size:11px;"
-            " font-weight:600; background:transparent;")
+        theme_mod.bind(tag, lambda is_move=is_move: (
+            f"color: {theme_mod.hexc('danger') if is_move else theme_mod.hexc('accent_text')};"
+            " font-size: 11px; font-weight: 600; background: transparent;"))
         lay.addWidget(tag)
 
         lay.addStretch(1)
 
         key = QLabel(key_label)
-        key.setStyleSheet("color:#8a8a93; font-size:11px; font-weight:600; background:transparent;")
+        theme_mod.bind(key, lambda: f"color: {theme_mod.hexc('muted')}; font-size: 11px;"
+                                    " font-weight: 600; background: transparent;")
         lay.addWidget(key)
 
-        x = QPushButton("✕")
-        x.setFixedSize(20, 20)
-        x.setCursor(Qt.CursorShape.PointingHandCursor)
+        from . import instrument as inst
+        x = inst.KeyCap("", variant="dark", icon="close")
+        x.setFixedSize(28, 28)
+        x.setMinimumHeight(28)
         x.setToolTip("Remove this location")
-        x.setStyleSheet(
-            "QPushButton { color:#8a8a93; border:0; background:transparent; font-size:12px; }"
-            "QPushButton:hover { color:#ef6b6b; }"
-        )
+        x.setAccessibleName("Remove this location")
         x.clicked.connect(self.remove.emit)
         lay.addWidget(x)
 
@@ -1803,6 +1858,8 @@ class SlideshowView(QWidget):
         self._manager = manager
         self._idx = start_idx
         self._current_dest = 0
+        from . import sort_keys
+        self._dest_keys = sort_keys.key_map(self._manager.destinations)
         self._last_transfer: dict | None = None   # one-level undo for move/copy/delete
         # Decoded frames live in the module-level _FRAMES cache (path-keyed, RAM
         # budgeted, survives this view). In-flight decodes are tracked by path
@@ -1859,7 +1916,7 @@ class SlideshowView(QWidget):
             total = len(self._manager.images)
             if self._idx > 0 and self._idx == saved and total > 1:
                 self._toast.show_message(
-                    f"↩ Resumed at photo {self._idx + 1} of {total}  ·  Home = start over",
+                    f"Resumed at {self._idx + 1} of {total}  ·  Home starts over",
                     ms=2600)
         except Exception:
             return
@@ -1884,11 +1941,24 @@ class SlideshowView(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        # Top bar — filename + [idx/total], centered
+        # ── Top rail: the frame being judged, and the readout that measures it.
+        from . import instrument as inst
+        self._top_rail = QWidget()
+        self._top_rail.setObjectName("viewerRail")
+        rail_l = QHBoxLayout(self._top_rail)
+        rail_l.setContentsMargins(14, 8, 14, 8)
+        rail_l.setSpacing(12)
         self._title = QLabel()
-        self._title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._title.setTextFormat(Qt.TextFormat.RichText)
+        self._title.setFont(theme_mod.legend_font(10, tracking=1.2))
+        self._title.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        rail_l.addWidget(self._title, 1)
+        self._rail_screen = inst.Screen(height=42)
+        self._rail_screen.setMinimumWidth(250)
+        self._rail_screen.setMaximumWidth(330)
+        rail_l.addWidget(self._rail_screen)
         self._apply_title_qss()
-        layout.addWidget(self._title)
+        layout.addWidget(self._top_rail)
 
         # Middle row: image canvas + (optional) info panel
         self._middle = QWidget()
@@ -1918,6 +1988,17 @@ class SlideshowView(QWidget):
 
         mid_layout.addWidget(self._viewer_stack, stretch=1)
 
+        # Multi Sort: the destinations fill up beside the photo as you send.
+        self._dest_panel = None
+        if self._manager.has_destinations:
+            from .dest_panel import DestinationsPanel
+            self._dest_panel = DestinationsPanel(self._manager)
+            self._dest_panel.undo_requested.connect(self._undo_send)
+            self._dest_panel.undo_button.clicked.connect(self._undo)
+            self._dest_panel.open_requested.connect(self._open_dest_preview)
+            mid_layout.addWidget(self._dest_panel)
+        self._dest_preview = None
+
         from .image_info_panel import ImageInfoPanel
         self._info_panel = ImageInfoPanel()
         self._info_panel.hide()
@@ -1946,7 +2027,7 @@ class SlideshowView(QWidget):
         self._scan_progress.setTextVisible(False)
         self._scan_progress.setStyleSheet(
             "QProgressBar { background: transparent; border: 0; }"
-            "QProgressBar::chunk { background: #3b82f6; }"
+            f"QProgressBar::chunk {{ background: {theme_mod.ACCENT_HEX}; }}"
         )
         self._scan_progress.setRange(0, 0)
         self._scan_progress.setVisible(self._filmstrip_deferred)
@@ -1993,23 +2074,15 @@ class SlideshowView(QWidget):
         self.setPalette(pal)
 
     def _apply_title_qss(self):
-        bg = theme_mod.c("hint_bar_bg")
-        fg = theme_mod.c("hint_bar_fg")
-        self._title.setStyleSheet(
-            f"background: {bg}; color: {fg};"
-            f" padding: 9px 14px; font-size: 13px; font-weight: 600;"
-            f" letter-spacing: 0.2px;"
-            f" border-bottom: 1px solid rgba(255,255,255,0.06);"
-        )
+        theme_mod.bind(self._top_rail, lambda: f"#viewerRail {{ background: {theme_mod.hexc('deck')};"
+            f" border-bottom: 1px solid {theme_mod.hexc('rail')}; }}")
+        theme_mod.bind(self._title, lambda: f"color: {theme_mod.hexc('fg')}; background: transparent;")
 
     def _apply_status_qss(self):
-        bg = theme_mod.c("status_bar_bg")
-        fg = theme_mod.c("status_bar_fg")
-        # Bigger, brighter shortcut bar — reads at a glance during slideshow.
-        self._status_bar.setStyleSheet(
-            f"QFrame {{ background: {bg}; border-top: 1px solid rgba(255,255,255,0.06); }}"
-            f"QLabel {{ color: {fg}; font-size: 14px; }}"
-        )
+        # The legend rail: the keys this photo answers to, set as keycaps.
+        theme_mod.bind(self._status_bar, lambda: f"QFrame {{ background: {theme_mod.hexc('deck')};"
+            f" border-top: 1px solid {theme_mod.hexc('rail')}; }}"
+            f"QLabel {{ color: {theme_mod.hexc('muted')}; font-size: 12px; }}")
 
     # ── Background scan callbacks ────────────────────────────────────────────
 
@@ -2086,19 +2159,28 @@ class SlideshowView(QWidget):
     def _shortcut_hint(self) -> str:
         # Each shortcut is rendered as a bold "key chip" + label so the eye
         # picks them out at a glance. Groups separated by a dim middle dot.
+        cap_bg = theme_mod.hexc("cap")
+        cap_ink = theme_mod.hexc("legend")
+        label_c = theme_mod.hexc("muted")
+        mono = theme_mod.mono_family()
+
         def chip(key: str) -> str:
+            # A key on the legend rail is drawn the way it is on the keyboard:
+            # bone cap, charcoal legend.
             return (
-                '<span style="background:#26262c; color:#f0f0f0;'
-                ' font-weight:700; padding:3px 9px; border-radius:5px;'
-                ' border:1px solid #3a3a42;">' + key + '</span>'
+                f'<span style="background:{cap_bg}; color:{cap_ink};'
+                f' font-family:\'{mono}\'; font-size:11px; font-weight:700;'
+                f' padding:3px 8px; border-radius:3px;">{key}</span>'
             )
 
         def pair(key: str, label: str) -> str:
-            return f'{chip(key)}&nbsp;&nbsp;<span style="color:#cfcfd6;">{label}</span>'
+            return (f'{chip(key)}&nbsp;&nbsp;<span style="color:{label_c};'
+                    f' font-size:12px;">{label}</span>')
 
         # Wider gutters between groups than within them, so the eye parses the
         # legend as a few chunks instead of one dense run.
-        sep = ('&nbsp;' * 6) + '<span style="color:#4a4a52;">·</span>' + ('&nbsp;' * 6)
+        sep = (('&nbsp;' * 5) + f'<span style="color:{theme_mod.hexc("faint")};">|</span>'
+               + ('&nbsp;' * 5))
         gap = '&nbsp;' * 4
 
         # Adapt the hint to the current item type — image vs video.
@@ -2129,10 +2211,12 @@ class SlideshowView(QWidget):
         if self._manager.has_destinations:
             dests = self._manager.destinations
             n = len(dests)
+            from . import sort_keys
             if n == 1:
-                move_hint = pair("Enter", f"→ {dests[0]['name']}")
+                move_hint = (pair(sort_keys.key_of(dests[0], 0), dests[0]["name"])
+                             + gap + pair("Enter", f"→ {dests[0]['name']}"))
             else:
-                parts = [pair(str(i + 1), dests[i]["name"]) for i in range(n)]
+                parts = [pair(sort_keys.key_of(dests[i], i), dests[i]["name"]) for i in range(n)]
                 active = dests[self._current_dest]["name"]
                 move_hint = (
                     pair("Enter", f"→ {active}") + gap
@@ -2489,8 +2573,8 @@ class SlideshowView(QWidget):
         applied = ratings_mod.set_rating(self._manager.source_folder, path, stars)
         self._canvas.set_rating(applied)
         self._filmstrip.refresh()
-        self._toast.show_message("☆ Rating cleared" if applied == 0
-                                 else "★" * applied + "☆" * (5 - applied), ms=900)
+        self._toast.show_message("Rating cleared" if applied == 0
+                                 else f"Rated {applied} of 5", ms=900)
 
     def _send_to(self, dest_idx: int):
         if dest_idx < 0 or dest_idx >= len(self._manager.destinations):
@@ -2521,7 +2605,7 @@ class SlideshowView(QWidget):
             self.files_changed.emit()
         self._flash_if_enabled()
         self._toast.show_message(
-            f"✓  {verb} to  {dest_name}", ms=3000,
+            f"{verb} to {dest_name}", ms=3000,
             action="Undo", action_cb=self._undo,
         )
         self.status_changed.emit()
@@ -2535,7 +2619,31 @@ class SlideshowView(QWidget):
         if err:
             self._toast.show_message("Nothing to undo")
             return
-        self._toast.show_message("↩  Undone")
+        self._after_undo("Undone")
+
+    def _undo_send(self, dest_path: str):
+        """Send one photo back from a destination (the panel's undo button)."""
+        err = self._manager.undo_send(dest_path)
+        if err:
+            self._toast.show_message(err)
+            return
+        if self._dest_preview is not None and self._dest_preview.isVisible():
+            self._dest_preview.remove_current()
+        self._after_undo(f"Sent back {os.path.basename(dest_path)}")
+
+    def _open_dest_preview(self, dest_idx: int, path: str):
+        """Open a destination's photo large and step through that destination."""
+        from .dest_panel import DestPreview
+        if self._dest_preview is None:
+            self._dest_preview = DestPreview(self._viewer_stack)
+            self._dest_preview.undo_requested.connect(self._undo_send)
+            self._dest_preview.closed.connect(lambda: self.setFocus(Qt.FocusReason.OtherFocusReason))
+        sec = self._dest_panel.section(dest_idx)
+        self._dest_preview.open(sec.name, sec.paths(), path, undoable=sec.undoable,
+                                pct=display_pct(self._manager.resolution_pct))
+
+    def _after_undo(self, message: str):
+        self._toast.show_message(message)
         self.files_changed.emit()   # undo may have restored a moved file to the folder
         self.status_changed.emit()
         self._filmstrip.refresh()
@@ -2579,10 +2687,11 @@ class SlideshowView(QWidget):
 
     def _after_save(self, out_path: str, rec, reset_rotation: bool, overwrite: bool):
         name = Path(out_path).name
-        self._toast.show_message(f"✓  Saved: {name}", ms=1800)
+        self._toast.show_message(f"Saved {name}", ms=1800)
         if reset_rotation:
             self._manager.rotations.pop(rec.filename, None)
         _FRAMES.drop_path(rec.path)
+        _forget_mtime(rec.path)          # the file on disk just changed
         self._inflight.pop(rec.path, None)
         from . import thumb_store
         thumb_store.store().invalidate(rec.path)   # overwrite changed the pixels
@@ -2602,48 +2711,42 @@ class SlideshowView(QWidget):
         total = len(self._manager.images)
         # Refresh shortcut hint — it changes shape when current item is a video.
         self._update_hint()
-        # Top bar: filename centered, counter muted. Video items get a tiny
-        # "VIDEO" pill so the user knows why the chrome looks different.
-        muted = theme_mod.c("muted").name()
+        # The rail names the frame; the readout measures it. A video wears a
+        # silkscreened plate so the changed chrome is explained.
         from .media import is_video as _is_video
-        title_html = f'{rec.filename}'
+        title_html = html.escape(rec.filename)
         if _is_video(rec.path):
             title_html = (
-                '<span style="background:#3b82f6; color:#fff; font-size:11px;'
-                ' font-weight:700; padding:2px 8px; border-radius:4px;'
-                ' letter-spacing:1px;">VIDEO</span>&nbsp;&nbsp;'
-                + title_html
-            )
-        if self._manager.scan_complete:
-            pct = round((self._idx + 1) / total * 100) if total else 0
-            counter = f'[{self._idx + 1} / {total} · {pct}%]'
-        else:
-            counter = f'[{self._idx + 1}]'
-        self._title.setText(
-            f'{title_html}'
-            f'&nbsp;&nbsp;&nbsp;<span style="color:{muted}; font-weight:500;">'
-            f'{counter}</span>'
-        )
+                f'<span style="background:{theme_mod.solid_hex("cap")};'
+                f' color:{theme_mod.hexc("fg")}; font-size:10px;'
+                f' font-weight:600; padding:2px 7px;">&nbsp;Video&nbsp;</span>'
+                '&nbsp;&nbsp;' + title_html)
+        self._title.setText(title_html)
         self.title_changed.emit()
-        self._title.setTextFormat(Qt.TextFormat.RichText)
+
+        fields = [("FRAME", f"{self._idx + 1}" if not self._manager.scan_complete
+                   else f"{self._idx + 1}/{total}")]
+        note = ""
+        if self._manager.scan_complete and total:
+            note = f"{round((self._idx + 1) / total * 100)}%"
+        if self._manager.has_destinations:
+            mode = "MOVE" if self._manager.mode == "move" else "COPY"
+            active = (self._manager.destinations[self._current_dest].get("name", "?")
+                      if 0 <= self._current_dest < len(self._manager.destinations) else "?")
+            fields.append((mode + " →", active))
+        rating = self._current_rating()
+        if rating:
+            fields.append(("RATED", f"{rating}/5"))
+        self._rail_screen.set_fields(fields, note)
         # Bottom-right stats only when destinations are set.
         if not self._manager.has_destinations:
             self._stats_label.setText("")
         else:
-            status_str = self._manager.dest_name_for_status(rec.status)
+            # Where Enter sends is on the readout above; the rail keeps the tally.
             s = self._manager.stats()
-            # Always-visible mode + active target so "where does Enter send?" is
-            # answerable at a glance.
-            mode = "Move" if self._manager.mode == "move" else "Copy"
-            accent = theme_mod.c("accent").name()
-            active = self._manager.destinations[self._current_dest].get("name", "?") \
-                if 0 <= self._current_dest < len(self._manager.destinations) else "?"
-            chip = (f'<span style="color:{accent}; font-weight:700;">'
-                    f'{mode} → {active}</span>')
-            self._stats_label.setTextFormat(Qt.TextFormat.RichText)
+            self._stats_label.setFont(theme_mod.legend_font(9, bold=False, tracking=1.0))
             self._stats_label.setText(
-                f"{chip}   ·   Selected: {s['selected']}   ·   Remaining: {s['unreviewed']}"
-            )
+                f"FILED {s['selected']}   ·   LEFT {s['unreviewed']}")
         # Mirror stats width into the left spacer so the centered legend stays
         # truly centered regardless of how wide the right-side stats grew.
         self._stats_left_spacer.setFixedWidth(self._stats_label.sizeHint().width())
@@ -2729,10 +2832,8 @@ class SlideshowView(QWidget):
                 return
 
         if key == Qt.Key.Key_Escape:
-            w = self.window()
-            if w and w.isFullScreen():
-                self.fullscreen_requested.emit()
-                return
+            # Straight back to the mosaic. Full screen is the user's own mode
+            # (F / F11 / the status-bar button) and Esc never changes it.
             self.closed.emit(self._idx)
             return
         elif key == Qt.Key.Key_Delete and not ctrl:
@@ -2788,11 +2889,14 @@ class SlideshowView(QWidget):
             else:
                 self._toast.show_message(
                     "No Selection locations yet — right-click → Selection", ms=2500)
-        elif ctrl and Qt.Key.Key_1 <= key <= Qt.Key.Key_9:
-            self._send_to_location(key - Qt.Key.Key_1)    # Ctrl+1..9 = cull to Selection
-        elif not ctrl and Qt.Key.Key_1 <= key <= Qt.Key.Key_5:
-            # 1..5 set the star rating (press the same number again to clear).
+        elif ctrl and Qt.Key.Key_1 <= key <= Qt.Key.Key_5:
+            # Ctrl+1..5 set the star rating (the same again clears it).
             self._set_rating(key - Qt.Key.Key_0)
+        elif not ctrl and has_dest and int(key) in self._dest_keys:
+            # Multi Sort: each destination's own key (1, 2, 3, 4 by default).
+            self._send_to(self._dest_keys[int(key)])
+        elif not ctrl and not has_dest and Qt.Key.Key_1 <= key <= Qt.Key.Key_9:
+            self._send_to_location(key - Qt.Key.Key_1)    # 1..9 = cull to Selection
         elif has_dest and key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
             self._send_to(self._current_dest)
         elif has_dest and key == Qt.Key.Key_Tab:
@@ -2821,7 +2925,7 @@ class SlideshowView(QWidget):
     def set_chrome_visible(self, visible: bool):
         """MainWindow calls this when toggling fullscreen so the slideshow's
         own top/bottom bars hide together with the menu/status chrome."""
-        self._title.setVisible(visible)
+        self._top_rail.setVisible(visible)
         self._filmstrip.setVisible(self._show_filmstrip)
         self._status_bar.setVisible(visible)
         if not visible and hasattr(self, "_shortcut_panel"):
@@ -2854,6 +2958,9 @@ class SlideshowView(QWidget):
                 ("0", "Fit to window"),
                 ("Z", "1:1 pixel zoom"),
             ]),
+            ("RATE", [
+                ("Ctrl+1 – 5", "Star rating (again to clear)"),
+            ]),
             ("EDIT", [
                 ("R", "Rotate 90° CW"),
                 ("Ctrl+S", "Save rotation"),
@@ -2876,7 +2983,7 @@ class SlideshowView(QWidget):
             ]),
             ("WINDOW", [
                 ("F / F11", "Fullscreen"),
-                ("ESC", "Exit fullscreen / Back"),
+                ("ESC", "Back to the folder"),
                 ("?", "Toggle this panel"),
             ]),
             ("VIDEO", [
@@ -2891,7 +2998,9 @@ class SlideshowView(QWidget):
         ]
         if self._manager.has_destinations:
             dests = self._manager.destinations
-            dest_pairs = [(str(i + 1), dests[i]["name"]) for i in range(len(dests))]
+            from . import sort_keys
+            dest_pairs = [(sort_keys.key_of(dests[i], i), dests[i]["name"])
+                          for i in range(len(dests))]
             sections.append(("SORT", [
                 ("Enter", "Send to active"),
                 ("Tab", "Cycle destination"),
@@ -3101,7 +3210,7 @@ class SlideshowView(QWidget):
         from PyQt6.QtGui import QDesktopServices
         from PyQt6.QtCore import QUrl
         QDesktopServices.openUrl(QUrl(exif_mod.map_url(lat, lon)))
-        self._toast.show_message(f"📍 {lat:.5f}, {lon:.5f}", ms=1600)
+        self._toast.show_message(f"MAP {lat:.5f}, {lon:.5f}", ms=1600)
 
     def _copy_image_to_clipboard(self):
         """Put the current picture on the system clipboard so it can be pasted
@@ -3306,7 +3415,10 @@ class SlideshowView(QWidget):
         idx_a = self._idx
         idx_b = (self._idx + 1) % n
 
-        self._title.hide()
+        # The whole rail (title + single-image readout), remembering whether it
+        # was showing — in fullscreen it's hidden and must stay hidden after.
+        self._rail_was_visible = self._top_rail.isVisible()
+        self._top_rail.hide()
         self._middle.hide()
         self._filmstrip.hide()
         self._status_bar.hide()
@@ -3342,7 +3454,7 @@ class SlideshowView(QWidget):
         self._compare_view.deleteLater()
         self._compare_view = None
 
-        self._title.show()
+        self._top_rail.setVisible(getattr(self, "_rail_was_visible", True))
         self._middle.show()
         self._filmstrip.setVisible(self._show_filmstrip)
         self._status_bar.show()
@@ -3354,11 +3466,15 @@ class SlideshowView(QWidget):
         if hasattr(self, "_toast"):
             self._toast._reposition()
         self._reposition_shortcut_panel()
+        if getattr(self, "_dest_preview", None) is not None and self._dest_preview.isVisible():
+            self._dest_preview.setGeometry(self._viewer_stack.rect())
 
     def cleanup(self):
         """Called by MainWindow before this view is removed from the stack.
         Embedded widgets don't get closeEvent — do worker pool teardown here."""
         self._stop_movie()
+        if self._dest_panel is not None:
+            self._dest_panel.cleanup()
         ratings_mod.flush(self._manager.source_folder)   # persist star ratings
         if self._compare_view is not None:
             self._compare_view.cleanup()
@@ -3437,7 +3553,9 @@ class CompareView(QWidget):
 
         # Header — one cell per side; the active side is accent-highlighted.
         header = QWidget()
-        header.setStyleSheet("background:#141414;")
+        header.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        theme_mod.bind(header, lambda: f"background: {theme_mod.hexc('bg')};"
+                                       f" border-bottom: 1px solid {theme_mod.hexc('rail')};")
         hlay = QHBoxLayout(header)
         hlay.setContentsMargins(0, 0, 0, 0)
         hlay.setSpacing(0)
@@ -3470,9 +3588,9 @@ class CompareView(QWidget):
         # Bottom hint bar
         self._bar = QLabel()
         self._bar.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._bar.setStyleSheet(
-            "background:#141414; color:#9a9a9a; padding:7px; font-size:11px;"
-        )
+        theme_mod.bind(self._bar, lambda: f"background: {theme_mod.hexc('bg')}; color: {theme_mod.hexc('muted')};"
+                                          f" padding: 7px; font-size: 11px;"
+                                          f" border-top: 1px solid {theme_mod.hexc('rail')};")
         self._bar.setText(
             "←/→ change active side   ·   Tab / click  switch side   ·   "
             "X  swap   ·   scroll  zoom   ·   drag  pan   ·   "
@@ -3505,13 +3623,11 @@ class CompareView(QWidget):
 
     def _set_active(self, side: str):
         self._active = side
-        accent = theme_mod.c("accent").name()
         for s, frame in (("a", self._frame_a), ("b", self._frame_b)):
             on = (s == side)
-            frame.setStyleSheet(
-                f"#cmp_frame_{s} {{ background:#0d0d0d; border:3px solid "
-                f"{accent if on else 'transparent'}; border-radius:4px; }}"
-            )
+            theme_mod.bind(frame, lambda s=s, on=on: (
+                f"#cmp_frame_{s} {{ background: {theme_mod.hexc('well')}; border: 2px solid "
+                f"{theme_mod.hexc('focus') if on else 'transparent'}; }}"))
         self._update_header()
 
     # ── Sync ──────────────────────────────────────────────────────────────────
@@ -3536,17 +3652,21 @@ class CompareView(QWidget):
         dims = self._dims.get(side)
         dim_txt = f"{dims[0]}×{dims[1]}" if dims else ""
         active = (side == self._active)
-        accent = theme_mod.c("accent").name()
-        tag_bg = accent if active else "#333"
-        tag = (f"<span style='background:{tag_bg}; color:#fff; padding:1px 7px; "
-               f"border-radius:3px; font-weight:700;'>{side.upper()}</span>")
-        name_col = "#f0f0f0" if active else "#9a9a9a"
-        meta = f"  <span style='color:#6f6f6f;'>{idx+1}/{n}"
+        tag_bg = theme_mod.ACCENT_SOLID if active else theme_mod.solid_hex("cap")
+        tag_fg = "#ffffff" if active else theme_mod.hexc("fg")
+        tag = (f"<span style='background:{tag_bg}; color:{tag_fg}; "
+               f"font-weight:600;'>&nbsp;{side.upper()}&nbsp;</span>")
+        name_col = theme_mod.hexc("fg") if active else theme_mod.hexc("muted")
+        meta = f"  <span style='color:{theme_mod.hexc('faint')};'>{idx+1}/{n}"
         if dim_txt:
             meta += f" · {dim_txt}"
         meta += "</span>"
         return (f"<div style='padding:6px;'>{tag} "
                 f"<span style='color:{name_col}; font-weight:600;'>{name}</span>{meta}</div>")
+
+    def theme_changed(self):
+        """Mode switch: the frame outlines and header text carry colour."""
+        self._set_active(self._active)
 
     def _update_header(self):
         self._head_a.setText(self._head_html("a", self._idx_a))
@@ -3636,11 +3756,7 @@ class CompareView(QWidget):
         ctrl = event.modifiers() & Qt.KeyboardModifier.ControlModifier
 
         if key == Qt.Key.Key_Escape:
-            w = self.window()
-            if w and w.isFullScreen():
-                self.fullscreen_requested.emit()
-            else:
-                self.closed.emit()
+            self.closed.emit()          # leave compare; full screen is untouched
         elif key in (Qt.Key.Key_F, Qt.Key.Key_F11):
             self.fullscreen_requested.emit()
         elif key == Qt.Key.Key_S and not ctrl:

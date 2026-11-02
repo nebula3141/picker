@@ -25,8 +25,11 @@ _CLASSES_ROOT = r"Software\Classes"
 
 
 def _exe_path() -> str:
+    r"""The command prefix for shell verbs. Always quoted: an unquoted path with
+    a space in it ("D:\My Apps\PICker.exe") makes Windows try to run
+    "D:\My.exe" first, which anyone able to write that folder could plant."""
     if getattr(sys, "frozen", False):
-        return sys.executable
+        return f'"{sys.executable}"'
     return f'"{sys.executable}" "{os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "main.py"))}"'
 
 
@@ -160,6 +163,24 @@ def is_registered() -> bool:
         return True
     except OSError:
         return False
+
+
+def repair_if_stale() -> None:
+    """If associations are registered with a command that differs from what
+    this build would write (e.g. the old unquoted exe path, or an exe that has
+    moved), rewrite them. Cheap: one registry read when nothing is stale."""
+    if not _HAVE_WINREG or not is_registered():
+        return
+    try:
+        key = winreg.OpenKeyEx(winreg.HKEY_CURRENT_USER,
+                               rf"{_CLASSES_ROOT}\{PROG_ID}\shell\open\command",
+                               0, winreg.KEY_READ)
+        current, _ = winreg.QueryValueEx(key, "")
+        winreg.CloseKey(key)
+    except OSError:
+        return
+    if current != f'{_exe_path()} "%1"':
+        register()
 
 
 def _delete_tree(hive, subkey: str):

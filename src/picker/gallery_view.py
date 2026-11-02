@@ -93,6 +93,22 @@ _cache_file = cache_file
 # info, so validating the dimension cache needs a stat per file — done on a
 # worker instead of the UI thread.
 
+
+
+def _fill_source(pm, rect):
+    """The centred part of ``pm`` with ``rect``'s proportions — drawing it into
+    ``rect`` fills the tile without stretching the photo."""
+    pw, ph = pm.width(), pm.height()
+    if pw <= 0 or ph <= 0 or rect.width() <= 0 or rect.height() <= 0:
+        return QRectF(0, 0, pw, ph)
+    want = rect.width() / rect.height()
+    have = pw / ph
+    if have > want:                      # photo wider: trim the sides
+        w = ph * want
+        return QRectF((pw - w) / 2, 0, w, ph)
+    h = pw / want                        # photo taller: trim top and bottom
+    return QRectF(0, (ph - h) / 2, pw, h)
+
 class _LookupSignals(QObject):
     done = pyqtSignal(object, object)   # hits {path: (w,h)}, sigs {path: sig}
 
@@ -170,6 +186,7 @@ class _GalleryCanvas(QWidget):
         self._requested: set[str] = set()
         self._last_scan_rect = QRect()
         self._pending_headers: set[str] = set()
+        self._unknown: set[int] = set()
         self._total_headers = 0
         self._stopped = False
 
@@ -205,40 +222,60 @@ class _GalleryCanvas(QWidget):
         if self._stopped:
             return
         self._sigs = sigs
-        misses = []
+        known = []
+        self._unknown = set()
         for path, idx in self._index_by_path.items():
             dims = hits.get(path)
             if dims is not None and dims[1] > 0:
                 self._aspects[idx] = dims[0] / dims[1]
+                known.append(self._aspects[idx])
             else:
-                misses.append(path)
-        self._pending_headers = set(misses)
-        self.load_progress.emit(self._total_headers - len(misses), self._total_headers)
+                self._unknown.add(idx)
+        # Unknown sizes get the folder's average aspect and are read only when
+        # they approach the viewport (see _schedule_visible) — not all at once.
+        if known:
+            est = sum(known) / len(known)
+            for idx in self._unknown:
+                self._aspects[idx] = est
+        self._pending_headers = set()
+        self.load_progress.emit(self._total_headers, self._total_headers)
         self._recompute_layout()
-        if misses:
-            self._svc.request_dims(self._manager.source_folder, misses)
-        else:
-            self.load_done.emit()
+        self.load_done.emit()
+
+    def _request_visible_dims(self, index_range):
+        if not self._unknown:
+            return
+        images = self._manager.images
+        want = []
+        for idx in index_range:
+            if idx in self._unknown and idx < len(images):
+                p = images[idx].path
+                if p not in self._pending_headers:
+                    self._pending_headers.add(p)
+                    want.append(p)
+        if want:
+            self._svc.request_dims(self._manager.source_folder, want)
 
     @pyqtSlot(str, object)
     def _on_dims_ready(self, source: str, results):
         if self._stopped or source != self._manager.source_folder or not self._pending_headers:
             return
-        for p, w, h, _exact, _sig in results:
+        changed = False
+        for p, w, h, exact, _sig in results:
             if p not in self._pending_headers:
                 continue
             self._pending_headers.discard(p)
             idx = self._index_by_path.get(p)
-            if idx is not None and h > 0:
+            if idx is None:
+                continue
+            # One header attempt per tile: an inexact answer (video, HEIC) must
+            # not be re-requested on every relayout — the thumbnail settles it.
+            self._unknown.discard(idx)
+            if exact and h > 0:
                 self._aspects[idx] = w / h
-        done = self._total_headers - len(self._pending_headers)
-        self.load_progress.emit(done, self._total_headers)
-        if self._pending_headers:
+                changed = True
+        if changed:
             self._relayout_timer.start()
-        else:
-            self._relayout_timer.stop()
-            self._recompute_layout()
-            self.load_done.emit()
 
     @pyqtSlot(str)
     def _on_thumb_ready(self, path: str):
@@ -252,7 +289,9 @@ class _GalleryCanvas(QWidget):
         if pm is None:
             return
         h = pm.height()
-        if h > 0:
+        if h > 0 and not self._store.is_placeholder(path):
+            self._unknown.discard(idx)
+            self._pending_headers.discard(path)
             actual_aspect = pm.width() / h
             if abs(actual_aspect - self._aspects.get(idx, 0)) > 0.01:
                 self._aspects[idx] = actual_aspect
@@ -274,6 +313,8 @@ class _GalleryCanvas(QWidget):
         images = self._manager.images
         src = self._manager.source_folder
         wanted: set[str] = set()
+        self._request_visible_dims(
+            self._index_range(vis.top() - self.LOOKAHEAD * 2, vis.bottom() + self.LOOKAHEAD * 2))
         for idx in self._index_range(vis.top() - self.LOOKAHEAD, vis.bottom() + self.LOOKAHEAD):
             if idx >= len(images):
                 break
@@ -433,7 +474,15 @@ class _GalleryCanvas(QWidget):
             rec = images[idx]
             pm = self._store.get(rec.path)
             if pm is not None:
-                painter.drawPixmap(tile.rect, pm)
+                # The thumbnail is authoritative: if the tile's shape came from
+                # a stale or guessed size (e.g. on a revisit, when no thumbnail
+                # "arrives" to correct it), take the photo's shape.
+                if (pm.height() > 0 and not self._store.is_placeholder(rec.path)
+                        and abs(pm.width() / pm.height() - self._aspects.get(idx, 0))
+                        > 0.05 * (pm.width() / pm.height())):
+                    self._aspects[idx] = pm.width() / pm.height()
+                    self._relayout_timer.start()
+                painter.drawPixmap(QRectF(tile.rect), pm, _fill_source(pm, tile.rect))
             else:
                 painter.fillRect(tile.rect, placeholder)
 

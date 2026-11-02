@@ -2,7 +2,7 @@
 
 > A complete, implementation-agnostic description of **what PICker does** — every feature,
 > screen, behavior, and option. No code or algorithms; this is the "what to build," not the
-> "how." Use it to rebuild the app on any stack. Current version: **4.7.0**.
+> "how." Use it to rebuild the app on any stack. Current version: **5.0.0**.
 
 ---
 
@@ -260,7 +260,18 @@ releases the file when leaving so the file can be moved/renamed/deleted.)
   cached listings re-validate against the folder's modification time.
 - **Nothing is re-done:** one recursive walk records the counts of every folder beneath it;
   image dimensions are remembered so grids lay out correctly on the first paint; searching
-  refilters the grid in place; viewer positions are written lazily, not per keypress.
+  refilters the grid in place; viewer positions and settings are written lazily in the
+  background, not per keypress.
+- **Only what's on screen is read.** A folder's photo sizes come from the remembered index;
+  any that aren't known yet borrow the folder's average shape and are measured only when
+  they come near the viewport — a first visit to a folder of thousands of photos reads a
+  few dozen headers, not thousands.
+- **The folder index outlives the app.** Listings (names, sizes, dimensions) of visited
+  folders are saved and reloaded at the next launch, validated against each folder's
+  modification time, so the first folder opened after starting is served from memory. The
+  folder last used is warmed in the background right after launch.
+- **Launch loads only the first screen's code** — the viewer, gallery, dialogs and the
+  RAW/HEIF decoders are imported the first time they're actually used.
 
 ---
 
@@ -329,7 +340,7 @@ releases the file when leaving so the file can be moved/renamed/deleted.)
 - Reset settings to defaults (keeps editor paths, file associations, recents).
 
 **Appearance**
-- Theme: dark or light.
+- Appearance: Light mode on/off (dark is the default) and Animation on/off; both apply live.
 
 **Overlays**
 - EXIF overlay position; histogram position; histogram style (RGB / luminance).
@@ -404,7 +415,7 @@ All local and disposable:
 
 **Global / window**
 - Home (Library); Open Folder; Sort (`Ctrl+Shift+S`); Sort-Multi (`Ctrl+Alt+S`); toggle
-  theme; quit; fullscreen; show shortcuts.
+  light/dark mode (`Ctrl+T`); animation on/off (`Ctrl+Shift+M`); quit; fullscreen; show shortcuts.
 
 **Sort (two panes)**
 - Arrows / Home / End / PgUp / PgDn move; Space copy to destination; Enter preview; Tab switch

@@ -19,7 +19,7 @@ class SaveModeDialog(QDialog):
         self._source = Path(source_path)
         self._choice: str | None = None
         self.setWindowTitle("Save changes")
-        self.setStyleSheet(theme_mod.dialog_qss())
+        theme_mod.bind(self, lambda: theme_mod.dialog_qss())
         self.setModal(True)
         self.setMinimumWidth(460)
         self._build()

@@ -29,7 +29,7 @@ def is_portable() -> bool:
 def portable_dir() -> Path | None:
     return _portable_dir
 
-SETTINGS_VERSION = 3
+SETTINGS_VERSION = 4
 
 DEFAULTS = {
     # ── Internal
@@ -59,10 +59,13 @@ DEFAULTS = {
     "include_subfolders": True,
     "exclude_hidden": True,
     "file_types": ["jpeg", "png", "tiff", "webp", "bmp", "heif", "svg", "raw"],
+    # Every type you've been offered — a type added later than this list is
+    # switched on for you; one you've seen and turned off stays off.
+    "file_types_known": ["jpeg", "png", "tiff", "webp", "bmp", "heif", "svg", "raw"],
     "include_videos": True,              # show .mp4/.mov/etc alongside images
 
     # ── Appearance
-    "theme": "dark",                     # "dark"|"light"
+    "theme": "dark",                     # "dark" | "light"
 
     # ── External editors (auto-detect if empty)
     "photoshop_path": "",
@@ -95,6 +98,12 @@ DEFAULTS = {
 
     # ── Slideshow animation
     "slideshow_animation": True,         # cross-fade between images in fullscreen
+    # ── Interface motion: one switch for every transition (off = instant)
+    "ui_motion": True,
+    # ── Folder browser: scroll track labelled with capture times
+    "timeline_scroll": True,
+    # ── Window: full screen is a mode you choose; it survives restarts
+    "fullscreen": False,
 
     # ── File associations
     "file_associations_registered": False,
@@ -141,6 +150,42 @@ def _migrate_v2_to_v3(data: dict) -> dict:
         data["default_resolution_pct"] = 50
     data["settings_version"] = 3
     return data
+
+
+@_migration(3)
+def _migrate_v3_to_v4(data: dict) -> dict:
+    # 5.0 folds the viewer-only "slideshow_animation" into one Animation switch
+    # for the whole app. Someone who had turned animation off keeps it off.
+    data.setdefault("ui_motion", bool(data.get("slideshow_animation", True)))
+    data["settings_version"] = 4
+    return data
+
+
+# File types PICker offered before it recorded which ones you'd been shown
+# (4.8 and earlier). SVG arrived in 4.9 and HEIC/AVIF in 4.10 without an
+# upgrade step, so a list saved earlier silently skipped those files.
+_TYPES_BEFORE_TRACKING = ("jpeg", "png", "tiff", "webp", "bmp", "raw")
+
+
+def _reconcile_file_types(data: dict) -> bool:
+    """Switch on file types added since these settings were saved.
+
+    ``file_types_known`` records every type the user has been offered. A type
+    missing from it is new to them — enable it. A known type that's off was
+    turned off on purpose — leave it. Returns True if ``data`` changed."""
+    types = data.get("file_types")
+    if not isinstance(types, list):
+        return False
+    all_types = list(DEFAULTS["file_types"])
+    known = data.get("file_types_known")
+    if not isinstance(known, list):
+        known = list(_TYPES_BEFORE_TRACKING)
+    new = [t for t in all_types if t not in known and t not in types]
+    changed = bool(new) or sorted(known) != sorted(all_types)
+    if new:
+        data["file_types"] = list(types) + new
+    data["file_types_known"] = all_types
+    return changed
 
 
 def _run_migrations(data: dict) -> dict:
@@ -318,8 +363,10 @@ def load() -> dict:
             raw = json.loads(text)
             if isinstance(raw, dict):
                 version = raw.get("settings_version", 0)
-                if version < SETTINGS_VERSION:
+                migrated = version < SETTINGS_VERSION
+                if migrated:
                     raw = _run_migrations(raw)
+                if _reconcile_file_types(raw) or migrated:
                     save(raw)
                 data.update({k: v for k, v in raw.items() if k in DEFAULTS})
     except json.JSONDecodeError:
@@ -335,19 +382,50 @@ def load() -> dict:
     return dict(data)
 
 
-def save(data: dict) -> None:
-    """Atomic write: dump to .tmp, fsync, rename. A crash mid-write leaves
-    the previous good file intact instead of an empty/partial JSON that
-    `load()` would silently fall back to defaults for (= losing all user prefs)."""
-    global _mem, _mem_path
+_save_lock = _threading.Lock()
+_save_timer: "_threading.Timer | None" = None
+_save_pending = False
+_SAVE_DELAY = 0.4
+
+
+def save(data: dict, *, immediate: bool = False) -> None:
+    """Update settings. The in-memory copy changes at once; the disk write is
+    debounced onto a background thread (and flushed on exit), because an atomic
+    write + fsync on the UI thread stalled the window on things as ordinary as
+    toggling the theme or remembering a folder."""
+    global _mem, _mem_path, _save_timer, _save_pending
     try:
         merged = dict(DEFAULTS)
         merged.update({k: v for k, v in data.items() if k in DEFAULTS})
         target = _settings_file()
         _mem = dict(merged)            # keep cache in sync with what we persist
         _mem_path = str(target)
+        if immediate:
+            flush_settings()
+            return
+        with _save_lock:
+            _save_pending = True
+            if _save_timer is None:
+                _save_timer = _threading.Timer(_SAVE_DELAY, flush_settings)
+                _save_timer.daemon = True
+                _save_timer.start()
+    except Exception as e:
+        from . import log
+        log.error("settings save failed", err=str(e))
+
+
+def flush_settings() -> None:
+    """Write pending settings to disk now (atomic). Safe from any thread."""
+    global _save_timer, _save_pending
+    with _save_lock:
+        _save_timer = None
+        if not _save_pending or _mem is None or _mem_path is None:
+            return
+        _save_pending = False
+        payload = json.dumps(dict(_mem), indent=2)
+        target = Path(_mem_path)
+    try:
         tmp = target.with_suffix(target.suffix + ".tmp")
-        payload = json.dumps(merged, indent=2)
         with open(tmp, "w", encoding="utf-8") as f:
             f.write(payload)
             try:

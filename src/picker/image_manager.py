@@ -145,7 +145,7 @@ class UndoEntry:
 
 
 class ImageManager:
-    MAX_UNDO = 50
+    MAX_UNDO = 2000     # every send this session stays undoable from the destinations panel
 
     def __init__(self, source_folder: str, destinations: list[dict], mode: str, resolution_pct: int,
                  progress_cb=None, include_subfolders: bool | None = None):
@@ -155,6 +155,9 @@ class ImageManager:
         self.resolution_pct = resolution_pct
         self.images: list[ImageRecord] = []
         self.undo_stack: list[UndoEntry] = []
+        # Views that show destinations live (Multi Sort's panel) subscribe here:
+        # fn(event, dest_idx, dest_path, src_path) with event "send" | "undo".
+        self._listeners: list = []
         self.rotations: dict[str, int] = {}     # filename -> 0/90/180/270 (in-memory; not persisted)
         # Optional conflict callback: fn(src_path, dest_path) -> "replace"|"rename"|"skip"|"cancel"
         self.conflict_handler = None
@@ -428,6 +431,7 @@ class ImageManager:
         )
         rec.status = f"dest_{dest_idx}"
         self._push_undo(entry)
+        self._notify("send", dest_idx, str(dest_path), rec.path)
         return None
 
     def undo(self) -> str | None:
@@ -451,7 +455,44 @@ class ImageManager:
                     return str(e)
 
         rec.status = entry.prev_status
+        self._notify("undo", entry.dest_idx, entry.dest_path, rec.path)
         return None
+
+    def undo_send(self, dest_path: str) -> str | None:
+        """Undo one specific send from this session — not just the latest —
+        identified by where the file landed. A copy is deleted; a moved file
+        goes back to the source. Files that were already in the destination
+        before this session are never touched (they have no entry here)."""
+        norm = os.path.normcase(os.path.abspath(dest_path))
+        for i in range(len(self.undo_stack) - 1, -1, -1):
+            e = self.undo_stack[i]
+            if e.action == "send" and os.path.normcase(os.path.abspath(e.dest_path)) == norm:
+                # rotate it to the top and reuse undo() so both paths stay one
+                self.undo_stack.append(self.undo_stack.pop(i))
+                return self.undo()
+        return "That file wasn't sent in this session."
+
+    def session_sends(self) -> set[str]:
+        """Normalised destination paths this session sent (and can undo)."""
+        return {os.path.normcase(os.path.abspath(e.dest_path))
+                for e in self.undo_stack if e.action == "send"}
+
+    def add_listener(self, fn) -> None:
+        if fn not in self._listeners:
+            self._listeners.append(fn)
+
+    def remove_listener(self, fn) -> None:
+        try:
+            self._listeners.remove(fn)
+        except ValueError:
+            pass
+
+    def _notify(self, event: str, dest_idx: int, dest_path: str, src_path: str) -> None:
+        for fn in list(self._listeners):
+            try:
+                fn(event, dest_idx, dest_path, src_path)
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------ stats
 

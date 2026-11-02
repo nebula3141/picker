@@ -11,6 +11,7 @@ from . import settings as settings_mod
 from . import external
 from . import recent as recent_mod
 from . import theme as theme_mod
+from . import instrument as inst
 from .sysfeatures import windows_features_enabled
 
 
@@ -36,30 +37,33 @@ FILE_TYPE_LABELS = [
 # Only the rules unique to this dialog (paged scroll area + sidebar nav); the
 # base (cards, inputs, toggles, buttons, #primary/#danger/#hint/#detected,
 # scrollbars, #divider) comes from theme.dialog_qss().
-_EXTRA_QSS = """
-QScrollArea { background: #141416; border: 0; }
-QScrollArea > QWidget > QWidget { background: #141416; }
+def _extra_qss() -> str:
+    t = theme_mod
+    return f"""
+QScrollArea {{ background: transparent; border: 0; }}
+QScrollArea > QWidget > QWidget {{ background: transparent; }}
 
-QListWidget#nav {
-    background: #1a1a1e;
-    border: 1px solid #26262c;
-    border-radius: 12px;
+QListWidget#nav {{
+    background: {t.hexc('deck')};
+    border: 1px solid {t.hexc('rail')};
+    border-radius: {t.RADIUS}px;
     padding: 6px;
     outline: 0;
     font-size: 13px;
-}
-QListWidget#nav::item {
-    color: #b6b6bf;
-    padding: 10px 12px;
-    border-radius: 8px;
-    margin: 2px 0;
-}
-QListWidget#nav::item:hover { background: #24242a; color: #eaeaef; }
-QListWidget#nav::item:selected {
-    background: #3b82f6;
-    color: #ffffff;
+}}
+QListWidget#nav::item {{
+    color: {t.hexc('muted')};
+    padding: 9px 12px;
+    border-radius: 5px;
+    margin: 1px 0;
+}}
+QListWidget#nav::item:hover {{ background: {t.hexc('deck_high')}; color: {t.hexc('fg')}; }}
+QListWidget#nav::item:selected {{
+    background: {t.hexc('glass_high')};
+    color: {t.hexc('fg')};
+    border-left: 2px solid {t.hexc('accent')};
     font-weight: 600;
-}
+}}
 """
 
 
@@ -71,10 +75,15 @@ class SettingsDialog(QDialog):
         self.setWindowIcon(app_icon())
         self.setMinimumSize(760, 680)
         self.resize(820, 720)
-        self.setStyleSheet(theme_mod.dialog_qss() + _EXTRA_QSS)
+        theme_mod.bind(self, lambda: theme_mod.dialog_qss() + _extra_qss())
         self._build_ui()
         self._set_accessible_names()
         self._load()
+        # Start on the section list, not the first checkbox — a focus ring on
+        # an arbitrary control at open reads like an error.
+        # (after show — Qt assigns first-in-chain focus when the dialog appears)
+        from PyQt6.QtCore import QTimer
+        QTimer.singleShot(0, lambda: self._nav.setFocus(Qt.FocusReason.OtherFocusReason))
 
     # ── UI construction ───────────────────────────────────────────────────────
 
@@ -86,10 +95,11 @@ class SettingsDialog(QDialog):
         header = QVBoxLayout()
         header.setSpacing(2)
         title = QLabel("Settings")
-        title.setStyleSheet("color:#fff; font-size:22px; font-weight:700; letter-spacing:-0.3px;")
+        theme_mod.bind(title, lambda: f"color: {theme_mod.hexc('fg')}; font-size: 22px;"
+                                       f" font-weight: 600; letter-spacing: -0.3px;")
         header.addWidget(title)
         subtitle = QLabel("Configure defaults, performance, and appearance.")
-        subtitle.setStyleSheet("color:#8a8a8a; font-size:12px;")
+        theme_mod.bind(subtitle, lambda: f"color: {theme_mod.hexc('muted')}; font-size: 12px;")
         header.addWidget(subtitle)
         outer.addLayout(header)
 
@@ -210,7 +220,7 @@ class SettingsDialog(QDialog):
             "preload_spin": "Preload count",
             "auto_advance_cb": "Auto advance on send",
             "filmstrip_cb": "Show filmstrip",
-            "animation_cb": "Slideshow animation",
+            "motion_switch": "Animation",
             "confirm_delete_cb": "Ask before deleting",
             "send_feedback_cb": "Send feedback flash",
             "conflict_combo": "Conflict handling",
@@ -222,7 +232,7 @@ class SettingsDialog(QDialog):
             "hidden_cb": "Exclude hidden files",
             "videos_cb": "Include videos",
             "cache_mb_spin": "Thumbnail cache cap",
-            "theme_combo": "Theme",
+            "light_switch": "Light mode",
             "exif_pos_combo": "EXIF overlay position",
             "hist_pos_combo": "Histogram overlay position",
             "hist_style_combo": "Histogram style",
@@ -350,8 +360,6 @@ class SettingsDialog(QDialog):
         self.filmstrip_cb = QCheckBox("Show filmstrip bar")
         g.addWidget(self.filmstrip_cb, 2, 0, 1, 3)
 
-        self.animation_cb = QCheckBox("Animate image transitions in fullscreen")
-        g.addWidget(self.animation_cb, 3, 0, 1, 3)
 
         self.confirm_delete_cb = QCheckBox("Ask before deleting (otherwise sends straight to the Recycle Bin)")
         g.addWidget(self.confirm_delete_cb, 4, 0, 1, 3)
@@ -514,12 +522,17 @@ class SettingsDialog(QDialog):
         g = QGridLayout(grp)
         g.setSpacing(12)
         g.setColumnStretch(2, 1)
-        g.addWidget(QLabel("Theme"), 0, 0)
-        self.theme_combo = QComboBox()
-        self.theme_combo.addItem("Dark", "dark")
-        self.theme_combo.addItem("Light", "light")
-        self.theme_combo.setFixedWidth(140)
-        g.addWidget(self.theme_combo, 0, 1, Qt.AlignmentFlag.AlignLeft)
+        # Two live switches. Both apply when you press Save; Ctrl+T and
+        # Ctrl+Shift+M flip them from anywhere without opening Settings.
+        self.light_switch = inst.ToggleSwitch("Light mode", theme_mod.is_light())
+        g.addWidget(self.light_switch, 0, 0, 1, 3)
+        self.motion_switch = inst.ToggleSwitch("Animation", True)
+        g.addWidget(self.motion_switch, 1, 0, 1, 3)
+        hint = QLabel("On: short fades and eased hovers give the interface presence. "
+                      "Off: every change is instant, including photo transitions.")
+        hint.setObjectName("hint")
+        hint.setWordWrap(True)
+        g.addWidget(hint, 2, 0, 1, 3)
         return grp
 
     # Overlays
@@ -716,9 +729,10 @@ class SettingsDialog(QDialog):
         # 3) In-memory scan caches (folder browser) + dimension/position memory
         try:
             from . import album_browser_view as abv
-            from . import dim_cache
+            from . import dim_cache, listing_cache
             abv.invalidate_scan_cache()
             dim_cache.reset()
+            listing_cache.clear()
             settings_mod.clear_positions()
         except Exception:
             pass
@@ -785,7 +799,12 @@ class SettingsDialog(QDialog):
         self.full_res_cb.setChecked(bool(data.get("display_full_resolution", False)))
         # Reflect the checkbox state in dropdown visibility on open.
         self._sync_res_combo_visible(self.full_res_cb.isChecked())
-        self._select_data(self.thumb_size_combo, int(data.get("thumbnail_row_height", 170)))
+        # The Size knob can set any height; show it rather than snapping to the
+        # first preset (which Save would then write back over the user's size).
+        rh = int(data.get("thumbnail_row_height", 170))
+        if self.thumb_size_combo.findData(rh) < 0:
+            self.thumb_size_combo.addItem(f"Custom ({rh} px)", rh)
+        self._select_data(self.thumb_size_combo, rh)
         self._select_data(self.group_by_combo, data.get("group_by", "flat"))
         self._select_data(self.group_gran_combo, data.get("date_group_granularity", "day"))
         self._sync_group_gran_enabled()
@@ -793,7 +812,7 @@ class SettingsDialog(QDialog):
         self.preload_spin.setValue(int(data.get("preload_count", 2)))
         self.auto_advance_cb.setChecked(bool(data.get("auto_advance_on_send", True)))
         self.filmstrip_cb.setChecked(bool(data.get("show_filmstrip", True)))
-        self.animation_cb.setChecked(bool(data.get("slideshow_animation", True)))
+        self.motion_switch.setChecked(bool(data.get("ui_motion", True)))
         self.confirm_delete_cb.setChecked(bool(data.get("confirm_delete", True)))
         self.send_feedback_cb.setChecked(bool(data.get("send_feedback", True)))
         self._select_data(self.conflict_combo, data.get("conflict_default", "ask"))
@@ -816,7 +835,7 @@ class SettingsDialog(QDialog):
         self.cache_mb_spin.setValue(int(data.get("thumb_cache_mb", 1024)))
         self._refresh_cache_size()
 
-        self._select_data(self.theme_combo, data.get("theme", "dark"))
+        self.light_switch.setChecked(data.get("theme", "dark") == "light")
 
         self._select_data(self.exif_pos_combo, data.get("exif_position", "tr"))
         self._select_data(self.hist_pos_combo, data.get("histogram_position", "br"))
@@ -885,7 +904,8 @@ class SettingsDialog(QDialog):
             "preload_count": int(self.preload_spin.value()),
             "auto_advance_on_send": bool(self.auto_advance_cb.isChecked()),
             "show_filmstrip": bool(self.filmstrip_cb.isChecked()),
-            "slideshow_animation": bool(self.animation_cb.isChecked()),
+            "slideshow_animation": bool(self.motion_switch.isChecked()),
+            "ui_motion": bool(self.motion_switch.isChecked()),
             "confirm_delete": bool(self.confirm_delete_cb.isChecked()),
             "send_feedback": bool(self.send_feedback_cb.isChecked()),
             "conflict_default": self.conflict_combo.currentData() or "ask",
@@ -905,7 +925,7 @@ class SettingsDialog(QDialog):
 
             "thumb_cache_mb": int(self.cache_mb_spin.value()),
 
-            "theme": self.theme_combo.currentData() or "dark",
+            "theme": "light" if self.light_switch.isChecked() else "dark",
 
             "exif_position": self.exif_pos_combo.currentData() or "tr",
             "histogram_position": self.hist_pos_combo.currentData() or "br",

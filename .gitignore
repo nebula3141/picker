@@ -48,3 +48,6 @@ dist_multi/
 
 # Build logs
 *.log
+
+# Design tooling cache (impeccable)
+.impeccable/

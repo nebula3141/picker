@@ -1,5 +1,162 @@
 # Changelog
 
+## v5.0.0 (2026-09-28)
+
+### A new look: light, transparent, instant
+- **Redesigned interface.** Chrome is now translucent glass over one ground colour,
+  with hairline edges and a single blue accent. Photos are the only saturated, solid
+  thing on screen.
+  - Buttons are quiet glass chips; the one main action per screen (Sort, Add folder,
+    Save) is a solid blue button.
+  - Labels use the system's UI font in natural case. Folder and file names are shown
+    exactly as they're spelled, never uppercased.
+  - Counts sit in a compact readout sized to its contents.
+  - Focus and selection are marked with corner brackets and outlines, never a colour
+    wash over your photos.
+
+  Keyboard navigation, focus indicators, accessible names and shortcuts all work as
+  before. Every icon is drawn: the video player's emoji buttons and the library
+  manager's emoji folder are gone.
+- **Light and Dark modes.** Toggle with **Ctrl+T**, **View → Light Mode**, or the switch
+  in **Settings → Appearance**. Switching is instant (about 25 ms): the screen you're
+  on repaints in place, so you keep your folder, scroll position, selection and Sort
+  counts. Text in both modes meets WCAG AA contrast (4.5:1), and a test enforces it.
+  On Windows the title bar follows the mode.
+- **Animation switch.** **View → Animation** (Ctrl+Shift+M) or **Settings →
+  Appearance**:
+  - On, screens arrive with a short fade and buttons ease into hover.
+  - Off, every change is instant, including photo cross-fades.
+
+  One switch now controls all motion. The old fullscreen-only animation checkbox has
+  been folded into it.
+- **Lighter transitions.** Changing screens no longer snapshots the old screen or
+  re-renders the new one offscreen. A single dissolving layer does the job, or nothing
+  at all with Animation off.
+- **Timeline scrollbar.** In a folder, the scroll track is labelled with when the photos
+  were taken. The labels adapt to the folder:
+  - clock times ("12:45 AM") when everything is from one day;
+  - days ("Sep 12") within a year;
+  - months or years for longer spans.
+
+  How it works:
+  - **Moving along it.** Drag anywhere and the grid follows the pointer immediately;
+    click and it glides there. Hover or scroll and a bubble shows the exact date and
+    time.
+  - **Capture times.** They come from the library index, then from each photo's EXIF
+    date (read in the background), then from the file date.
+  - **Speed.** Scrubbing across 3,000 photos stays under 7 ms per step. Rows you fly
+    past aren't decoded until you stop.
+  - **Turning it off.** It's on by default; the button at the top right, above the
+    rail, switches it off.
+- **Smooth scrolling.** The mouse wheel glides instead of jumping, and fast spins build
+  up into one continuous motion. Touchpads are unaffected, and turning Animation off
+  makes it instant.
+- **The folder view fills the window.**
+  - Photos run edge to edge in justified rows: each full row is scaled to exactly the
+    width of the window, and every photo keeps its own proportions.
+  - The gaps between photos are a 1px hairline.
+  - The "PHOTOS" heading only appears when a folder mixes subfolders and photos, and
+    the chrome around the grid is tighter.
+- **Search** is a magnifier button that opens into the search box (Ctrl+F; Esc clears
+  and closes it). A "This folder / Whole library" switch sits in the search bar with
+  both options always visible, and works from the keyboard.
+- **One bar along the bottom of the window.**
+  - Left: where you are, clearly legible with a folder mark. It follows you into
+    subfolders and shows the current photo in the viewer.
+  - Right: tile size (a slider between zoom-out and zoom-in magnifiers) and the full
+    screen button.
+- **Full screen is your choice, and it stays.** Turn it on or off from View → Full
+  Screen (F11), the button at the bottom right, or F in the viewer. Opening a photo no
+  longer switches the window to full screen, and Esc in the viewer goes straight back
+  to the folder instead of first dropping out of full screen. Your choice is
+  remembered between launches.
+- **One Sort: Multi Sort.** The two-pane Sort is gone. The Sort button in a folder (and
+  File → Sort…, Ctrl+Shift+S) starts Multi Sort with that folder already filled in as
+  the source.
+- **See your destinations fill up while you sort.**
+  - A panel beside the photo shows every destination: its key, name, live count and
+    photos, newest first. A photo appears there the moment you press its number.
+  - Anything sent this session has an **undo** button on hover (or right-click →
+    "Send back"). It returns just that photo: a copy is deleted, a moved file goes back
+    to the source.
+  - Photos that were already in a destination are shown but never touched, and changes
+    made to the folders outside the app appear too.
+  - The panel's Undo button (and Ctrl+Z) still undoes the most recent send.
+- **Sorting keys fixed, and yours to choose.**
+  - In Multi Sort, pressing **1 sends the photo to the first destination**. It used to
+    set a star rating instead, so sorting appeared to do nothing, and the hint bar's
+    "1 Keepers 2 Maybe" was wrong.
+  - Plain keys now sort, and **star rating moved to Ctrl+1–5**. Outside Multi Sort,
+    1–9 send to your Selection locations (they used to be Ctrl+1–9).
+  - Each destination has its own key, chosen in the Sort window. Defaults are 1, 2, 3,
+    4…, and only keys the viewer doesn't already use are offered. Picking a key another
+    folder has swaps the two.
+- **Copy or move is chosen in the Sort window** ("When a key is pressed: Move the photo /
+  Copy the photo"). It always opens on **Copy**, so nothing leaves the source unless
+  you pick Move for that sort.
+- The Sort window labels its columns **Shortcut key · Name · Folder**, so the key
+  dropdown clearly reads as the shortcut for that folder.
+- **Open a destination's photos.** Click a photo in the destinations panel (or
+  right-click → Open) to see it large over the sorting view.
+  - Left/Right (or A/D, the side arrows, the wheel) step through that destination, and
+    Home/End jump to the ends.
+  - "Send back" undoes it if it was sent this session.
+  - Esc returns to sorting.
+- **Copy where you are.** Click the location at the bottom left to copy the name (the
+  photo's file name, or the folder's), or double-click to copy the full path. A short
+  "Copied" confirmation appears, and right-click offers both.
+- The folder view's top bar is quieter: Back is an icon, and the album name sits at the
+  centre of the window.
+- **Library cards scale their cover once** instead of on every repaint, so hover and
+  focus are a plain blit.
+- Fixed: a mode chosen in Settings used to take effect only after a restart.
+- Fixed: Settings, Sort-Multi, the conflict dialog, the library manager, the video
+  controls and the compare view had hard-coded dark colours and broke in light mode.
+- Fixed: **photos squashed into the wrong shape in the folder mosaic.** Portraits shot
+  on a camera or phone (stored landscape with a "rotate 90°" tag) were measured as
+  landscape, and on a revisit nothing corrected it, so a folder of portraits showed
+  every tile as 3:2. They're measured correctly now, and the thumbnail always settles
+  a tile's shape. Tiles crop to fill rather than stretching, and wrong sizes saved by
+  earlier builds are discarded.
+- Fixed: **folders of SVGs (or HEIC/AVIF) showed "no photos"** for anyone whose
+  settings were saved before those formats were added (4.9 and 4.10). The saved
+  File types list never gained the new types. New types now switch on
+  automatically; a type you've seen and turned off stays off.
+- Fixed: the Sort-Multi gallery threw an error on every repaint (a drawing call mixed
+  two rectangle types), so its thumbnails never appeared.
+- Fixed: the toast in the viewer had no visible background, so its text floated over
+  the photo.
+- Fixed: combo-box arrows rendered as a flat bar; they're a drawn chevron now.
+
+### Second speed pass — nothing loads that you can't see
+- **A first visit to a big folder no longer reads every photo's header.** Opening a
+  10,000-photo folder used to spend **68 seconds** reading all 10,000 image headers just
+  to lay out the grid — and those reads starved the dozen thumbnails actually on screen,
+  which took **3.1 s** to appear. Sizes now come from the cache instantly, unknown ones
+  borrow the folder's average shape, and headers are read **only for tiles near the
+  viewport**. First screen of thumbnails: **3120 ms → 28 ms**.
+- **The folder index survives a restart.** The listing (names, sizes, dimensions) of the
+  folders you've visited is saved to one small file and reloaded in the background at
+  launch, so the first folder you open after starting the app comes from memory:
+  **313 ms → 56 ms** on 10,000 photos. It's validated against the folder's modification
+  time, so anything changed on disk is re-scanned instead of trusted.
+- **Warm start** — the folder you were last in has its listing, sizes and first screen of
+  thumbnails loaded in the background right after launch, before you ask for it.
+- **The app starts ~185 ms faster** (500 ms → 316 ms): the viewer, gallery, dialogs,
+  Pillow, pillow-heif and rawpy are loaded the first time they're needed rather than on
+  every launch.
+- **Scrolling and flicking through photos got much cheaper.** Thumbnails were being
+  smooth-scaled from 360 px on *every* repaint; tile-sized copies are now kept ready to
+  blit. Viewer navigation: **14 ms → 3.9 ms per key**. Returning to a big folder:
+  **664 ms → 34 ms**.
+- Removed repeated work on hot paths: path normalisation is memoised (it ran per tile per
+  frame), file modification times are no longer re-checked on every preload, and file-type
+  checks no longer build a `Path` object each time.
+- **Library folder counts use an indexed range scan** instead of a `LIKE` query that
+  forced a full table scan of the photo index.
+- **Settings are written in the background**, debounced and flushed on exit — saving a
+  preference (theme, last folder, tile size) no longer stalls the window on an fsync.
+
 ## v4.11.0 (2026-09-16)
 
 ### New: two-pane Sort

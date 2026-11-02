@@ -1,5 +1,6 @@
 import os
 from PyQt6.QtWidgets import (
+    QComboBox,
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton,
     QGroupBox, QFileDialog, QMessageBox, QFrame
 )
@@ -21,7 +22,10 @@ class DestinationRow(QFrame):
     # (row, global_y) while the grip is dragged — the dialog does the reordering.
     drag_move = pyqtSignal(object, int)
 
-    def __init__(self, name: str = "", path: str = "", on_remove=None, parent=None):
+    key_changed = pyqtSignal(object, str, str)    # (row, old key, new key)
+
+    def __init__(self, name: str = "", path: str = "", on_remove=None, parent=None,
+                 key: str = ""):
         super().__init__(parent)
         self.setObjectName("destRow")
         self._on_remove = on_remove
@@ -30,17 +34,37 @@ class DestinationRow(QFrame):
         layout.setContentsMargins(10, 4, 8, 4)
         layout.setSpacing(8)
 
-        self._grip = QLabel("⠿")
+        # Drawn grip (the braille glyph it replaced has no font coverage on
+        # many systems and rendered as an empty box).
+        self._grip = QLabel()
         self._grip.setObjectName("grip")
         self._grip.setFixedWidth(14)
+        self._grip.setAccessibleName("Drag handle")
+        self._grip.theme_changed = self._paint_grip
+        self._paint_grip()
         self._grip.setCursor(Qt.CursorShape.OpenHandCursor)
-        self._grip.setToolTip("Drag to reorder — order sets the 1 / 2 / 3 keys")
+        self._grip.setToolTip("Drag to reorder")
         self._grip.installEventFilter(self)
         layout.addWidget(self._grip)
 
         self._dot = QLabel()
         self._dot.setFixedSize(6, 6)
         layout.addWidget(self._dot)
+
+        # The key that sends a photo here. Only keys the viewer leaves free are
+        # listed, so a destination can never shadow Rotate, Crop, navigation…
+        from . import sort_keys
+        self.key_combo = QComboBox()
+        for k in sort_keys.ALLOWED:
+            self.key_combo.addItem(k, k)
+        self.key_combo.setFixedWidth(64)
+        self.key_combo.setToolTip("Shortcut key: press it while viewing to send the photo "
+                                  "to this folder")
+        self.key_combo.setAccessibleName("Shortcut key for this folder")
+        self._key = key if key in sort_keys.ALLOWED else "1"
+        self.key_combo.setCurrentIndex(sort_keys.ALLOWED.index(self._key))
+        self.key_combo.currentIndexChanged.connect(self._on_key_combo)
+        layout.addWidget(self.key_combo)
 
         self.name_edit = QLineEdit()
         self.name_edit.setPlaceholderText("Label")
@@ -61,13 +85,27 @@ class DestinationRow(QFrame):
         browse_btn.clicked.connect(self._browse)
         layout.addWidget(browse_btn)
 
-        self._remove_btn = QPushButton("×")
-        self._remove_btn.setObjectName("rowIcon")
-        self._remove_btn.setFixedSize(28, 26)
+        from . import instrument as inst
+        self._remove_btn = inst.KeyCap("", variant="dark", icon="close")
+        self._remove_btn.setFixedSize(28, 28)
         self._remove_btn.setToolTip("Remove")
-        self._remove_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._remove_btn.setAccessibleName("Remove this folder")
         self._remove_btn.clicked.connect(self._remove)
         layout.addWidget(self._remove_btn)
+
+    def _paint_grip(self):
+        from PyQt6.QtCore import QRectF
+        from PyQt6.QtGui import QPainter, QPixmap
+        from . import instrument as inst
+        dpr = self.devicePixelRatioF() or 1.0
+        pm = QPixmap(int(14 * dpr), int(20 * dpr))
+        pm.setDevicePixelRatio(dpr)
+        pm.fill(Qt.GlobalColor.transparent)
+        qp = QPainter(pm)
+        qp.setRenderHint(QPainter.RenderHint.Antialiasing)
+        inst.draw_icon(qp, "grip", QRectF(0, 2, 14, 16), inst._c("muted"))
+        qp.end()
+        self._grip.setPixmap(pm)
 
     def eventFilter(self, obj, ev):
         if obj is self._grip:
@@ -88,8 +126,23 @@ class DestinationRow(QFrame):
     def set_accent_index(self, idx: int):
         c = DEST_ACCENTS[idx % len(DEST_ACCENTS)]
         self._dot.setStyleSheet(f"background:{c}; border-radius:3px;")
-        # Order drives the number-key shortcut, so show it.
-        self._grip.setToolTip(f"Drag to reorder — currently key {idx + 1}")
+
+    def key(self) -> str:
+        return self._key
+
+    def set_key(self, key: str) -> None:
+        """Set without announcing (used when another row takes our old key)."""
+        from . import sort_keys
+        if key in sort_keys.ALLOWED:
+            self._key = key
+            self.key_combo.blockSignals(True)
+            self.key_combo.setCurrentIndex(sort_keys.ALLOWED.index(key))
+            self.key_combo.blockSignals(False)
+
+    def _on_key_combo(self, _i):
+        old, new = self._key, self.key_combo.currentData()
+        self._key = new
+        self.key_changed.emit(self, old, new)
 
     def _browse(self):
         folder = QFileDialog.getExistingDirectory(self, "Select folder")
@@ -106,36 +159,41 @@ class DestinationRow(QFrame):
         path = self.path_edit.text().strip()
         name = self.name_edit.text().strip() or (os.path.basename(path) or "Folder")
         if path:
-            return {"name": name, "path": path}
+            return {"name": name, "path": path, "key": self._key}
         return None
 
 
 # Only the rules unique to this dialog; the base (QDialog, QGroupBox, inputs,
 # buttons, #primary, radios) comes from theme.dialog_qss().
-_EXTRA_QSS = """
-QLabel#tagline { color: #6f6f78; font-style: italic; }
-QPushButton#recent {
-    background: #1c1c20; color: #bbb; padding: 5px 12px;
-    border: 1px solid #2a2a30; border-radius: 13px; font-size: 11px; font-weight: 500;
-}
-QPushButton#recent:hover { background: #26262c; color: #fff; border-color: #3b82f6; }
-QFrame#destRow {
-    background: transparent; border: 1px solid transparent; border-radius: 9px;
-}
-QFrame#destRow:hover { background: #1c1c20; border: 1px solid #2a2a30; }
-QLabel#grip { color: #55555f; font-size: 14px; }
-QFrame#destRow:hover QLabel#grip { color: #8a8a93; }
-QPushButton#rowIcon {
-    background: transparent; color: #777; border: 1px solid transparent;
-    border-radius: 7px; padding: 0; font-size: 15px;
-}
-QPushButton#rowIcon:hover { background: #2a2a30; color: #ddd; border-color: #3a3a42; }
-QPushButton#addDest {
-    background: transparent; color: #7a7a7a; border: 1px dashed #3a3a42;
-    border-radius: 9px; padding: 8px 14px; font-size: 12px;
-}
-QPushButton#addDest:hover { color: #cfcfcf; border-color: #55555f; background: #1a1a1e; }
-QPushButton#addDest:disabled { color: #444; border-color: #2a2a30; }
+def _extra_qss() -> str:
+    t = theme_mod
+    return f"""
+QLabel#tagline {{ color: {t.hexc('muted')}; }}
+QLabel#colHead {{ color: {t.hexc('muted')}; font-size: 11px; font-weight: 600; }}
+QPushButton#recent {{
+    background: {t.hexc('cap_alt')}; color: {t.hexc('fg')}; padding: 5px 12px;
+    border: 1px solid {t.hexc('rail')}; border-radius: 13px; font-size: 11px; font-weight: 500;
+}}
+QPushButton#recent:hover {{ background: {t.hexc('cap')}; border-color: {t.hexc('accent')}; }}
+QFrame#destRow {{
+    background: transparent; border: 1px solid transparent; border-radius: {t.RADIUS}px;
+}}
+QFrame#destRow:hover {{ background: {t.hexc('deck')}; border: 1px solid {t.hexc('rail')}; }}
+QLabel#grip {{ color: {t.hexc('faint')}; font-size: 14px; }}
+QFrame#destRow:hover QLabel#grip {{ color: {t.hexc('muted')}; }}
+QPushButton#rowIcon {{
+    background: transparent; color: {t.hexc('muted')}; border: 1px solid transparent;
+    border-radius: 5px; padding: 0; font-size: 15px;
+}}
+QPushButton#rowIcon:hover {{ background: {t.hexc('deck_high')}; color: {t.hexc('fg')};
+    border-color: {t.hexc('glass_edge')}; }}
+QPushButton#addDest {{
+    background: transparent; color: {t.hexc('muted')}; border: 1px dashed {t.hexc('glass_edge')};
+    border-radius: {t.RADIUS}px; padding: 8px 14px; font-size: 12px;
+}}
+QPushButton#addDest:hover {{ color: {t.hexc('fg')}; border-color: {t.hexc('muted')};
+    background: {t.hexc('deck')}; }}
+QPushButton#addDest:disabled {{ color: {t.hexc('faint')}; border-color: {t.hexc('rail')}; }}
 """
 
 
@@ -147,7 +205,7 @@ class StartupDialog(QDialog):
         self.setWindowIcon(app_icon())
         self.setMinimumWidth(640)
         self.setModal(True)
-        self.setStyleSheet(theme_mod.dialog_qss() + _EXTRA_QSS)
+        theme_mod.bind(self, lambda: theme_mod.dialog_qss() + _extra_qss())
         self._result_data: dict | None = None
         self._build_ui()
 
@@ -198,6 +256,20 @@ class StartupDialog(QDialog):
         self._dest_group = dest_group
         dest_outer = QVBoxLayout(dest_group)
         dest_outer.setSpacing(4)
+        # Column headings, aligned with the row controls below: the first
+        # dropdown is the keyboard shortcut that sends a photo to that folder.
+        heads = QHBoxLayout()
+        heads.setContentsMargins(10, 0, 8, 0)
+        heads.setSpacing(8)
+        heads.addSpacing(14 + 8 + 6 + 9)              # grip + gap + colour dot + row frame
+        for text, width in (("Shortcut key", 64), ("Name", 110), ("Folder", 0)):
+            lab = QLabel(text)
+            lab.setObjectName("colHead")
+            if width:
+                lab.setFixedWidth(width)
+            heads.addWidget(lab, 0 if width else 1)
+        dest_outer.addLayout(heads)
+
         self._dest_rows_layout = QVBoxLayout()
         self._dest_rows_layout.setSpacing(2)
         dest_outer.addLayout(self._dest_rows_layout)
@@ -211,13 +283,30 @@ class StartupDialog(QDialog):
         add_row.setContentsMargins(10, 4, 10, 0)
         add_row.addWidget(self._add_dest_btn)
         add_row.addStretch()
-        hint = QLabel("Drag ⠿ to reorder — order sets the 1 / 2 / 3 keys")
+        hint = QLabel("Press a folder's shortcut key while viewing to send the photo there")
         hint.setObjectName("hint")
         add_row.addWidget(hint)
         dest_outer.addLayout(add_row)
 
         self._add_dest_row(name="Best")
         root.addWidget(dest_group)
+
+        # Copy or move is part of the sort, so it's decided here — not buried
+        # in Settings (a sort that silently copied looked like it did nothing).
+        from . import instrument as inst
+        mode_row = QHBoxLayout()
+        mode_row.setContentsMargins(4, 0, 4, 0)
+        mode_lbl = QLabel("When a key is pressed")
+        mode_row.addWidget(mode_lbl)
+        # Always starts on Copy: nothing leaves the source unless you pick Move
+        # for this sort (the choice is deliberately not remembered).
+        start_mode = "copy"
+        self._mode = inst.Segmented(
+            [("move", "Move the photo"), ("copy", "Copy the photo")],
+            "move" if start_mode == "move" else "copy", name="Copy or move")
+        mode_row.addWidget(self._mode)
+        mode_row.addStretch(1)
+        root.addLayout(mode_row)
 
         # Buttons
         btn_layout = QHBoxLayout()
@@ -237,11 +326,16 @@ class StartupDialog(QDialog):
         btn_layout.addWidget(ok_btn)
         root.addLayout(btn_layout)
 
-    def _add_dest_row(self, name: str = "", path: str = ""):
+    def _add_dest_row(self, name: str = "", path: str = "", key: str = ""):
         if len(self.dest_rows) >= MAX_DESTS:
             return
-        row = DestinationRow(name=name, path=path, on_remove=self._remove_dest_row)
+        from . import sort_keys
+        taken = {r.key() for r in self.dest_rows}
+        if not key or key in taken:
+            key = sort_keys.default_key(len(self.dest_rows), taken)
+        row = DestinationRow(name=name, path=path, on_remove=self._remove_dest_row, key=key)
         row.drag_move.connect(self._on_row_drag)
+        row.key_changed.connect(self._on_key_changed)
         self._dest_rows_layout.addWidget(row)
         self.dest_rows.append(row)
         self._refresh_dest_accents()
@@ -269,6 +363,12 @@ class StartupDialog(QDialog):
         for r in self.dest_rows:
             self._dest_rows_layout.addWidget(r)
         self._refresh_dest_accents()
+
+    def _on_key_changed(self, row, old: str, new: str):
+        """One key, one destination: whoever had the key gets the old one."""
+        for r in self.dest_rows:
+            if r is not row and r.key() == new:
+                r.set_key(old)
 
     def _remove_dest_row(self, row: DestinationRow):
         if row not in self.dest_rows:
@@ -320,7 +420,7 @@ class StartupDialog(QDialog):
         self._result_data = {
             "source_folder": source,
             "destinations": destinations,
-            "mode": settings_mod.get("default_mode") or "copy",
+            "mode": self._mode.value(),
             "resolution_pct": int(settings_mod.get("default_resolution_pct") or 25),
         }
         recent_mod.add(source)
@@ -342,6 +442,7 @@ class StartupDialog(QDialog):
                 r.deleteLater()
             self.dest_rows.clear()
             for d in dests[:MAX_DESTS]:
-                self._add_dest_row(name=d.get("name", ""), path=d.get("path", ""))
+                self._add_dest_row(name=d.get("name", ""), path=d.get("path", ""),
+                                   key=str(d.get("key") or ""))
             if not self.dest_rows:
                 self._add_dest_row()

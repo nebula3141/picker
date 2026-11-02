@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 import sys
 from pathlib import Path
@@ -20,9 +22,9 @@ os.environ.setdefault(
     ]),
 )
 
-from PyQt6.QtWidgets import QApplication, QMainWindow, QMessageBox, QGraphicsOpacityEffect, QLabel
-from PyQt6.QtCore import Qt, pyqtSlot, QTimer, qInstallMessageHandler, QtMsgType, QPropertyAnimation, QEasingCurve
-from PyQt6.QtGui import QAction, QDragEnterEvent, QDropEvent
+from PyQt6.QtWidgets import QApplication, QMainWindow, QMessageBox, QWidget
+from PyQt6.QtCore import Qt, pyqtSignal, pyqtSlot, QTimer, qInstallMessageHandler, QtMsgType, QEvent, QVariantAnimation
+from PyQt6.QtGui import QAction, QColor, QDragEnterEvent, QDropEvent, QPainter
 
 
 # ── Qt message handler ────────────────────────────────────────────────────────
@@ -82,25 +84,181 @@ def _thread_excepthook(args):
 
 threading.excepthook = _thread_excepthook
 
-from picker.startup_dialog import StartupDialog
-from picker.settings_dialog import SettingsDialog
-from picker.image_manager import ImageManager
-from picker.gallery_view import GalleryView
-from picker.slideshow_view import SlideshowView
-from picker.loading_screen import LoadingScreen
-from picker.album_browser_view import AlbumBrowserView
+# Only what the first screen needs is imported here. The viewer, gallery,
+# dialogs and their dependencies (Pillow, the folder browser, the loading
+# screen) are pulled in the first time they're actually used — they cost ~200 ms
+# of the ~320 ms that module imports used to add to every launch.
+from typing import TYPE_CHECKING
+
 from picker.icon import app_icon
+
+if TYPE_CHECKING:   # annotations only — never imported at runtime
+    from picker.album_browser_view import AlbumBrowserView
+    from picker.gallery_view import GalleryView
+    from picker.image_manager import ImageManager
+    from picker.slideshow_view import SlideshowView
 from picker import __version__
 from picker import recent as recent_mod
 from picker import settings as settings_mod
 from picker import theme as theme_mod
+from picker import motion as motion_mod
 from picker import library as library_mod
 
 
+class _LocationLabel(QWidget):
+    """Where you are, bottom left: a folder mark and the path in the body text
+    colour, middle-elided so the start and the name both stay readable.
+
+    Click copies the name (the photo's file name, or the folder's name);
+    double-click copies the full path. A short "Copied" confirmation shows in
+    place, and right-click offers both as menu items."""
+
+    def __init__(self):
+        super().__init__()
+        self._path = ""
+        self._note = ""
+        self.setMinimumWidth(120)
+        self.setFixedHeight(26)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._note_timer = QTimer(self)
+        self._note_timer.setSingleShot(True)
+        self._note_timer.setInterval(1400)
+        self._note_timer.timeout.connect(self._clear_note)
+
+    def set_path(self, path: str):
+        path = path or ""
+        if path != self._path:
+            self._path = path
+            self.setToolTip(f"{path}\nClick: copy the name  ·  Double-click: copy the full path"
+                            if path else "")
+            self.setAccessibleName(f"Location: {path}" if path else "Location")
+            self.update()
+
+    def _name(self) -> str:
+        return os.path.basename(self._path.rstrip("/\\")) or self._path
+
+    def _copy(self, text: str, note: str):
+        if not text:
+            return
+        QApplication.clipboard().setText(text)
+        self._note = note
+        self._note_timer.start()
+        self.update()
+
+    def _clear_note(self):
+        self._note = ""
+        self.update()
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self._copy(self._name(), "Copied name")
+        elif e.button() == Qt.MouseButton.RightButton:
+            from PyQt6.QtWidgets import QMenu
+            menu = QMenu(self)
+            a_name = menu.addAction(f"Copy name  ({self._name()})")
+            a_full = menu.addAction("Copy full path")
+            chosen = menu.exec(e.globalPosition().toPoint())
+            if chosen is a_name:
+                self._copy(self._name(), "Copied name")
+            elif chosen is a_full:
+                self._copy(self._path, "Copied full path")
+
+    def mouseDoubleClickEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self._copy(self._path, "Copied full path")
+
+    def paintEvent(self, _ev):
+        if not self._path:
+            return
+        from PyQt6.QtCore import QRectF
+        from PyQt6.QtGui import QFontMetrics
+        from picker import instrument as inst
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        inst.draw_icon(p, "folder", QRectF(6, 5, 16, 16), theme_mod.c("accent_text"), 1.6)
+        f = theme_mod.legend_font(10, bold=False, tracking=0.0)
+        p.setFont(f)
+        fm = QFontMetrics(f)
+        note_w = 0
+        if self._note:
+            nf = theme_mod.legend_font(9, tracking=0.2)
+            note_w = QFontMetrics(nf).horizontalAdvance(self._note) + 18
+        avail = max(10, self.width() - 34 - note_w - (8 if note_w else 0))
+        text = fm.elidedText(self._path, Qt.TextElideMode.ElideMiddle, avail)
+        p.setPen(theme_mod.c("fg"))
+        p.drawText(QRectF(28, 0, avail, self.height()),
+                   Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, text)
+        if self._note:
+            x = 28 + fm.horizontalAdvance(text) + 10
+            chip = QRectF(x, 4, note_w, self.height() - 8)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(theme_mod.ACCENT_SOLID))
+            p.drawRoundedRect(chip, 4, 4)
+            p.setPen(QColor(255, 255, 255))
+            p.setFont(theme_mod.legend_font(9, tracking=0.2))
+            p.drawText(chip, Qt.AlignmentFlag.AlignCenter, self._note)
+        p.end()
+
+
+class _Veil(QWidget):
+    """A ground-coloured layer that dissolves off a newly shown view.
+
+    Cheap by construction: one translucent fillRect per frame, transparent to
+    the mouse, gone after the animation. The view beneath keeps its own fast
+    paint path — nothing is snapshotted or re-rendered offscreen."""
+
+    def __init__(self, target: QWidget):
+        super().__init__(target)
+        self._alpha = 1.0
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        self.setGeometry(target.rect())
+        target.installEventFilter(self)
+        self._anim = QVariantAnimation(self)
+        self._anim.setEasingCurve(motion_mod.ease())
+        self._anim.valueChanged.connect(self._step)
+        self._anim.finished.connect(self.deleteLater)
+
+    def run(self, ms: int):
+        self.raise_()
+        self.show()
+        self._anim.setDuration(ms)
+        self._anim.setStartValue(1.0)
+        self._anim.setEndValue(0.0)
+        self._anim.start()
+
+    def _step(self, v):
+        self._alpha = float(v)
+        self.update()
+
+    def eventFilter(self, obj, ev):
+        if ev.type() == QEvent.Type.Resize:
+            self.setGeometry(obj.rect())
+        return False
+
+    def paintEvent(self, _ev):
+        p = QPainter(self)
+        col = QColor(theme_mod.c("bg"))
+        col.setAlphaF(max(0.0, min(1.0, self._alpha)))
+        p.fillRect(self.rect(), col)
+        p.end()
+
+
 class MainWindow(QMainWindow):
+    # Emitted from the warm-start worker thread; being a signal on a main-thread
+    # QObject, it's delivered as a queued call on the UI thread. (A
+    # QTimer.singleShot(0, lambda) from a plain thread is parked in that
+    # thread — which has no event loop — and never fires.)
+    _warm_listing_ready = pyqtSignal(str, object)
+    _update_result = pyqtSignal(object, bool)     # (release | None, manual)
+    _scan_progress = pyqtSignal(int)              # from the scanner thread
+
     def __init__(self, manager: ImageManager | None = None, parent=None,
                  skip_library: bool = False):
         super().__init__(parent)
+        self._warm_listing_ready.connect(self._warm_thumbs)
+        self._update_result.connect(self._on_update_result)
+        self._scan_progress.connect(self._on_scan_progress)
         self._manager: ImageManager | None = manager
         self._slideshow: SlideshowView | None = None
         self._gallery: GalleryView | None = None
@@ -112,7 +270,6 @@ class MainWindow(QMainWindow):
         self._parked_source: str | None = None
         self._album_dirty: bool = False
         self._library_view = None
-        self._sort_view = None           # two-pane Sort (picker.sort_view.SortView)
 
         self._source_folder: str | None = manager.source_folder if manager else None
         self._current_folder: str | None = None
@@ -131,6 +288,7 @@ class MainWindow(QMainWindow):
         self.setStyleSheet(theme_mod.main_window_qss())
 
         self._build_menu()
+        self._build_status_bar()
         if self._manager is not None:
             self._build_gallery()
             self._update_status()
@@ -142,6 +300,46 @@ class MainWindow(QMainWindow):
         # First-run coach marks — after the window is up, once.
         from PyQt6.QtCore import QTimer
         QTimer.singleShot(400, self._maybe_show_welcome)
+        # Warm the folder you were last in while the window is idle.
+        QTimer.singleShot(500, self._warm_start)
+
+    def _warm_start(self):
+        """Put the last-used folder's listing, sizes and first screen of
+        thumbnails in RAM before they're asked for, so opening it is instant.
+        Entirely background; nothing here touches the UI until the results are
+        handed back."""
+        import threading
+        last = settings_mod.get("last_folder") or ""
+        if not last or not os.path.isdir(last):
+            return
+
+        def work():
+            try:
+                from picker import album_browser_view as abv
+                from picker import dim_cache
+                dim_cache.preload(last)
+                hit = abv._cache_get(last)
+                if hit is None:
+                    abv._cache_put(last, *abv._list_folder(last, last))
+                    hit = abv._cache_get(last)
+                items = list(hit[1][:60]) if hit else []
+            except Exception:
+                return
+            try:
+                self._warm_listing_ready.emit(last, items)
+            except RuntimeError:
+                pass   # window already closed
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _warm_thumbs(self, folder: str, items):
+        try:
+            from picker import thumb_store
+            svc = thumb_store.service()
+            for it in items:
+                svc.request(it.path, folder, svc.PRI_PREFETCH, it.sig)
+        except Exception:
+            pass
 
     def _maybe_show_welcome(self):
         try:
@@ -155,6 +353,59 @@ class MainWindow(QMainWindow):
         """Re-open the coach marks on demand (Help menu)."""
         from picker import welcome
         welcome.WelcomeDialog(self).exec()
+
+    def _build_status_bar(self):
+        """One slim bottom bar for the whole window: where you are on the left,
+        the controls you reach for on the right (tile size, full screen). It
+        stays visible in full screen so the way out is always on screen."""
+        from picker import instrument as inst
+        bar = self.statusBar()
+        bar.setSizeGripEnabled(False)
+        self._location = _LocationLabel()
+        bar.addWidget(self._location, 1)
+        self._zoom = inst.ZoomSlider(90, 520,
+                                     int(settings_mod.get("thumbnail_row_height") or 200),
+                                     step=26, label="Tile size")
+        self._zoom.valueChanged.connect(self._on_zoom_slider)
+        self._zoom.hide()
+        bar.addPermanentWidget(self._zoom)
+        self._fs_btn = inst.KeyCap("", variant="dark", icon="fullscreen")
+        self._fs_btn.setFixedSize(30, 26)
+        self._fs_btn.setMinimumHeight(26)
+        self._fs_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._fs_btn.clicked.connect(self._toggle_fullscreen)
+        bar.addPermanentWidget(self._fs_btn)
+        self._sync_fullscreen_controls()
+
+    def set_location(self, text: str):
+        if getattr(self, "_location", None) is not None:
+            self._location.set_path(text)
+
+    def _on_zoom_slider(self, value: int):
+        if self._album_browser is not None and self.centralWidget() is self._album_browser:
+            self._album_browser.set_tile_size(value)
+
+    def _on_browser_zoom(self, value: int):
+        self._zoom.blockSignals(True)
+        self._zoom.set_value(value)
+        self._zoom.blockSignals(False)
+
+    def setCentralWidget(self, widget):          # noqa: N802 — Qt name
+        super().setCentralWidget(widget)
+        self._sync_status_for(widget)
+
+    def _sync_status_for(self, widget):
+        """Show the size slider only where it does something; point the
+        location at whatever the new view is showing."""
+        if getattr(self, "_zoom", None) is None:
+            return
+        is_browser = widget is not None and widget is self._album_browser
+        self._zoom.setVisible(is_browser)
+        if is_browser:
+            self._on_browser_zoom(self._album_browser.tile_size())
+            self.set_location(self._album_browser.current_path)
+        elif widget is not None and widget is self._library_view:
+            self.set_location("")
 
     def _restore_window_geometry(self):
         """Restore last window size/position, then SHOW the window.
@@ -177,6 +428,8 @@ class MainWindow(QMainWindow):
             self.show()
         else:
             self.showMaximized()
+        if settings_mod.get("fullscreen"):
+            self.set_fullscreen(True, persist=False)
 
     def _geometry_on_screen(self) -> bool:
         """True if the window's frame intersects some available screen area."""
@@ -213,7 +466,6 @@ class MainWindow(QMainWindow):
         from picker import log
         folder = str(Path(file_path).parent)
 
-        self._close_sort_view()
         if self._slideshow:
             self._slideshow.cleanup()
             self._slideshow = None
@@ -227,12 +479,16 @@ class MainWindow(QMainWindow):
         self._source_folder = folder
         self._current_folder = folder
 
-        def _on_progress(count):
-            QTimer.singleShot(0, lambda: self._on_scan_progress(count))
+        def _on_progress(count):          # scanner thread -> queued to UI
+            try:
+                self._scan_progress.emit(count)
+            except RuntimeError:
+                pass
 
         def _on_complete():
             QTimer.singleShot(0, self._on_scan_complete)
 
+        from picker.image_manager import ImageManager
         mgr, seed_idx = ImageManager.create_seeded(
             source_folder=folder,
             target_file=file_path,
@@ -264,6 +520,11 @@ class MainWindow(QMainWindow):
     def _open_file_in_browser(self, file_path: str):
         """Open image from album browser — also uses instant open."""
         self._instant_open_file(file_path)
+
+    def _location_from_viewer(self):
+        sv = self._slideshow
+        if sv is not None and self._manager and 0 <= sv._idx < len(self._manager.images):
+            self.set_location(self._manager.images[sv._idx].path)
 
     def _update_window_title(self):
         if self._manager and self._slideshow and 0 <= self._slideshow._idx < len(self._manager.images):
@@ -308,7 +569,6 @@ class MainWindow(QMainWindow):
         No loading screen: the browser paints its chrome at once and lists the
         folder on a worker (usually from the in-memory listing cache), so there's
         nothing to wait for — the old splash + processEvents() only added delay."""
-        self._close_sort_view()
         self._discard_parked_album()
         if self._slideshow:
             self._slideshow.cleanup()
@@ -362,7 +622,6 @@ class MainWindow(QMainWindow):
         if self._source_folder is None:
             self._show_library_view()
             return
-        self._close_sort_view()
         self._discard_parked_album()
         if self._slideshow:
             self._slideshow.cleanup()
@@ -374,16 +633,14 @@ class MainWindow(QMainWindow):
             self._album_browser.cleanup()
             self._album_browser = None
         self._current_folder = None
+        from picker.album_browser_view import AlbumBrowserView
         self._album_browser = AlbumBrowserView(self._source_folder, self)
-        self._album_browser.open_image.connect(self._open_image_in_folder)
-        self._album_browser.sort_requested.connect(self._start_two_pane_sort)
-        self._album_browser.back_requested.connect(self._show_library_view)
+        self._wire_browser(self._album_browser)
         self._set_central(self._album_browser)
         # Focus a tile once shown so the grid is keyboard-drivable without a click.
         from PyQt6.QtCore import QTimer
         QTimer.singleShot(0, self._album_browser.focus_content)
-        bar = self.statusBar()
-        bar.showMessage(f"  {self._source_folder}")
+        self.set_location(self._album_browser.current_path)
 
     def _park_album_browser(self):
         """Detach the live browser WITHOUT deleting it so returning is instant:
@@ -421,90 +678,22 @@ class MainWindow(QMainWindow):
         self._opened_from_explorer = False
         self._instant_open_file(target, names=names)
 
-    # ── Two-pane Sort ───────────────────────────────────────────────────────────
+    # ── Sort (Multi Sort) ───────────────────────────────────────────────────────
 
-    def _start_two_pane_sort(self, source: str | None = None):
-        """Open the two-pane Sort view: source mosaic ⇄ destination mosaic.
-        Source defaults to the folder being browsed (or the last one sorted);
-        destination to the last one used — otherwise a folder picker asks."""
-        from PyQt6.QtWidgets import QFileDialog
-        from picker.sort_view import SortView
+    def _start_sort(self, source: str | None = None):
+        """Sort a folder into up to 9 destinations (number keys). From the
+        folder browser the current folder is prefilled as the source."""
         if not isinstance(source, str) or not source:
-            if self._album_browser is not None:
-                source = self._album_browser.current_path
-            else:
-                source = settings_mod.get("sort_last_source") or ""
-        if not source or not os.path.isdir(source):
-            source = QFileDialog.getExistingDirectory(
-                self, "Sort — choose the SOURCE folder",
-                self._source_folder or os.path.expanduser("~"))
-            if not source:
-                return
-        dest = settings_mod.get("sort_last_destination") or ""
-        norm = lambda p: os.path.normcase(os.path.abspath(p))  # noqa: E731
-        if not dest or not os.path.isdir(dest) or norm(dest) == norm(source):
-            dest = QFileDialog.getExistingDirectory(
-                self, "Sort — choose the DESTINATION folder (Space copies photos here)",
-                os.path.dirname(source.rstrip("/\\")) or source)
-            if not dest:
-                return
-            if norm(dest) == norm(source):
-                QMessageBox.information(self, "Sort",
-                                        "Source and destination must be different folders.")
-                return
-        settings_mod.set_value("sort_last_source", source)
-        settings_mod.set_value("sort_last_destination", dest)
-
-        # Reuse the browser's thumbnail cache when the source lives under it.
-        cache_root = None
-        root = self._source_folder
-        if root and norm(source).startswith(norm(root)):
-            cache_root = root
-
-        self._close_sort_view()
-        if self._slideshow:
-            self._slideshow.cleanup()
-            self._slideshow = None
-        if self._gallery:
-            self._gallery.cleanup()
-            self._gallery = None
-        self._park_album_browser()
-        resolution = self._manager.resolution_pct if self._manager else self._resolution_pct
-        view = SortView(source, dest, self, cache_root=cache_root, resolution_pct=resolution)
-        view.closed.connect(self._on_sort_closed)
-        self._sort_view = view
-        self._set_central(view)
-        self.statusBar().showMessage(f"  Sort:  {source}   →   {dest}")
-        QTimer.singleShot(0, view.focus_source)
-
-    def _close_sort_view(self):
-        if self._sort_view is not None:
-            try:
-                self._sort_view.cleanup()
-            except Exception:
-                pass
-            self._sort_view = None
-
-    def _on_sort_closed(self):
-        self._close_sort_view()
-        if self._parked_album is not None:
-            self._album_browser = self._parked_album
-            self._parked_album = None
-            self._source_folder = self._parked_source
-            self._parked_source = None
-            self._album_browser.show()
-            self._set_central(self._album_browser)
-            # Copies may have landed in (or been deleted from) folders it shows.
-            self._album_browser.reload_current()
-            self._album_browser.focus_content()
-            self.statusBar().showMessage(f"  {self._source_folder or ''}")
-            return
-        self._show_library_view()
-
-    # ── Menu ───────────────────────────────────────────────────────────────────
+            source = (self._album_browser.current_path if self._album_browser is not None
+                      else None)
+        self._change_source(source)
 
     def _build_menu(self):
         bar = self.menuBar()
+        # The menu strip is part of the front panel: same legend lettering as
+        # every other label on the instrument (QSS font-family does not reach
+        # QMenuBar items on Windows, so set it on the widget).
+        bar.setFont(theme_mod.legend_font(9, tracking=1.2))
         file_menu = bar.addMenu("&File")
 
         home_action = QAction("Home (Library)", self)
@@ -518,16 +707,10 @@ class MainWindow(QMainWindow):
         file_menu.addAction(open_folder_action)
 
         sort_action = QAction("Sort…", self)
-        sort_action.setShortcut("Ctrl+Shift+S")
-        sort_action.setStatusTip("Two panes: source ⇄ destination — Space copies the focused photo")
-        sort_action.triggered.connect(lambda: self._start_two_pane_sort(None))
+        sort_action.setShortcuts(["Ctrl+Shift+S", "Ctrl+Alt+S"])
+        sort_action.setStatusTip("Sort a folder into up to 9 destinations with the number keys")
+        sort_action.triggered.connect(lambda: self._start_sort(None))
         file_menu.addAction(sort_action)
-
-        sort_multi_action = QAction("Sort-Multi…", self)
-        sort_multi_action.setShortcut("Ctrl+Alt+S")
-        sort_multi_action.setStatusTip("Sort one folder into up to 9 destinations with number keys")
-        sort_multi_action.triggered.connect(self._change_source)
-        file_menu.addAction(sort_multi_action)
 
         file_menu.addSeparator()
 
@@ -560,10 +743,11 @@ class MainWindow(QMainWindow):
 
         view_menu = bar.addMenu("&View")
 
-        fullscreen_action = QAction("Fullscreen", self)
-        fullscreen_action.setShortcut("F11")
-        fullscreen_action.triggered.connect(self._toggle_fullscreen)
-        view_menu.addAction(fullscreen_action)
+        self._fullscreen_action = QAction("Full Screen", self, checkable=True)
+        self._fullscreen_action.setShortcut("F11")
+        self._fullscreen_action.setStatusTip("Fill the screen; stays on until you turn it off")
+        self._fullscreen_action.triggered.connect(lambda on: self.set_fullscreen(on))
+        view_menu.addAction(self._fullscreen_action)
 
         shortcuts_action = QAction("Show Shortcuts", self)
         shortcuts_action.setShortcut("?")
@@ -572,11 +756,21 @@ class MainWindow(QMainWindow):
 
         view_menu.addSeparator()
 
-        self._theme_action = QAction("Light Theme", self, checkable=True)
-        self._theme_action.setChecked(theme_mod.current() == "light")
-        self._theme_action.setShortcut("Ctrl+T")
-        self._theme_action.triggered.connect(self._toggle_theme)
-        view_menu.addAction(self._theme_action)
+        # Appearance: two switches, both live — no restart, nothing rebuilt.
+        self._light_action = QAction("Light Mode", self, checkable=True)
+        self._light_action.setShortcut("Ctrl+T")
+        self._light_action.setStatusTip("Switch between the dark and light appearance")
+        self._light_action.setChecked(theme_mod.is_light())
+        self._light_action.triggered.connect(
+            lambda on: self.apply_theme("light" if on else "dark"))
+        view_menu.addAction(self._light_action)
+        self._motion_action = QAction("Animation", self, checkable=True)
+        self._motion_action.setShortcut("Ctrl+Shift+M")
+        self._motion_action.setStatusTip(
+            "On: short fades give the interface presence. Off: every change is instant.")
+        self._motion_action.setChecked(motion_mod.enabled())
+        self._motion_action.triggered.connect(self.set_motion)
+        view_menu.addAction(self._motion_action)
 
         help_menu = bar.addMenu("&Help")
         keys_action = QAction("Keyboard Shortcuts", self)
@@ -612,11 +806,11 @@ class MainWindow(QMainWindow):
     # ── Gallery ────────────────────────────────────────────────────────────────
 
     def _build_gallery(self):
-        self._close_sort_view()
         self._discard_parked_album()
         if self._gallery:
             self._gallery.cleanup()
 
+        from picker.gallery_view import GalleryView
         self._gallery = GalleryView(self._manager)
         self._gallery.open_slideshow.connect(self._open_slideshow)
         self._set_central(self._gallery)
@@ -624,14 +818,12 @@ class MainWindow(QMainWindow):
 
     def _update_status(self):
         if self._gallery:
-            bar = self.statusBar()
-            bar.showMessage("  " + self._gallery.status_text())
+            self.set_location(self._manager.source_folder if self._manager else "")
 
     # ── Slideshow ──────────────────────────────────────────────────────────────
 
     @pyqtSlot(int)
     def _open_slideshow(self, idx: int, filmstrip_hidden: bool = False):
-        self._close_sort_view()
         if self._slideshow:
             self._slideshow.cleanup()
             self._slideshow = None
@@ -642,12 +834,14 @@ class MainWindow(QMainWindow):
             self._gallery.cleanup()
             self._gallery = None
 
+        from picker.slideshow_view import SlideshowView
         self._slideshow = SlideshowView(self._manager, idx, parent=self,
                                          filmstrip_hidden=filmstrip_hidden)
         self._slideshow.closed.connect(self._on_slideshow_closed)
         self._slideshow.status_changed.connect(self._on_status_changed)
         self._slideshow.fullscreen_requested.connect(self._toggle_fullscreen)
         self._slideshow.title_changed.connect(self._update_window_title)
+        self._slideshow.title_changed.connect(self._location_from_viewer)
         # A move/delete in the viewer marks the parked browser stale so it
         # refreshes on return; pure navigation leaves it clean for instant restore.
         self._slideshow.files_changed.connect(self._on_viewer_files_changed)
@@ -655,9 +849,11 @@ class MainWindow(QMainWindow):
         self._slideshow.setFocus()
         if not filmstrip_hidden:
             self._fade_in(self._slideshow)
-        if not self.isFullScreen():
-            self._toggle_fullscreen()
-        # Fullscreen toggle / fade can steal focus; re-assert it next tick so
+        # Full screen is the user's mode, not the viewer's: leave it as it is.
+        self._slideshow.set_chrome_visible(not self.isFullScreen())
+        self.set_location(self._manager.images[idx].path
+                          if 0 <= idx < len(self._manager.images) else "")
+        # A fade can steal focus; re-assert it next tick so
         # arrow keys work without a click. (_post_show_settle also retries.)
         from PyQt6.QtCore import QTimer
         QTimer.singleShot(0, self._focus_slideshow)
@@ -700,7 +896,8 @@ class MainWindow(QMainWindow):
                 self._album_dirty = False
                 self._album_browser.reload_current()
             self._album_browser.focus_content()   # keyboard-ready without a click
-            self.statusBar().showMessage(f"  {self._source_folder or ''}")
+            if self._album_browser is not None:
+                self.set_location(self._album_browser.current_path)
             return
         if self._current_folder is not None and self._source_folder is not None:
             self._show_album_browser()
@@ -710,82 +907,55 @@ class MainWindow(QMainWindow):
                 self._gallery.scroll_to(last_idx)
                 self._update_status()
 
-    def _fade_in(self, widget, duration: int = 160):
-        effect = QGraphicsOpacityEffect(widget)
-        widget.setGraphicsEffect(effect)
-        anim = QPropertyAnimation(effect, b"opacity")
-        anim.setDuration(duration)
-        anim.setStartValue(0.0)
-        anim.setEndValue(1.0)
-        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-        anim.finished.connect(lambda: widget.setGraphicsEffect(None))
-        anim.start()
-        self._view_anim = anim
+    def _fade_in(self, widget, duration: int | None = None):
+        """Presence without cost: a ground-coloured veil laid over the new view
+        dissolves away. The view itself paints normally underneath — no
+        offscreen snapshot, no QGraphicsEffect re-rendering the whole tree."""
+        ms = motion_mod.dur(motion_mod.VIEW if duration is None else duration)
+        if ms <= 0:
+            return
+        veil = _Veil(widget)
+        veil.run(ms)
+        self._view_anim = veil
 
     def _set_central(self, widget, *, animate: bool = True):
-        """Swap the central view with a cross-dissolve: the outgoing view is
-        snapshotted and melted out on top while the incoming view fades in,
-        so navigating between Library / folders / gallery feels fluid rather
-        than a hard cut. Falls back to a plain swap when animation is off."""
-        old = self.centralWidget()
-        snap = None
-        if (animate and bool(settings_mod.get("slideshow_animation"))
-                and old is not None and old.isVisible()
-                and old.width() > 1 and old.height() > 1):
-            try:
-                snap = old.grab()
-            except Exception:
-                snap = None
-
+        """Swap the central view. With Animation on, the new view arrives under
+        a short dissolve; with it off, the swap is a hard cut, instantly."""
         self.setCentralWidget(widget)
-
-        if snap is None or snap.isNull():
-            if animate and bool(settings_mod.get("slideshow_animation")):
-                self._fade_in(widget)
-            return
-
-        self._fade_in(widget, duration=170)
-
-        # Outgoing snapshot laid over the new view, faded to transparent.
-        overlay = QLabel(widget)
-        overlay.setScaledContents(True)
-        overlay.setPixmap(snap)
-        overlay.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-
-        def _place_and_run():
-            if overlay.parent() is None:
-                return
-            overlay.setGeometry(widget.rect())
-            overlay.raise_()
-            overlay.show()
-            eff = QGraphicsOpacityEffect(overlay)
-            overlay.setGraphicsEffect(eff)
-            anim = QPropertyAnimation(eff, b"opacity", overlay)
-            anim.setDuration(170)
-            anim.setStartValue(1.0)
-            anim.setEndValue(0.0)
-            anim.setEasingCurve(QEasingCurve.Type.InOutCubic)
-            anim.finished.connect(overlay.deleteLater)
-            anim.start()
-            self._overlay_anim = anim
-
-        # Defer one tick so the new central widget has its real geometry.
-        from PyQt6.QtCore import QTimer
-        QTimer.singleShot(0, _place_and_run)
+        if animate:
+            self._fade_in(widget)
 
     def _toggle_fullscreen(self):
-        if self.isFullScreen():
-            self.showMaximized()
-            self.menuBar().show()
-            self.statusBar().show()
-            if self._slideshow:
-                self._slideshow.set_chrome_visible(True)
-        else:
-            self.menuBar().hide()
-            self.statusBar().hide()
-            if self._slideshow:
-                self._slideshow.set_chrome_visible(False)
-            self.showFullScreen()
+        self.set_fullscreen(not self.isFullScreen())
+
+    def set_fullscreen(self, on: bool, *, persist: bool = True):
+        """Full screen is a mode you choose (View > Full Screen, F11, F in the
+        viewer, or the button at the bottom right) and it stays until you turn
+        it off — opening or closing a photo never changes it. The status bar
+        stays, so the way back is always on screen; the menu bar folds away."""
+        on = bool(on)
+        if on != self.isFullScreen():
+            if on:
+                self.menuBar().hide()
+                self.showFullScreen()
+            else:
+                self.menuBar().show()
+                self.showMaximized()
+        self.statusBar().show()
+        if self._slideshow:
+            self._slideshow.set_chrome_visible(not on)
+        if persist:
+            settings_mod.set_value("fullscreen", on)
+        self._sync_fullscreen_controls()
+
+    def _sync_fullscreen_controls(self):
+        on = self.isFullScreen()
+        if getattr(self, "_fullscreen_action", None) is not None:
+            self._fullscreen_action.setChecked(on)
+        if getattr(self, "_fs_btn", None) is not None:
+            self._fs_btn.set_icon("exit_fullscreen" if on else "fullscreen",
+                                  "Exit full screen" if on else "Full screen")
+            self._fs_btn.setToolTip(("Exit full screen" if on else "Full screen") + " (F11)")
 
     @pyqtSlot()
     def _on_status_changed(self):
@@ -795,11 +965,12 @@ class MainWindow(QMainWindow):
 
     # ── Change source ──────────────────────────────────────────────────────────
 
-    def _change_source(self):
+    def _change_source(self, source: str | None = None):
+        from picker.startup_dialog import StartupDialog
         dlg = StartupDialog(self)
         dlg.prefill({
-            "source_folder": (self._manager.source_folder if self._manager
-                              else (self._source_folder or "")),
+            "source_folder": source or (self._manager.source_folder if self._manager
+                                        else (self._source_folder or "")),
             "destinations": list(self._destinations),
             "mode": self._mode,
             "resolution_pct": self._resolution_pct,
@@ -810,7 +981,6 @@ class MainWindow(QMainWindow):
         if not data:
             return
 
-        self._close_sort_view()
         self._discard_parked_album()
         if self._slideshow:
             self._slideshow.cleanup()
@@ -822,6 +992,8 @@ class MainWindow(QMainWindow):
             self._album_browser.cleanup()
             self._album_browser = None
 
+        from picker.image_manager import ImageManager
+        from picker.loading_screen import LoadingScreen
         app = QApplication.instance()
         src_label = os.path.basename(data["source_folder"].rstrip("/\\")) or data["source_folder"]
         loading = LoadingScreen(sub=f"Scanning {src_label}…", parent=self)
@@ -872,7 +1044,7 @@ class MainWindow(QMainWindow):
             "  Click tile       Open album",
             "",
             "── Gallery ────────────────────",
-            "  Click            Open in slideshow (fullscreen)",
+            "  Click            Open in the viewer",
             "  Right-click      Open in external editor",
             "  Drop folder      Swap source folder",
             "",
@@ -904,11 +1076,13 @@ class MainWindow(QMainWindow):
             "  O                Open with system default",
             "  Ctrl+O           Open with… (PS / LR)",
             "  ?                Toggle shortcut panel",
-            "  ESC              Exit fullscreen / Back to gallery",
+            "  ESC              Back to the folder (full screen stays as you set it)",
         ]
         if self._manager and self._manager.has_destinations:
             dests = self._manager.destinations
-            dest_lines = [f"  {i+1}                Send to \"{dests[i]['name']}\"" for i in range(len(dests))]
+            from picker import sort_keys
+            dest_lines = [f"  {sort_keys.key_of(dests[i], i):<17}Send to \"{dests[i]['name']}\""
+                          for i in range(len(dests))]
             lines += [
                 "",
                 "── Sort to destinations ───────",
@@ -917,34 +1091,65 @@ class MainWindow(QMainWindow):
                 *dest_lines,
                 "  Ctrl+Z           Undo last action",
             ]
+        lines += ["", "── Rating ───────", "  Ctrl+1 – 5       Star rating (again to clear)"]
         QMessageBox.information(self, "Keyboard Shortcuts", "\n".join(lines))
 
     # ── Theme ──────────────────────────────────────────────────────────────────
 
-    def _toggle_theme(self):
-        new_name = "light" if self._theme_action.isChecked() else "dark"
-        app = QApplication.instance()
-        theme_mod.apply(app, new_name)
-        settings_mod.set_value("theme", new_name)
+    def apply_theme(self, name: str, *, persist: bool = True):
+        """Switch dark/light, live. Painters read colours at paint time and
+        stylesheets are bound (theme.bind), so this is a restyle + repaint:
+        no view is rebuilt, scroll positions and selections stay put."""
+        if name not in theme_mod.THEMES:
+            return
+        theme_mod.apply(QApplication.instance(), name)
+        if persist:
+            settings_mod.set_value("theme", name)
         self.setStyleSheet(theme_mod.main_window_qss())
+        theme_mod.match_titlebar(self)
+        if getattr(self, "_light_action", None) is not None:
+            self._light_action.setChecked(name == "light")
+        theme_mod.restyle()                       # every open window
+        if self._parked_album is not None:        # hidden, but keep it current
+            theme_mod.restyle(self._parked_album)
         if self._gallery:
             self._gallery.refresh_theme()
         if self._slideshow:
             self._slideshow.refresh_theme()
-        self.update()
 
-    # ── Settings ───────────────────────────────────────────────────────────────
+    def set_motion(self, on: bool, *, persist: bool = True):
+        motion_mod.set_enabled(on, persist=persist)
+        if getattr(self, "_motion_action", None) is not None:
+            self._motion_action.setChecked(motion_mod.enabled())
+        self.statusBar().showMessage(
+            "Animation on" if motion_mod.enabled() else "Animation off: every change is instant",
+            2000)
+
+    def _wire_browser(self, browser):
+        browser.tile_size_changed.connect(self._on_browser_zoom)
+        browser.location_changed.connect(
+            lambda path, b=browser: self.set_location(path) if self.centralWidget() is b else None)
+        browser.open_image.connect(self._open_image_in_folder)
+        browser.sort_requested.connect(self._start_sort)
+        browser.back_requested.connect(self._show_library_view)
 
     def _open_settings(self):
+        from picker.settings_dialog import SettingsDialog
         dlg = SettingsDialog(self)
         dlg.exec()
+        # Appearance chosen in Settings applies now, not after a restart.
+        chosen = settings_mod.get("theme") or "dark"
+        if chosen != theme_mod.current():
+            self.apply_theme(chosen, persist=False)
+        motion_mod.invalidate()
+        if getattr(self, "_motion_action", None) is not None:
+            self._motion_action.setChecked(motion_mod.enabled())
 
     # ── Library home view ──────────────────────────────────────────────────────
 
     def _show_library_view(self):
         """Swap central widget to the library home screen."""
         from picker.library_view import LibraryView
-        self._close_sort_view()
         self._discard_parked_album()
         if self._slideshow:
             self._slideshow.cleanup()
@@ -961,7 +1166,7 @@ class MainWindow(QMainWindow):
         self._library_view.manage_requested.connect(self._manage_library_roots)
         self._library_view.add_requested.connect(self._add_library_root)
         self._set_central(self._library_view)
-        self.statusBar().clearMessage()
+        self.set_location("")
         self._schedule_idle_index()
 
     # ── Background pre-index ────────────────────────────────────────────────────
@@ -1033,6 +1238,7 @@ class MainWindow(QMainWindow):
         """Foreground scan with a loading screen showing the current file."""
         from picker import index as index_mod
         from picker.image_manager import active_extensions
+        from picker.loading_screen import LoadingScreen
         from picker import log
 
         app = QApplication.instance()
@@ -1178,19 +1384,29 @@ class MainWindow(QMainWindow):
 
         def _worker():
             result = updater.check_now()
-            if result and updater.is_newer(result["tag"]):
-                QTimer.singleShot(0, lambda: self._show_update_toast(result))
-            else:
-                QTimer.singleShot(0, lambda: QMessageBox.information(
-                    self, "Updates", f"PICker {__version__} is up to date."))
+            newer = result if (result and updater.is_newer(result["tag"])) else None
+            try:
+                self._update_result.emit(newer, True)   # queued onto the UI thread
+            except RuntimeError:
+                pass
 
         Thread(target=_worker, daemon=True).start()
 
     def _check_for_updates_auto(self):
         from picker import updater
-        def _on_result(release):
-            QTimer.singleShot(0, lambda: self._show_update_toast(release))
+
+        def _on_result(release):          # runs on the checker's thread
+            try:
+                self._update_result.emit(release, False)
+            except RuntimeError:
+                pass
         updater.check_in_background(_on_result)
+
+    def _on_update_result(self, release, manual: bool):
+        if release:
+            self._show_update_toast(release)
+        elif manual:
+            QMessageBox.information(self, "Updates", f"PICker {__version__} is up to date.")
 
     def _show_update_toast(self, release: dict):
         import webbrowser
@@ -1203,7 +1419,11 @@ class MainWindow(QMainWindow):
             f"Download from the releases page?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
-        if reply == QMessageBox.StandardButton.Yes and url:
+        # The URL comes from the network: open it only if it is this project's
+        # GitHub page over https. webbrowser.open() on Windows falls back to
+        # os.startfile, so a file:// or bare path must never reach it.
+        safe = url.lower().startswith("https://github.com/nebula3141/picker/")
+        if reply == QMessageBox.StandardButton.Yes and url and safe:
             webbrowser.open(url)
 
     def _show_about(self):
@@ -1276,7 +1496,6 @@ class MainWindow(QMainWindow):
                 event.ignore()
                 return
         self._save_window_geometry()
-        self._close_sort_view()
         if self._gallery:
             self._gallery.cleanup()
         if self._album_browser:
@@ -1288,10 +1507,15 @@ class MainWindow(QMainWindow):
         # (e.g. a folder still mid-load) and the lazily-written viewer positions,
         # so the next launch opens instantly and resumes where you were.
         try:
-            from picker import dim_cache, thumb_store
+            from picker import dim_cache, listing_cache, thumb_store
             thumb_store.service().shutdown(wait_ms=150)
             dim_cache.flush()
             settings_mod.flush_positions()
+            settings_mod.flush_settings()
+            listing_cache.save()      # next launch opens these folders from memory
+            from picker import library_view as _lv
+            if _lv._CARD_POOL is not None:
+                _lv._CARD_POOL.clear()    # drop queued card counts; don't make exit wait
         except Exception:
             pass
         super().closeEvent(event)
@@ -1437,7 +1661,10 @@ def main():
     if _check_single_instance(app, args):
         return
 
-    theme_mod.apply(app, settings_mod.get("theme") or "dark")
+    # Two modes. Retired finishes from 5.0 betas map onto the nearer one.
+    stored = settings_mod.get("theme") or "dark"
+    stored = {"sandstone": "light"}.get(stored, stored)
+    theme_mod.apply(app, stored if stored in theme_mod.THEMES else "dark")
 
     from PyQt6.QtCore import QTranslator, QLocale
     translator = QTranslator()
@@ -1446,7 +1673,8 @@ def main():
     if translations_dir.is_dir() and translator.load(f"picker_{locale}", str(translations_dir)):
         app.installTranslator(translator)
 
-    from picker import log
+    from picker import listing_cache, log
+    listing_cache.load_async()   # folder index from the last run, off-thread
     log.info("PICker starting", version=__version__)
 
     if library_mod.seed_if_empty():
@@ -1459,6 +1687,7 @@ def main():
     app.processEvents()
 
     _setup_ipc_listener(app, window)
+    theme_mod.match_titlebar(window)     # native frame follows the mode
 
     if has_path:
         from PyQt6.QtGui import QCursor
@@ -1475,6 +1704,16 @@ def main():
         log.error("background scan kick failed", err=str(e))
 
     QTimer.singleShot(10000, window._check_for_updates_auto)
+
+    # Rewrite "Open with PICker" registry commands left by older builds (their
+    # exe path was unquoted) — off the startup path, and only if stale.
+    def _repair_assoc():
+        try:
+            from picker import file_assoc
+            file_assoc.repair_if_stale()
+        except Exception as e:
+            log.error("file association repair failed", err=str(e))
+    QTimer.singleShot(4000, _repair_assoc)
 
     sys.exit(app.exec())
 

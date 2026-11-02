@@ -43,7 +43,7 @@ def test_persists_across_sessions(tmp_path):
     dim_cache._folders.clear(); dim_cache._loaded.clear(); dim_cache._dirty.clear()
     assert dim_cache.get(str(tmp_path), str(f)) == (1920, 1080)
     # The index file lives in .picker_cache next to the thumbnails.
-    assert (tmp_path / ".picker_cache" / "dimensions.json").is_file()
+    assert (tmp_path / ".picker_cache" / dim_cache._INDEX_NAME).is_file()
 
 
 def test_invalidates_on_content_change(tmp_path):
@@ -76,5 +76,5 @@ def test_flush_all_dirty_folders(tmp_path):
     dim_cache.put(str(a), str(fa), 10, 20)
     dim_cache.put(str(b), str(fb), 30, 40)
     dim_cache.flush()   # no arg → every dirty folder
-    assert (a / ".picker_cache" / "dimensions.json").is_file()
-    assert (b / ".picker_cache" / "dimensions.json").is_file()
+    assert (a / ".picker_cache" / dim_cache._INDEX_NAME).is_file()
+    assert (b / ".picker_cache" / dim_cache._INDEX_NAME).is_file()

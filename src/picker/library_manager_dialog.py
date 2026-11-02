@@ -5,14 +5,15 @@ buttons. "Add" at the footer opens a folder picker. Changes apply immediately.
 """
 import os
 
-from PyQt6.QtCore import Qt, QSize
-from PyQt6.QtGui import QPixmap, QIcon
+from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QPixmap
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFrame,
     QScrollArea, QWidget, QInputDialog, QFileDialog, QMessageBox,
 )
 
 from . import library as library_mod
+from . import theme as theme_mod
 from . import index as index_mod
 from . import log
 from .icon import app_icon
@@ -27,22 +28,16 @@ class _RootRow(QFrame):
         self._parent = parent
         self._root = root
         self.setObjectName("rootRow")
-        self.setStyleSheet("""
-            QFrame#rootRow {
-                background: #1e1e1e;
-                border: 1px solid #2a2a2a;
-                border-radius: 8px;
-            }
-            QFrame#rootRow:hover { border-color: #3a3a3a; }
-            QLabel#label { font-size: 14px; font-weight: 600; color: #eaeaea; }
-            QLabel#path  { color: #8a8a8a; font-size: 11px; }
-            QLabel#count { color: #5a9bff; font-size: 11px; }
-            QPushButton {
-                background: #2a2a2a; color: #ddd; border: 1px solid #3a3a3a;
-                border-radius: 4px; padding: 5px 12px; font-size: 11px;
-            }
-            QPushButton:hover { background: #333; border-color: #4a4a4a; }
-            QPushButton#danger:hover { background: #5a1f1f; border-color: #7a2a2a; color: #fff; }
+        theme_mod.bind(self, lambda: f"""
+            QFrame#rootRow {{
+                background: {theme_mod.hexc('deck')};
+                border: 1px solid {theme_mod.hexc('rail')};
+                border-radius: {theme_mod.RADIUS}px;
+            }}
+            QFrame#rootRow:hover {{ border-color: {theme_mod.hexc('glass_edge')}; }}
+            QLabel#label {{ font-size: 14px; font-weight: 600; color: {theme_mod.hexc('fg')}; }}
+            QLabel#path  {{ color: {theme_mod.hexc('muted')}; font-size: 11px; }}
+            QLabel#count {{ color: {theme_mod.hexc('accent_text')}; font-size: 11px; }}
         """)
 
         layout = QHBoxLayout(self)
@@ -52,7 +47,8 @@ class _RootRow(QFrame):
         # Cover thumbnail
         self._cover = QLabel()
         self._cover.setFixedSize(_COVER_SIZE, _COVER_SIZE)
-        self._cover.setStyleSheet("background: #0f0f0f; border-radius: 6px;")
+        theme_mod.bind(self._cover, lambda: f"background: {theme_mod.hexc('well')};"
+                                            f" border-radius: {theme_mod.RADIUS}px;")
         self._cover.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._refresh_cover()
         layout.addWidget(self._cover)
@@ -108,17 +104,28 @@ class _RootRow(QFrame):
             except Exception:
                 pix = None
         if pix is None or pix.isNull():
-            self._cover.setText("📁")
-            self._cover.setStyleSheet(
-                "background:#0f0f0f; border-radius:6px; color:#555; font-size:32px;"
-            )
+            # No photo to show: an empty glass well, with the folder mark drawn
+            # (never an emoji) so it reads the same on every platform.
+            from PyQt6.QtGui import QPainter
+            from PyQt6.QtCore import QRectF
+            from . import instrument as inst
+            pm = QPixmap(_COVER_SIZE, _COVER_SIZE)
+            pm.fill(Qt.GlobalColor.transparent)
+            qp = QPainter(pm)
+            qp.setRenderHint(QPainter.RenderHint.Antialiasing)
+            inst.draw_icon(qp, "folder", QRectF(30, 30, 36, 36), inst._c("faint"), 1.6)
+            qp.end()
+            self._cover.setPixmap(pm)
+            theme_mod.bind(self._cover, lambda: f"background: {theme_mod.hexc('well')};"
+                                                f" border-radius: {theme_mod.RADIUS}px;")
             return
         self._cover.setPixmap(pix.scaled(
             _COVER_SIZE, _COVER_SIZE,
             Qt.AspectRatioMode.KeepAspectRatioByExpanding,
             Qt.TransformationMode.SmoothTransformation,
         ))
-        self._cover.setStyleSheet("background:#0f0f0f; border-radius:6px;")
+        theme_mod.bind(self._cover, lambda: f"background: {theme_mod.hexc('well')};"
+                                            f" border-radius: {theme_mod.RADIUS}px;")
 
     def _on_rename(self):
         current = self._root.get("label") or ""
@@ -172,21 +179,10 @@ class LibraryManagerDialog(QDialog):
         self.setWindowIcon(app_icon())
         self.setMinimumSize(640, 480)
         self.setModal(True)
-        self.setStyleSheet("""
-            QDialog { background: #121212; color: #eaeaea; }
-            QLabel#header { font-size: 18px; font-weight: 700; color: #fff; }
-            QLabel#hint   { color: #8a8a8a; font-size: 11px; }
-            QScrollArea { background: #121212; border: 0; }
-            QPushButton#primary {
-                background: #3b82f6; color: #fff; border: 0;
-                border-radius: 4px; padding: 8px 20px; font-weight: 600;
-            }
-            QPushButton#primary:hover { background: #3b93eb; }
-            QPushButton {
-                background: #1e1e1e; color: #eaeaea; border: 1px solid #2a2a2a;
-                border-radius: 4px; padding: 8px 18px;
-            }
-            QPushButton:hover { background: #262626; border-color: #3a3a3a; }
+        theme_mod.bind(self, lambda: theme_mod.dialog_qss() + f"""
+            QLabel#header {{ font-size: 18px; font-weight: 600; color: {theme_mod.hexc('fg')}; }}
+            QScrollArea {{ background: transparent; border: 0; }}
+            QScrollArea > QWidget > QWidget {{ background: transparent; }}
         """)
 
         root = QVBoxLayout(self)
@@ -235,8 +231,8 @@ class LibraryManagerDialog(QDialog):
 
         roots = library_mod.roots()
         if not roots:
-            empty = QLabel("No library folders yet. Click “+ Add Folder” to get started.")
-            empty.setStyleSheet("color: #6a6a6a; padding: 32px; font-size: 13px;")
+            empty = QLabel("No library folders yet. Click “Add Folder” to get started.")
+            theme_mod.bind(empty, lambda: f"color: {theme_mod.hexc('muted')}; padding: 32px; font-size: 13px;")
             empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self._list_layout.addWidget(empty)
             self._list_layout.addStretch()

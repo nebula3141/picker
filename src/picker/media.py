@@ -25,17 +25,21 @@ VIDEO_EXTENSIONS: set[str] = {
 MEDIA_EXTENSIONS: set[str] = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
 
 
+# os.path.splitext, not Path(...).suffix: these run per tile per repaint and
+# per navigation, and building a PurePath just to read an extension is ~10x the
+# cost of a string split.
+
 def is_video(path: str) -> bool:
-    return Path(path).suffix.lower() in VIDEO_EXTENSIONS
+    return os.path.splitext(path)[1].lower() in VIDEO_EXTENSIONS
 
 
 def is_image(path: str) -> bool:
-    return Path(path).suffix.lower() in IMAGE_EXTENSIONS
+    return os.path.splitext(path)[1].lower() in IMAGE_EXTENSIONS
 
 
 def media_type(path: str) -> str:
     """Return 'video' / 'image' / 'other'."""
-    ext = Path(path).suffix.lower()
+    ext = os.path.splitext(path)[1].lower()
     if ext in VIDEO_EXTENSIONS:
         return "video"
     if ext in IMAGE_EXTENSIONS:

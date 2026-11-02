@@ -21,7 +21,10 @@ import threading
 from pathlib import Path
 
 _CACHE_DIRNAME = ".picker_cache"
-_INDEX_NAME = "dimensions.json"
+# v2: sizes saved before 5.0 ignored EXIF rotation (rotated portraits were
+# stored as landscape). A new file name drops them all once, cleanly.
+_INDEX_NAME = "dimensions-v2.json"
+_LEGACY_INDEX_NAMES = ("dimensions.json",)
 
 _lock = threading.Lock()
 _folders: dict[str, dict[str, list]] = {}   # source_folder -> {npath: [w,h,mtime,size]}
@@ -34,7 +37,10 @@ def _index_path(source_folder: str) -> Path:
 
 
 def _npath(path: str) -> str:
-    return os.path.normcase(os.path.abspath(path))
+    # Memoised, and skips abspath for already-absolute paths — this runs once
+    # per image on every folder open. See thumb_store.npath.
+    from .thumb_store import npath as _n
+    return _n(path)
 
 
 def _ensure_loaded(source_folder: str) -> dict:
@@ -153,5 +159,10 @@ def flush(source_folder: str | None = None) -> None:
             tmp.write_text(json.dumps(data, separators=(",", ":")),
                            encoding="utf-8")
             os.replace(tmp, p)
+            for legacy in _LEGACY_INDEX_NAMES:
+                try:
+                    (p.parent / legacy).unlink()
+                except OSError:
+                    pass
         except OSError:
             pass

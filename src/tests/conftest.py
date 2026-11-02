@@ -45,3 +45,13 @@ def index_dir(tmp_path, monkeypatch):
     d.mkdir()
     monkeypatch.setattr("picker.index._config_dir", lambda: d)
     return d
+
+
+@pytest.fixture(scope="session")
+def qapp():
+    """One QApplication for the whole run. A per-module app is destroyed when
+    its module finishes, taking app-lifetime singletons (the thumbnail
+    service) with it and breaking every later module."""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PyQt6.QtWidgets import QApplication
+    return QApplication.instance() or QApplication([])

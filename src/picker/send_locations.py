@@ -68,4 +68,4 @@ def is_full() -> bool:
 
 def shortcut_label(index: int, count: int) -> str:
     """Shortcut text for the location at `index`, given the total count."""
-    return "Ctrl+Space" if count == 1 else f"Ctrl+{index + 1}"
+    return "Ctrl+Space" if count == 1 else f"{index + 1}"

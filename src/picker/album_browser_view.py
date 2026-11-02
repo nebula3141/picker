@@ -15,6 +15,7 @@ once their walk completes; the enriched result is cached for instant re-visits.
 from __future__ import annotations
 
 import bisect
+import html
 import os
 import threading
 from collections import OrderedDict
@@ -27,7 +28,7 @@ from PyQt6.QtGui import (
     QImage, QImageReader, QPixmap, QColor, QPainter, QPen, QBrush, QFont,
     QPolygonF
 )
-from PyQt6.QtCore import QPointF
+from PyQt6.QtCore import QEvent, QPointF, QRectF, QVariantAnimation
 from PyQt6.QtWidgets import (
     QWidget, QScrollArea, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
     QGridLayout, QSizePolicy, QApplication, QFrame, QMenu, QMessageBox,
@@ -35,7 +36,11 @@ from PyQt6.QtWidgets import (
 )
 
 from . import theme as theme_mod
+from . import motion as motion_mod
+from . import capture_time
+from . import timeline as timeline_mod
 from . import settings as settings_mod
+from . import instrument as inst
 from . import log
 from . import album as album_mod
 from .album import Folder, ImageItem, scan_path
@@ -91,23 +96,71 @@ def _cache_get(path: str):
         hit = _SCAN_CACHE.get(path)
         if hit is not None:
             _SCAN_CACHE.move_to_end(path)
-        return hit
+            return hit
+    # Nothing in memory — the index saved by the previous run may still have it
+    # (validated against the directory's mtime). Only stat when a record exists:
+    # this runs on the UI thread (e.g. 32x per render for subfolder prefetch),
+    # and a stat on a sleeping or network drive can take hundreds of ms.
+    from . import listing_cache
+    if not listing_cache.has(path):
+        return None
+    restored = listing_cache.take(path, _dir_mtime(path))
+    if restored is not None:
+        _cache_put(path, *restored)
+        # A folder's mtime doesn't change when a file inside is edited in
+        # place, so a listing from the last session is shown at once but
+        # re-checked in the background the first time it's opened.
+        _UNVERIFIED.add(path)
+        return restored
+    return None
 
 
-def _cache_put(path: str, folders, items, mtime: int):
+_UNVERIFIED: set[str] = set()   # restored from disk, not yet re-listed this session
+
+
+def _cache_put(path: str, folders, items, mtime: int, dims: dict | None = None):
     with _SCAN_LOCK:
-        _SCAN_CACHE[path] = (folders, items, mtime)
+        _SCAN_CACHE[path] = (folders, items, mtime, dims or {})
         _SCAN_CACHE.move_to_end(path)
         while len(_SCAN_CACHE) > _SCAN_CACHE_MAX:
             _SCAN_CACHE.popitem(last=False)
+    from . import listing_cache
+    listing_cache.mark_dirty()   # persisted on exit so the next launch is instant
 
 
-def _list_folder(path: str):
-    """scandir listing + dir mtime, for workers. Captures the mtime *before*
-    listing so a change racing the scan invalidates the entry, never hides."""
+def _px_bytes(pm: QPixmap) -> int:
+    return max(1, pm.width() * pm.height() * max(1, pm.depth()) // 8)
+
+
+def _remember_dims(item_path: str, w: int, h: int) -> None:
+    """A thumbnail proved an item's real size: fold it into the in-memory
+    listing so the next visit (and the persisted index) lays it out right
+    without waiting for the thumbnail again."""
+    folder = os.path.dirname(item_path)
+    with _SCAN_LOCK:
+        hit = _SCAN_CACHE.get(folder)
+        if hit is not None:
+            hit[3][item_path] = (w, h)
+
+
+def _list_folder(path: str, source: str | None = None):
+    """scandir listing + dir mtime + known image sizes, for workers.
+
+    The mtime is captured *before* listing so a change racing the scan
+    invalidates the entry rather than hiding. Dimension-cache lookups happen
+    here too — off the UI thread, and carried with the listing so a revisit
+    lays the grid out correctly without touching anything."""
     mtime = _dir_mtime(path)
     folders, items = scan_path(path, deep=False)
-    return folders, items, mtime
+    dims: dict = {}
+    if source and items:
+        try:
+            hits = dim_cache.get_many(
+                source, [(it.path, it.mtime, it.size) for it in items])
+            dims = {it.path: d for it, d in zip(items, hits) if d is not None}
+        except Exception:
+            dims = {}
+    return folders, items, mtime, dims
 
 
 # ── Move / copy + recent destinations ──────────────────────────────────────────
@@ -310,17 +363,19 @@ class _ListSignals(QObject):
 
 
 class _ListTask(QRunnable):
-    def __init__(self, gen: int, path: str, signals: _ListSignals | None):
+    def __init__(self, gen: int, path: str, signals: _ListSignals | None,
+                 source: str | None = None):
         super().__init__()
         self._gen, self._path, self._signals = gen, path, signals
+        self._source = source or path
         self.setAutoDelete(True)
 
     def run(self):
         lower_worker_priority()
         try:
-            result = _list_folder(self._path)
+            result = _list_folder(self._path, self._source)
         except Exception:
-            result = ([], [], -1)
+            result = ([], [], -1, {})
         _cache_put(self._path, *result)
         if self._signals is not None:
             try:
@@ -347,7 +402,7 @@ class _PrefetchTask(QRunnable):
             if _cache_get(p) is not None:
                 continue
             try:
-                _cache_put(p, *_list_folder(p))
+                _cache_put(p, *_list_folder(p, self._source))
             except Exception:
                 continue
 
@@ -528,73 +583,63 @@ class FolderTile(_BaseTile):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
 
-        bg = _qc("filmstrip_bg")
-        fg = _qc("hint_bar_fg")
-        muted = _qc("muted")
+        r = self.rect()
+        inst.draw_deck(p, r)
 
-        cover_rect = QRect(0, 0, TILE_W, COVER_H)
-        p.fillRect(cover_rect, QColor(20, 20, 20))
+        cover_rect = QRect(r.left() + 1, r.top() + 1, r.width() - 2, COVER_H)
+        p.fillRect(cover_rect, _qc("well"))
 
         if self._cover and not self._cover.isNull():
             # Smooth-scaling the cover on every hover repaint was wasted work —
             # crop/scale it once and reuse.
             if self._scaled_cover is None:
                 self._scaled_cover = QPixmap(cover_rect.size())
-                self._scaled_cover.fill(QColor(20, 20, 20))
+                self._scaled_cover.fill(_qc("well"))
                 sp = QPainter(self._scaled_cover)
                 _draw_cover_into(sp, self._cover, QRect(0, 0, cover_rect.width(),
                                                           cover_rect.height()))
                 sp.end()
             p.drawPixmap(cover_rect.topLeft(), self._scaled_cover)
+        else:
+            inst.draw_icon(p, "folder",
+                           QRectF(cover_rect.center().x() - 15,
+                                  cover_rect.center().y() - 15, 30, 30),
+                           _qc("rail_light"), 1.6)
 
-        # Folder badge — small ribbon top-left so user sees this is a folder
-        badge_w, badge_h = 78, 22
-        bx, by = 8, 8
-        p.setBrush(QColor(0, 0, 0, 170))
-        p.setPen(Qt.PenStyle.NoPen)
-        p.drawRoundedRect(bx, by, badge_w, badge_h, 4, 4)
-        # Mini folder glyph
-        gx, gy = bx + 8, by + 6
-        p.setBrush(QColor(240, 200, 100))
-        p.setPen(Qt.PenStyle.NoPen)
-        # Tab
-        p.drawRect(gx, gy, 6, 3)
-        p.drawRect(gx, gy + 2, 14, 8)
-        # Label
-        f = p.font(); f.setPointSize(8); f.setBold(True); p.setFont(f)
-        p.setPen(QColor(235, 235, 235))
-        p.drawText(QRect(bx + 28, by, badge_w - 32, badge_h),
-                   Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
-                   "FOLDER")
+        inst.draw_rail(p, r.left() + 1, cover_rect.bottom() + 1, r.right() - 1)
 
-        # Caption strip
-        cap = QRect(0, COVER_H, TILE_W, TILE_H - COVER_H)
-        p.fillRect(cap, bg)
-
-        f = p.font(); f.setPointSize(10); f.setBold(True); p.setFont(f)
-        p.setPen(fg)
+        # Plate legend: name in silkscreen caps, count as a readout value.
+        p.setFont(theme_mod.legend_font(9, tracking=1.1))
+        p.setPen(_qc("fg"))
         metrics = p.fontMetrics()
-        elided = metrics.elidedText(self.item.name, Qt.TextElideMode.ElideMiddle, TILE_W - 16)
-        p.drawText(QRect(8, COVER_H + 6, TILE_W - 16, 18),
+        elided = metrics.elidedText(self.item.name,
+                                    Qt.TextElideMode.ElideMiddle, TILE_W - 24)
+        p.drawText(QRect(10, COVER_H + 9, TILE_W - 20, 16),
                    Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, elided)
-        f.setPointSize(9); f.setBold(False); p.setFont(f)
-        p.setPen(muted)
+        p.setFont(theme_mod.readout_font(10, bold=False))
         n = self._count
-        caption = "counting…" if n < 0 else f"{n:,} image{'s' if n != 1 else ''}"
-        p.drawText(QRect(8, COVER_H + 24, TILE_W - 16, 18),
-                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-                   caption)
+        if n < 0:
+            p.setPen(_qc("screen_dim"))
+            caption = "COUNTING"
+        else:
+            p.setPen(_qc("muted"))
+            caption = f"{n:,} PHOTO{'S' if n != 1 else ''}"
+        p.drawText(QRect(10, COVER_H + 26, TILE_W - 20, 16),
+                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, caption)
+        # A folder is a folder: silkscreened on the plate, not a floating badge.
+        p.setFont(theme_mod.legend_font(7, tracking=1.4))
+        p.setPen(_qc("faint"))
+        p.drawText(QRect(TILE_W - 74, COVER_H + 26, 64, 16),
+                   Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, "FOLDER")
 
-        if self._hover or self._focused:
+        if self._focused:
+            inst.draw_brackets(p, cover_rect, _qc("focus"), arm=16, width=2, inset=4)
+            p.setPen(QPen(_qc("focus"), 2))
             p.setBrush(Qt.BrushStyle.NoBrush)
-            # Brighter, thicker ring when keyboard-focused so it's unmistakable.
-            width = 3 if self._focused else 2
-            color = QColor(90, 160, 240) if self._focused else QColor(80, 140, 220)
-            p.setPen(QPen(color, width))
-            p.drawRect(self.rect().adjusted(1, 1, -1, -1))
+            p.drawRect(r.adjusted(1, 1, -2, -2))
+        elif self._hover:
+            inst.draw_brackets(p, cover_rect, _qc("cap_alt"), arm=13, width=2, inset=4)
         p.end()
-
-
 class _ImageMosaic(QWidget):
     """Justified mosaic of images. Tiles keep their aspect ratio (no crop) and
     pack into centred rows, driven by a list of ``ImageItem``.
@@ -621,6 +666,8 @@ class _ImageMosaic(QWidget):
     clicked = pyqtSignal(int)            # image index in the list passed in
     removed = pyqtSignal(list)           # paths gone from this folder (move/delete)
     scroll_to = pyqtSignal(int, int)     # (x, y) the parent scroll area should reveal
+    layout_changed = pyqtSignal()        # rows moved (timeline relabels)
+    row_height_changed = pyqtSignal(int)   # zoom by wheel/keys, so the knob follows
     load_progress = pyqtSignal(int, int) # (headers_done, total) — drives the load bar
     reload_requested = pyqtSignal()      # folder needs a rescan (e.g. rotate wrote new files)
     selection_changed = pyqtSignal(int)  # number of selected tiles (drives the bulk bar)
@@ -632,12 +679,15 @@ class _ImageMosaic(QWidget):
     ROW_HEIGHT_MIN = 90
     ROW_HEIGHT_MAX = 520
     ZOOM_FACTOR = 1.12
-    SPACING = 3
+    SPACING = 1                          # hairline between photos
+    MAX_GROW = 1.6                       # a row may grow this much to fill the width
     HOVER_BORDER = 3
     LOOKAHEAD = 900                      # px above/below the viewport to pre-decode
+    SCALED_BUDGET = 96 * 1024 * 1024     # bytes of tile-sized pixmaps kept ready to blit
 
     def __init__(self, items: list, source_folder: str, parent=None, *,
-                 sort_mode: bool = False):
+                 sort_mode: bool = False, cached_dims: dict | None = None,
+                 row_height: int | None = None):
         super().__init__(parent)
         self._items: list = list(items)
         self._source = source_folder
@@ -652,8 +702,11 @@ class _ImageMosaic(QWidget):
         self._viewport_width = 0
         self._total_height = 0
         self._hover_idx = -1
-        self._row_height = self.ROW_HEIGHT
+        self._row_height = max(self.ROW_HEIGHT_MIN, min(self.ROW_HEIGHT_MAX,
+                                   int(row_height or self.ROW_HEIGHT)))
         self._marked: set[str] = set()       # lower-cased names flagged with a badge
+        self._scaled: "OrderedDict[str, tuple[int, QPixmap]]" = OrderedDict()
+        self._scaled_bytes = 0
 
         # Multi-selection (shift = range from anchor, ctrl = toggle).
         self._selected: set[int] = set()
@@ -668,6 +721,8 @@ class _ImageMosaic(QWidget):
         self._requested: set[str] = set()     # paths this view has queued
         self._last_scan_rect = QRect()
         self._dims_pending: set[str] = set()
+        self._unknown: set[int] = set()       # tiles whose real size we don't know yet
+        self._estimate = 1.5                  # running average aspect for those
         self._headers_done = 0
         self._stopped = False
 
@@ -683,39 +738,77 @@ class _ImageMosaic(QWidget):
         pal.setColor(self.backgroundRole(), _qc("canvas_bg"))
         self.setPalette(pal)
 
-        self._resolve_aspects(range(len(self._items)))
+        self._resolve_aspects(range(len(self._items)), cached_dims)
 
     # ── Aspect resolution ─────────────────────────────────────────────────────
 
     def _reindex(self):
         self._index_by_path = {it.path: i for i, it in enumerate(self._items)}
 
-    def _resolve_aspects(self, indices):
-        """Fill aspects for ``indices`` from the dimension cache in one batch;
-        queue header reads for the rest."""
+    def _resolve_aspects(self, indices, cached_dims: dict | None = None):
+        """Fill aspects for ``indices`` from the dimension cache.
+
+        **Nothing is read from disk here.** Sizes already known (from a previous
+        visit, or resolved by the listing worker and handed over in
+        ``cached_dims``) are applied immediately; the rest get the folder's
+        running average aspect and are read *only if they come near the
+        viewport* — see :meth:`_request_visible_dims`. Reading all 10,000 headers
+        up front cost a minute of disk churn on a first visit and starved the
+        handful of thumbnails actually on screen."""
         self._reindex()
         n = len(self._items)
         if len(self._aspects) != n:
             self._aspects = (self._aspects + [1.5] * n)[:n]
             self._exact = (self._exact + [False] * n)[:n]
         indices = list(indices)
-        with_sig = [i for i in indices if self._items[i].mtime is not None]
-        hits = dim_cache.get_many(
-            self._source,
-            [(self._items[i].path, self._items[i].mtime, self._items[i].size) for i in with_sig])
-        unknown: list[str] = [self._items[i].path for i in indices
-                              if self._items[i].mtime is None]
-        for i, dims in zip(with_sig, hits):
+        cached_dims = dict(cached_dims or {})
+        # The listing may predate sizes learned since (an empty {} on a first
+        # visit): fill the gaps from the dimension cache instead of guessing.
+        missing = [i for i in indices
+                   if self._items[i].path not in cached_dims and self._items[i].mtime is not None]
+        if missing:
+            hits = dim_cache.get_many(
+                self._source,
+                [(self._items[i].path, self._items[i].mtime, self._items[i].size)
+                 for i in missing])
+            cached_dims.update({self._items[i].path: d for i, d in zip(missing, hits) if d})
+        for i in indices:
+            dims = cached_dims.get(self._items[i].path)
             if dims is not None and dims[1] > 0:
                 self._aspects[i] = dims[0] / dims[1]
                 self._exact[i] = True
             else:
-                unknown.append(self._items[i].path)
-        self._headers_done = n - len(unknown)
-        self._dims_pending = set(unknown)
-        if unknown:
-            self._svc.request_dims(self._source, unknown)
-        self.load_progress.emit(self._headers_done, n)
+                self._unknown.add(i)
+        self._refresh_estimate()
+        for i in list(self._unknown):
+            if i < n and not self._exact[i]:
+                self._aspects[i] = self._estimate
+            else:
+                self._unknown.discard(i)
+        # Nothing long-running to report any more: the grid is usable at once.
+        self._headers_done = n
+        self.load_progress.emit(n, n)
+
+    def _refresh_estimate(self):
+        """Average aspect of the tiles we do know — a much better guess for the
+        rest than a fixed 3:2, so the layout barely moves as they resolve."""
+        known = [a for a, ex in zip(self._aspects, self._exact) if ex]
+        if known:
+            self._estimate = sum(known) / len(known)
+
+    def _request_visible_dims(self, index_range):
+        """Read headers only for not-yet-known tiles near the viewport."""
+        if not self._unknown:
+            return
+        want = []
+        for idx in index_range:
+            if idx in self._unknown:
+                p = self._items[idx].path
+                if p not in self._dims_pending:
+                    self._dims_pending.add(p)
+                    want.append(p)
+        if want:
+            self._svc.request_dims(self._source, want)
 
     @pyqtSlot(str, object)
     def _on_dims_ready(self, source: str, results):
@@ -726,20 +819,19 @@ class _ImageMosaic(QWidget):
             if p not in self._dims_pending:
                 continue
             self._dims_pending.discard(p)
-            self._headers_done += 1
             idx = self._index_by_path.get(p)
-            if idx is not None and h > 0:
+            if idx is None:
+                continue
+            # Either way the header has had its one try: a guess (video, HEIC)
+            # must not re-request forever — the thumbnail settles it instead.
+            self._unknown.discard(idx)
+            if exact and h > 0 and not self._exact[idx]:
                 self._aspects[idx] = w / h
-                self._exact[idx] = exact
+                self._exact[idx] = True
                 changed = True
-        n = len(self._items)
-        self.load_progress.emit(min(self._headers_done, n), n)
         if changed:
-            if self._dims_pending:
-                self._relayout_timer.start()      # coalesce bursts
-            else:
-                self._relayout_timer.stop()
-                self._recompute_layout()
+            self._refresh_estimate()
+            self._relayout_timer.start()      # coalesce bursts
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -753,6 +845,7 @@ class _ImageMosaic(QWidget):
         if h != self._row_height:
             self._row_height = h
             self._recompute_layout()
+            self.row_height_changed.emit(h)
 
     def row_height(self) -> int:
         return self._row_height
@@ -773,7 +866,8 @@ class _ImageMosaic(QWidget):
         idx = self._index_by_path.get(path)
         return self._aspects[idx] if idx is not None and self._exact[idx] else None
 
-    def set_items(self, items: list, seed_aspects: dict | None = None) -> None:
+    def set_items(self, items: list, seed_aspects: dict | None = None,
+                  cached_dims: dict | None = None) -> None:
         """Replace the item list in place, keeping per-path state (aspects,
         selection, cursor) so nothing re-decodes or jumps. ``seed_aspects``
         pre-fills known aspect ratios for new paths (e.g. a just-copied file
@@ -793,6 +887,7 @@ class _ImageMosaic(QWidget):
         n = len(self._items)
         self._aspects = [1.5] * n
         self._exact = [False] * n
+        self._unknown = set()
         unresolved = []
         for i, it in enumerate(self._items):
             prev = old_aspects.get(it.path)
@@ -804,11 +899,10 @@ class _ImageMosaic(QWidget):
             else:
                 unresolved.append(i)
         self._reindex()
-        # Only look up / read headers for genuinely new or inexact tiles.
+        # Only look up sizes for genuinely new or inexact tiles.
         if unresolved:
-            self._resolve_aspects(unresolved)
+            self._resolve_aspects(unresolved, cached_dims)
         else:
-            self._dims_pending = set()
             self._headers_done = n
             self.load_progress.emit(n, n)
 
@@ -862,9 +956,12 @@ class _ImageMosaic(QWidget):
     # ── Layout ────────────────────────────────────────────────────────────────
 
     def _recompute_layout(self):
-        """Free-flow mosaic, **centred**: every tile keeps its native aspect at
-        the current row height, packs left-to-right, wraps when the next tile
-        won't fit, and each row is offset by half its slack."""
+        """Justified mosaic, **edge to edge**: tiles pack left-to-right at the
+        target row height, then each full row is scaled so it exactly fills the
+        width — no slack at the sides, every photo at its own proportions. The
+        last row keeps the target height (left-aligned) rather than blowing a
+        few photos up to full width; so does a row that would need to grow more
+        than MAX_GROW to fill (e.g. one narrow photo before a panorama)."""
         width = self._viewport_width
         n = len(self._items)
         if width <= 0:
@@ -874,39 +971,60 @@ class _ImageMosaic(QWidget):
         rects: list[QRect] = [QRect()] * n
         row_tops: list[int] = []
         row_starts: list[int] = []
+        max_h = target_h
         y = 0
         i = 0
         aspects = self._aspects
         while i < n:
             start = i
-            row_w = 0
-            widths = []
+            nat: list[float] = []          # natural widths at target height
+            row_w = 0.0
             while i < n:
                 asp = aspects[i] if aspects[i] > 0 else 1.5
-                tw = max(1, min(int(round(asp * target_h)), width))
-                sep = spacing if widths else 0
-                if widths and row_w + sep + tw > width:
+                tw = max(1.0, asp * target_h)
+                sep = spacing if nat else 0
+                if nat and row_w + sep + tw > width:
                     break
-                widths.append(tw)
+                nat.append(tw)
                 row_w += sep + tw
                 i += 1
-            x = max(0, (width - row_w) // 2)
-            for k, tw in enumerate(widths):
-                rects[start + k] = QRect(x, y, tw, target_h)
+            k = len(nat)
+            gaps = spacing * (k - 1)
+            content = sum(nat)
+            last_row = i >= n
+            grow = (width - gaps) / content if content > 0 else 1.0
+            if last_row and grow > 1.0:
+                grow = 1.0                  # don't stretch a short final row
+            if grow > self.MAX_GROW:
+                grow = 1.0
+            h = max(1, int(round(target_h * grow)))
+            widths = [max(1, int(nw * grow)) for nw in nat]
+            if grow != 1.0:
+                # absorb rounding so the row lands exactly on the right edge
+                widths[-1] = max(1, widths[-1] + (width - gaps) - sum(widths))
+            x = 0                           # rows start at the left edge
+            for off, tw in enumerate(widths):
+                rects[start + off] = QRect(x, y, tw, h)
                 x += tw + spacing
             row_tops.append(y)
             row_starts.append(start)
-            y += target_h + spacing
+            max_h = max(max_h, h)
+            y += h + spacing
         if n:
             y -= spacing
+        self._max_row_h = max_h
         self._rects = rects
         self._row_tops = row_tops
         self._row_starts = row_starts
         self._total_height = max(int(y), target_h)
         self._last_scan_rect = QRect()
+        # No need to drop _scaled here: each entry records the size it was
+        # scaled to and is re-made on mismatch, so a relayout mid-scroll doesn't
+        # throw away blits whose tiles kept their size.
         self.setMinimumHeight(self._total_height)
         self.setFixedHeight(self._total_height)
         self.update()
+        self.layout_changed.emit()
 
     def _row_of(self, idx: int) -> int:
         return max(0, bisect.bisect_right(self._row_starts, idx) - 1)
@@ -917,7 +1035,7 @@ class _ImageMosaic(QWidget):
             return range(0)
         # Row r spans [top_r, top_r + h - 1]; it intersects when top_r > top - h
         # and top_r <= bottom. Row tops are sorted, so both ends are a bisect.
-        r0 = bisect.bisect_right(self._row_tops, top - self._row_height)
+        r0 = bisect.bisect_right(self._row_tops, top - getattr(self, "_max_row_h", self._row_height))
         r1 = bisect.bisect_right(self._row_tops, bottom)
         if r0 >= r1:
             return range(0)
@@ -951,30 +1069,59 @@ class _ImageMosaic(QWidget):
         if idx is None:
             return
         self._requested.discard(path)
-        pm = self._store.get(path)
+        pm = self._store.get(path, self._items[idx].sig)
         if pm is None or idx >= len(self._rects):
             return
+        if not self._reconcile(idx, pm):
+            self.update(self._rects[idx])
+
+    def _reconcile(self, idx: int, pm: QPixmap) -> bool:
+        """Make tile ``idx`` take its thumbnail's shape if they disagree.
+
+        The decoded thumbnail is authoritative — EXIF rotation, RAW and HEIC
+        quirks are already applied to it — so it overrides any header read,
+        estimate, or stale cached size. Checked on arrival *and* at paint time,
+        because on a revisit the thumbnail is already in memory and never
+        "arrives". Returns True if a relayout was scheduled."""
         h = pm.height()
-        if h > 0:
-            actual = pm.width() / h
-            cached = self._aspects[idx]
-            # The decoded thumb is authoritative (EXIF rotation, RAW quirks):
-            # correct the tile and persist it so the next open is right.
-            if cached <= 0 or abs(actual - cached) / max(cached, 0.01) > 0.05:
-                self._aspects[idx] = actual
+        if h <= 0 or self._store.is_placeholder(self._items[idx].path):
+            return False
+        actual = pm.width() / h
+        cached = self._aspects[idx]
+        if cached > 0 and abs(actual - cached) / cached <= 0.05:
+            if not self._exact[idx]:
                 self._exact[idx] = True
-                item = self._items[idx]
-                if item.sig is not None:
-                    dim_cache.put_sig(self._source, item.path, pm.width(), h, item.sig)
-                    self._svc.note_dims(self._source)
-                self._relayout_timer.start()
-                return
-        self.update(self._rects[idx])
+                self._unknown.discard(idx)
+            return False
+        self._aspects[idx] = actual
+        self._exact[idx] = True
+        self._unknown.discard(idx)
+        self._dims_pending.discard(self._items[idx].path)
+        item = self._items[idx]
+        # thumbs are scaled copies: persist the ratio at the header's scale
+        w_full, h_full = round(actual * 1000), 1000
+        if item.sig is not None:
+            dim_cache.put_sig(self._source, item.path, w_full, h_full, item.sig)
+            self._svc.note_dims(self._source)
+        _remember_dims(item.path, w_full, h_full)
+        self._relayout_timer.start()
+        return True
+
+    def set_scrubbing(self, on: bool):
+        """While the timeline is being dragged the view flies past rows it will
+        never stop on: paint what's in memory, request nothing, and catch up
+        the moment the pointer rests or lets go."""
+        self._scrubbing = bool(on)
+        if not on:
+            self._last_scan_rect = QRect()
+            self.update()
 
     def _schedule_visible(self):
         """Request thumbs for the viewport (high priority) + look-ahead (lower),
         and cancel queued decodes that fell out of range. Runs only when the
         visible rect actually changed."""
+        if getattr(self, "_scrubbing", False):
+            return
         vis = self.visibleRegion().boundingRect()
         if vis.isEmpty() or vis == self._last_scan_rect:
             return
@@ -983,10 +1130,12 @@ class _ImageMosaic(QWidget):
         store, svc = self._store, self._svc
         items, rects = self._items, self._rects
         la = self.LOOKAHEAD
+        band = self._index_range(vis.top() - la * 2, vis.bottom() + la * 2)
+        self._request_visible_dims(band)      # headers for what's about to matter
         for idx in self._index_range(vis.top() - la, vis.bottom() + la):
             it = items[idx]
             wanted.add(it.path)
-            if store.contains(it.path):
+            if store.get(it.path, it.sig) is not None:   # drops a stale entry
                 continue
             pri = svc.PRI_VISIBLE if rects[idx].intersects(vis) else svc.PRI_NEAR
             if svc.request(it.path, self._source, pri, it.sig):
@@ -1016,9 +1165,10 @@ class _ImageMosaic(QWidget):
             if not rect.intersects(visible):
                 continue
             item = self._items[idx]
-            pm = store.get(item.path)
+            pm = store.get(item.path, item.sig)
             if pm is not None:
-                p.drawPixmap(rect, pm)
+                self._reconcile(idx, pm)     # no-op unless the shapes disagree
+                p.drawPixmap(rect.topLeft(), self._scaled_for(item.path, pm, rect))
             else:
                 # Skeleton at the tile's real aspect, so nothing jumps on arrival.
                 p.fillRect(rect, placeholder)
@@ -1029,66 +1179,89 @@ class _ImageMosaic(QWidget):
             if self._marked and item.name.lower() in self._marked:
                 self._draw_marked_badge(p, rect)
 
+            # Selection and focus are marked with registration brackets and a
+            # hairline, never a colour wash over the photograph.
             selected = idx in self._selected
             if selected:
-                p.fillRect(rect, QColor(80, 140, 220, 70))
                 p.setBrush(Qt.BrushStyle.NoBrush)
-                p.setPen(QPen(QColor(90, 160, 240), self.HOVER_BORDER + 1))
-                inset = (self.HOVER_BORDER + 1) // 2
-                p.drawRect(rect.adjusted(inset, inset, -inset, -inset))
+                p.setPen(QPen(_qc("focus"), 2))
+                p.drawRect(rect.adjusted(1, 1, -1, -1))
+                inst.draw_brackets(p, rect, _qc("focus"), arm=14, width=2, inset=4)
                 self._draw_check_badge(p, rect)
             elif idx == self._hover_idx:
                 p.setBrush(Qt.BrushStyle.NoBrush)
-                p.setPen(QPen(QColor(80, 140, 220), self.HOVER_BORDER))
-                inset = self.HOVER_BORDER // 2
-                p.drawRect(rect.adjusted(inset, inset, -inset, -inset))
+                p.setPen(QPen(_qc("cap_alt"), 1))
+                p.drawRect(rect.adjusted(0, 0, -1, -1))
+                inst.draw_brackets(p, rect, _qc("cap_alt"), arm=11, width=2, inset=4)
 
-            # Keyboard focus ring — drawn over any state above.
+            # Keyboard focus — the cursor tile locks like an AF point.
             if idx == self._cursor:
-                if self._sort_mode:
-                    p.setBrush(Qt.BrushStyle.NoBrush)
-                    p.setPen(QPen(_qc("accent"), 4))
-                    p.drawRect(rect.adjusted(2, 2, -2, -2))
-                else:
-                    pen = QPen(QColor(255, 255, 255), 2, Qt.PenStyle.DashLine)
-                    p.setBrush(Qt.BrushStyle.NoBrush)
-                    p.setPen(pen)
-                    p.drawRect(rect.adjusted(2, 2, -2, -2))
+                inst.draw_brackets(p, rect, _qc("focus"), arm=18, width=3, inset=3)
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.setPen(QPen(_qc("focus"), 2 if self._sort_mode else 1))
+                p.drawRect(rect.adjusted(1, 1, -2, -2))
         p.end()
+
+    def _scaled_for(self, path: str, pm: QPixmap, rect: QRect) -> QPixmap:
+        """Tile-sized copy of a thumbnail, cached.
+
+        Scaled to *fill* the tile keeping the photo's proportions and centre-
+        cropped — never stretched. When the tile already has the photo's shape
+        (the normal case) the crop is zero; while a size is still an estimate
+        the photo is trimmed a little rather than squashed.
+
+        Keyed on the pixmap's identity as well as the tile size, so a rotated
+        or re-decoded thumbnail is re-scaled instead of serving the old copy.
+        Bounded by pixel bytes, not entry count — big tiles are big."""
+        want = rect.size()
+        key = pm.cacheKey()
+        hit = self._scaled.get(path)
+        if hit is None or hit[0] != key or hit[1].size() != want:
+            full = pm.scaled(want, Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                             Qt.TransformationMode.SmoothTransformation)
+            if full.size() != want:
+                x = max(0, (full.width() - want.width()) // 2)
+                y = max(0, (full.height() - want.height()) // 2)
+                full = full.copy(x, y, want.width(), want.height())
+            if hit is not None:
+                self._scaled_bytes -= _px_bytes(hit[1])
+            hit = (key, full)
+            self._scaled[path] = hit
+            self._scaled_bytes += _px_bytes(full)
+            while self._scaled_bytes > self.SCALED_BUDGET and len(self._scaled) > 1:
+                _p, (_k, old) = self._scaled.popitem(last=False)
+                self._scaled_bytes -= _px_bytes(old)
+        else:
+            self._scaled.move_to_end(path)
+        return hit[1]
 
     @staticmethod
     def _draw_marked_badge(p: QPainter, rect: QRect) -> None:
-        """Green tick pill, top-right: this photo already exists in the destination."""
-        r = 10
-        cx = rect.right() - r - 6
-        cy = rect.top() + r + 6
+        """A filed photo carries a silkscreened plate in the corner — it reads
+        at a glance without putting colour across the image."""
+        w, h = 30, 16
+        plate = QRect(rect.right() - w - 5, rect.top() + 5, w, h)
         p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QColor(34, 197, 94, 235))
-        p.drawEllipse(QPointF(float(cx), float(cy)), r, r)
-        pen = QPen(QColor(255, 255, 255), 2.0)
-        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-        p.setPen(pen)
-        p.drawPolyline(QPolygonF([QPointF(cx - 4.5, cy), QPointF(cx - 1, cy + 3.5),
-                                  QPointF(cx + 4.5, cy - 3.5)]))
+        p.setBrush(_qc("cap"))
+        p.drawRoundedRect(plate, 2, 2)
+        inst.draw_icon(p, "check",
+                       QRectF(plate.left() + 3, plate.top() + 2, 12, 12),
+                       _qc("legend"), 2.0)
+        p.setFont(theme_mod.legend_font(7, tracking=0.6))
+        p.setPen(_qc("legend"))
+        p.drawText(QRect(plate.left() + 15, plate.top(), 14, h),
+                   Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, "IN")
 
     @staticmethod
     def _draw_check_badge(p: QPainter, rect: QRect) -> None:
-        """Filled accent disc with white tick, top-left of a selected tile."""
-        r = 11
-        cx = rect.left() + r + 6
-        cy = rect.top() + r + 6
+        """Selected: a lit square plate, top-left."""
+        side = 17
+        plate = QRect(rect.left() + 5, rect.top() + 5, side, side)
         p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QColor(90, 160, 240))
-        p.drawEllipse(QPointF(float(cx), float(cy)), r, r)
-        pen = QPen(QColor(255, 255, 255), 2.2)
-        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
-        p.setPen(pen)
-        p.drawPolyline(QPolygonF([
-            QPointF(cx - 5, cy + 0),
-            QPointF(cx - 1, cy + 4),
-            QPointF(cx + 5, cy - 4),
-        ]))
+        p.setBrush(_qc("accent"))
+        p.drawRoundedRect(plate, 2, 2)
+        inst.draw_icon(p, "check", QRectF(plate.adjusted(3, 3, -3, -3)),
+                       QColor(11, 13, 16), 2.2)
 
     # ── Hover + click ────────────────────────────────────────────────────────
 
@@ -1666,9 +1839,12 @@ class AlbumBrowserView(QWidget):
     results open exactly the photo that was clicked."""
 
     open_image = pyqtSignal(str, str)
-    sort_requested = pyqtSignal(str)   # two-pane Sort with this folder as source
+    sort_requested = pyqtSignal(str)   # Sort (Multi Sort) with this folder as the source
     back_requested = pyqtSignal()
     progress = pyqtSignal(str)  # internal: scanner emits current path
+
+    tile_size_changed = pyqtSignal(int)     # Ctrl+wheel/+- zoom -> window's size slider
+    location_changed = pyqtSignal(str)      # the folder now shown -> status bar
 
     def __init__(self, source_folder: str, parent=None):
         super().__init__(parent)
@@ -1771,111 +1947,126 @@ class AlbumBrowserView(QWidget):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
-        # Top bar
+        # ── Front-panel rail ──────────────────────────────────────────────
         top = QWidget()
         top.setObjectName("albumTopBar")
-        top.setStyleSheet(
-            f"#albumTopBar {{ background: {_css_color('hint_bar_bg')}; }}"
-        )
+        theme_mod.bind(top, lambda: f"#albumTopBar {{ background: {theme_mod.hexc('deck')};"
+            f" border-bottom: 1px solid {theme_mod.hexc('rail')}; }}")
         top_lay = QHBoxLayout(top)
-        top_lay.setContentsMargins(14, 10, 14, 10)
-        top_lay.setSpacing(12)
+        top_lay.setContentsMargins(8, 5, 8, 5)
+        top_lay.setSpacing(6)
 
-        self._back_btn = QPushButton("‹  Back")
-        self._back_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._back_btn.setToolTip("Back (Esc)")
-        self._back_btn.setStyleSheet(
-            "QPushButton { background: #1b1b20; color: #e6e6ea;"
-            " border: 1px solid #2a2a30; border-radius: 9px;"
-            " padding: 7px 16px 7px 12px; font-size: 13px; font-weight: 600; }"
-            "QPushButton:hover { background: #23232a; border-color: #3b82f6; }"
-        )
+        self._back_btn = inst.KeyCap("", variant="dark", icon="back")
+        self._back_btn.setFixedWidth(34)
+        self._back_btn.setAccessibleName("Back")
+        self._back_btn.setToolTip("Back: up one level (Esc)")
         self._back_btn.clicked.connect(self.go_back)
         top_lay.addWidget(self._back_btn)
 
         self._breadcrumb = QLabel()
         self._breadcrumb.setTextFormat(Qt.TextFormat.RichText)
-        self._breadcrumb.setStyleSheet(
-            f"color: {_css_color('hint_bar_fg')};"
-            f" font-size: 13px; font-weight: 600;"
-        )
+        self._breadcrumb.setFont(theme_mod.legend_font(9, tracking=1.1))
+        self._breadcrumb.setStyleSheet("background: transparent;")
         self._breadcrumb.setOpenExternalLinks(False)
         self._breadcrumb.linkActivated.connect(self._on_breadcrumb_clicked)
-        top_lay.addWidget(self._breadcrumb, 1)
+        self._breadcrumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        # The album name sits at the centre of the bar — positioned over it
+        # (see _place_title) rather than laid out, so it centres on the window
+        # and not on the gap between unequal button groups.
+        self._breadcrumb.setParent(top)
+        self._top_bar = top
+        top.installEventFilter(self)
+        top_lay.addStretch(1)
 
         # ── Search: live filename filter for this folder, or a real index-backed
         # search across the whole library (scope toggle).
+        # Collapsed to a magnifier until you need it; opens in place.
+        self._search_btn = inst.KeyCap("", variant="dark", icon="search")
+        self._search_btn.setAccessibleName("Search")
+        self._search_btn.setToolTip("Search (Ctrl+F)")
+        self._search_btn.setFixedWidth(34)
+        self._search_btn.clicked.connect(self.focus_search)
+        top_lay.addWidget(self._search_btn)
+
+        self._search_box = QWidget()
+        sbl = QHBoxLayout(self._search_box)
+        sbl.setContentsMargins(0, 0, 0, 0)
+        sbl.setSpacing(6)
         self._search = QLineEdit()
-        self._search.setPlaceholderText("Filter this folder…")
+        self._search.setPlaceholderText("Filter this folder")
         self._search.setClearButtonEnabled(True)
-        self._search.setFixedWidth(230)
-        self._search.setToolTip("Search (Ctrl+F) — Esc clears")
-        self._search.setStyleSheet(
-            "QLineEdit { background:#131317; color:#e6e6ea; border:1px solid #2a2a30;"
-            " border-radius:9px; padding:6px 10px; font-size:12px; }"
-            "QLineEdit:focus { border-color:#3b82f6; background:#16161b; }"
-        )
+        self._search.setFixedWidth(240)
+        self._search.setToolTip("Search (Ctrl+F) — Esc clears and closes")
+        self._search.setAccessibleName("Search")
+        self._search.installEventFilter(self)
+        self._search.setFont(theme_mod.legend_font(9, bold=False, tracking=0.8))
+        theme_mod.bind(self._search, lambda: f"QLineEdit {{ background: {theme_mod.hexc('chassis')};"
+            f" color: {theme_mod.hexc('fg')};"
+            f" border: 1px solid {theme_mod.hexc('rail')}; border-radius: 3px;"
+            f" padding: 7px 10px; }}"
+            f"QLineEdit:focus {{ border: 1px solid {theme_mod.hexc('focus')}; }}")
         self._search.textChanged.connect(self._on_search_text)
         self._search.returnPressed.connect(self._on_search_submit)
-        top_lay.addWidget(self._search)
+        self._search_icon = self._search.addAction(
+            self._search_glyph(), QLineEdit.ActionPosition.LeadingPosition)
+        sbl.addWidget(self._search)
 
-        self._scope_btn = QPushButton("This folder")
-        self._scope_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._scope_btn.setToolTip("Toggle search scope")
-        self._scope_btn.setStyleSheet(
-            "QPushButton { background:#1b1b20; color:#cfcfd6; border:1px solid #2a2a30;"
-            " border-radius:9px; padding:6px 12px; font-size:12px; }"
-            "QPushButton:hover { border-color:#3b82f6; color:#fff; }"
-        )
-        self._scope_btn.clicked.connect(self._toggle_search_scope)
-        top_lay.addWidget(self._scope_btn)
+        self._scope = inst.Segmented(
+            [("folder", "This folder"), ("library", "Whole library")], "folder",
+            name="Search scope")
+        self._scope.changed.connect(self._set_search_scope)
+        sbl.addWidget(self._scope)
+        self._search_box.hide()
+        top_lay.addWidget(self._search_box)
+        self._search_anim = QVariantAnimation(self)
+        self._search_anim.setEasingCurve(motion_mod.ease())
+        self._search_anim.valueChanged.connect(
+            lambda v: self._search_box.setMaximumWidth(int(v)))
+        self._search_anim.finished.connect(
+            lambda: self._search_box.setMaximumWidth(16777215))
 
-        self._count_label = QLabel("")
-        self._count_label.setStyleSheet(
-            f"color: {_css_color('muted')}; font-size: 12px;"
-        )
-        top_lay.addWidget(self._count_label)
+        # Readout + size live in the footer (bottom right); built below.
+        self._count_label = QLabel("")     # kept for callers; the footer shows it
+        self._count_label.hide()
 
-        self._rescan_btn = QPushButton("↻ Rescan")
-        self._rescan_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._rescan_btn = inst.KeyCap("", variant="dark", icon="rescan")
         self._rescan_btn.setToolTip(
             "Re-read this folder from disk.\n"
-            "Folders are cached in memory after the first visit so navigation stays instant."
-        )
-        self._rescan_btn.setStyleSheet(
-            "QPushButton { background: #262626; color: #e5e5e5;"
-            " border: 1px solid #353535; border-radius: 6px;"
-            " padding: 6px 12px; font-size: 12px; font-weight: 600; }"
-            "QPushButton:hover { background: #2f2f2f; border-color: #4a4a4a; }"
-        )
+            "Folders are held in memory after the first visit so navigation stays instant.")
+        self._rescan_btn.setAccessibleName("Rescan this folder")
         self._rescan_btn.clicked.connect(self._force_rescan)
         top_lay.addWidget(self._rescan_btn)
 
-        self._sort_btn = QPushButton("⇄ Sort")
-        self._sort_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        # The one lit key on this screen: start culling.
+        self._sort_btn = inst.KeyCap("Sort", variant="commit", icon="sort")
         self._sort_btn.setToolTip(
-            "Two-pane Sort: this folder on the left, a destination folder on the\n"
-            "right — press Space to copy the focused photo across.")
-        self._sort_btn.setStyleSheet(
-            "QPushButton { background: #1d3a6e; color: #eaf1ff;"
-            " border: 1px solid #2f5fb3; border-radius: 6px;"
-            " padding: 6px 12px; font-size: 12px; font-weight: 600; }"
-            "QPushButton:hover { background: #24488a; border-color: #3b82f6; }"
-        )
+            "Sort this folder into up to 9 destinations — number keys send the photo.")
         self._sort_btn.clicked.connect(lambda: self.sort_requested.emit(self.current_path))
         top_lay.addWidget(self._sort_btn)
 
+        # Far right, directly above the rail: the timeline switch.
+        self._timeline_on = bool(settings_mod.get("timeline_scroll"))
+        self._timeline_btn = inst.KeyCap("", variant="dark", icon="timeline")
+        self._timeline_btn.setCheckable(True)
+        self._timeline_btn.setChecked(self._timeline_on)
+        self._timeline_btn.setFixedWidth(34)
+        self._timeline_btn.setAccessibleName("Timeline scrollbar")
+        self._timeline_btn.setToolTip("Timeline scrollbar: label the scroll track with when photos were taken")
+        self._timeline_btn.toggled.connect(self._set_timeline)
+        top_lay.addWidget(self._timeline_btn)
+
         outer.addWidget(top)
 
-        # Inline scan-progress strip (visible only while scanning)
+        # Inline scan-progress strip (visible only while reading)
         self._scan_strip = QWidget()
         self._scan_strip.setObjectName("scanStrip")
-        self._scan_strip.setStyleSheet(
-            "#scanStrip { background: #16203a; }"
-            "QLabel#scanLbl { color: #cfd8e8; font-size: 11px; padding: 4px 12px; }"
-            "QProgressBar#scanBar { background: #0f1729; border: none; }"
-            "QProgressBar#scanBar::chunk { background: #3b82f6; }"
-        )
+        theme_mod.bind(self._scan_strip, lambda: f"#scanStrip {{ background: {theme_mod.hexc('screen_bg')};"
+            f" border-bottom: 1px solid {theme_mod.hexc('screen_edge')}; }}"
+            f"QLabel#scanLbl {{ color: {theme_mod.hexc('screen_fg')};"
+            f" font-family: '{theme_mod.mono_family()}'; font-size: 10px;"
+            f" letter-spacing: 1px; padding: 3px 12px; background: transparent; }}"
+            f"QProgressBar#scanBar {{ background: {theme_mod.hexc('screen_bg')}; border: none; }}"
+            f"QProgressBar#scanBar::chunk {{ background: {theme_mod.hexc('screen_fg')}; }}")
         scan_lay = QHBoxLayout(self._scan_strip)
         scan_lay.setContentsMargins(0, 0, 0, 0)
         scan_lay.setSpacing(0)
@@ -1884,76 +2075,106 @@ class AlbumBrowserView(QWidget):
         scan_lay.addWidget(self._scan_label)
         self._scan_bar = QProgressBar()
         self._scan_bar.setObjectName("scanBar")
-        self._scan_bar.setFixedHeight(4)
+        self._scan_bar.setFixedHeight(3)
         self._scan_bar.setTextVisible(False)
         self._scan_bar.hide()
         scan_lay.addWidget(self._scan_bar, 1)
         self._scan_strip.hide()
 
-        # Scrollable grid
+        # Scrollable grid — the well the photographs sit in
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QScrollArea.Shape.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        scroll.setStyleSheet(
-            f"QScrollArea {{ background: {_css_color('canvas_bg')}; }}"
-            f"QScrollArea > QWidget > QWidget {{ background: {_css_color('canvas_bg')}; }}"
-        )
+        theme_mod.bind(scroll, lambda: f"QScrollArea {{ background: {theme_mod.hexc('well')}; }}"
+            f"QScrollArea > QWidget > QWidget {{ background: {theme_mod.hexc('well')}; }}")
         self._scroll = scroll
 
         self._grid_host = QWidget()
         self._grid_host.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self._grid = QGridLayout(self._grid_host)
-        self._grid.setContentsMargins(20, 20, 20, 20)
-        self._grid.setSpacing(TILE_GAP)
+        self._grid.setContentsMargins(0, 0, 0, 0)
+        self._grid.setHorizontalSpacing(TILE_GAP)
+        self._grid.setVerticalSpacing(4)
         self._grid.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
 
         scroll.setWidget(self._grid_host)
-        outer.addWidget(scroll, 1)
+        body = QWidget()
+        body_lay = QHBoxLayout(body)
+        body_lay.setContentsMargins(0, 0, 0, 0)
+        body_lay.setSpacing(0)
+        body_lay.addWidget(scroll, 1)
+        self._smooth = timeline_mod.SmoothScroll(scroll)
+        self._rail = timeline_mod.TimelineRail(scroll, self, self._smooth)
+        body_lay.addWidget(self._rail)
+        outer.addWidget(body, 1)
+        self._times = capture_time.CaptureTimes(self)
+        self._times.updated.connect(self._queue_timeline)
+        self._times_key = None
+        self._timeline_timer = QTimer(self)
+        self._timeline_timer.setSingleShot(True)
+        self._timeline_timer.setInterval(40)
+        self._timeline_timer.timeout.connect(self._sync_timeline)
 
-        # Bulk-action bar — appears only when tiles are selected, so "what can I
-        # do with a selection?" is visible instead of hidden behind right-click.
+        # Bulk-action rail — appears only when tiles are selected.
         self._bulk_bar = QWidget()
         self._bulk_bar.setObjectName("bulkBar")
-        self._bulk_bar.setStyleSheet(
-            "#bulkBar { background:#16161a; border-top:1px solid #26262c; }"
-            "QLabel { color:#e6e6ea; font-size:13px; font-weight:600; }"
-            "QPushButton { background:#1f1f25; color:#e6e6ea; border:1px solid #2a2a30;"
-            " border-radius:8px; padding:7px 14px; font-size:12px; }"
-            "QPushButton:hover { border-color:#3b82f6; background:#23232a; }"
-            "QPushButton#danger { color:#ef6b6b; border-color:#45272a; }"
-            "QPushButton#danger:hover { background:#2a1618; color:#fff; border-color:#ef6b6b; }"
-        )
+        theme_mod.bind(self._bulk_bar, lambda: f"#bulkBar {{ background: {theme_mod.hexc('deck')};"
+            f" border-top: 1px solid {theme_mod.hexc('rail')}; }}")
         bb = QHBoxLayout(self._bulk_bar)
         bb.setContentsMargins(16, 8, 16, 8)
-        bb.setSpacing(10)
+        bb.setSpacing(8)
         self._bulk_label = QLabel("0 selected")
+        self._bulk_label.setFont(theme_mod.legend_font(9, tracking=1.4))
+        theme_mod.bind(self._bulk_label, lambda: f"color: {theme_mod.hexc('accent_text')}; background: transparent;")
         bb.addWidget(self._bulk_label)
         bb.addStretch(1)
-        for text, slot, obj in (
-            ("Move to…", lambda: self._bulk_transfer(move=True), None),
-            ("Copy to…", lambda: self._bulk_transfer(move=False), None),
-            ("Delete", self._bulk_delete, "danger"),
-            ("Clear", self._bulk_clear, None),
+        for text, icon, slot, variant in (
+            ("Move to", "sort", lambda: self._bulk_transfer(move=True), "putty"),
+            ("Copy to", "folder", lambda: self._bulk_transfer(move=False), "putty"),
+            ("Delete", "close", self._bulk_delete, "danger"),
+            ("Clear", "", self._bulk_clear, "dark"),
         ):
-            b = QPushButton(text)
-            if obj:
-                b.setObjectName(obj)
-            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b = inst.KeyCap(text, variant=variant, icon=icon)
             b.clicked.connect(slot)
             bb.addWidget(b)
         self._bulk_bar.hide()
         outer.addWidget(self._bulk_bar)
 
-        # Loading strip pinned at the BOTTOM, under the grid — unobtrusive while
-        # thumbnails/dimensions stream in (shown only while work is pending).
+        # The count readout was retired from view (callers still update it);
+        # tile size is the window's status-bar slider, driven through
+        # set_tile_size / tile_size_changed.
+        self._screen = inst.StatusLine()
+        self._screen.hide()
+        self._tile_size = int(settings_mod.get("thumbnail_row_height") or _ImageMosaic.ROW_HEIGHT)
+        self._apply_timeline_visibility()
+
+        # Loading strip pinned at the BOTTOM, under the grid.
         outer.addWidget(self._scan_strip)
+
+    def tile_size(self) -> int:
+        return self._tile_size
+
+    def set_tile_size(self, value: int):
+        """From the window's size slider."""
+        self._tile_size = int(value)
+        if self._mosaic is not None:
+            self._mosaic.set_row_height(value)
+        settings_mod.set_value("thumbnail_row_height", self._tile_size)
+
+    def _on_mosaic_zoom(self, value: int):
+        """Ctrl+wheel / +/- zoomed the grid: tell the window's slider (it must
+        not echo back) and remember the size for the next folder."""
+        self._tile_size = int(value)
+        settings_mod.set_value("thumbnail_row_height", self._tile_size)
+        self.tile_size_changed.emit(self._tile_size)
 
     # ── Scan + render ─────────────────────────────────────────────────────────
 
     def _scan_and_render(self, force: bool = False):
         path = self.current_path
         self._update_breadcrumb()
+        self.location_changed.emit(path)
         # Abandon any stat stream / listing still running for the folder we're leaving.
         self._cancel_folder_stats()
         self._list_gen += 1
@@ -1961,15 +2182,17 @@ class AlbumBrowserView(QWidget):
 
         hit = None if force else _cache_get(path)
         if hit is not None:
-            folders, items, mtime = hit
+            folders, items, mtime, dims = hit
             with log.timed("album.render", path=path, cached=True,
                            folders=len(folders), images=len(items)):
-                self._apply_listing(path, folders, items, mtime, cached=True)
+                self._apply_listing(path, folders, items, mtime, dims, cached=True)
             # Stale-while-revalidate: one stat tells us whether anything was
             # added/removed/renamed since; if so, relist in the background and
             # patch the grid in place.
-            if _dir_mtime(path) != mtime:
-                _list_pool().start(_ListTask(self._list_gen, path, self._list_signals), 10)
+            if path in _UNVERIFIED or _dir_mtime(path) != mtime:
+                _UNVERIFIED.discard(path)
+                _list_pool().start(_ListTask(self._list_gen, path, self._list_signals,
+                                             self._source), 10)
             return
 
         if force:
@@ -1978,10 +2201,12 @@ class AlbumBrowserView(QWidget):
         # window. The previous grid stays up for a fast listing (no blank flash);
         # a slow one clears it and shows an "Opening…" strip after 150 ms.
         self._list_wait_timer.start()
-        _list_pool().start(_ListTask(self._list_gen, path, self._list_signals), 10)
+        _list_pool().start(_ListTask(self._list_gen, path, self._list_signals,
+                                     self._source), 10)
 
     def _show_listing_strip(self):
-        self._scan_label.setText(f"Opening  {os.path.basename(self.current_path) or self.current_path}…")
+        name = os.path.basename(self.current_path) or self.current_path
+        self._scan_label.setText(f"Opening {name}…")
         self._scan_bar.setRange(0, 0)
         self._scan_bar.show()
         self._scan_strip.show()
@@ -1991,7 +2216,7 @@ class AlbumBrowserView(QWidget):
         if gen != self._list_gen or path != self.current_path:
             return
         self._list_wait_timer.stop()
-        folders, items, mtime = result
+        folders, items, mtime, dims = result
         if getattr(self, "_rendered_path", None) == path:
             # Revalidation of a grid rendered from cache.
             def shown(fs):   # folder paths not already known to be empty
@@ -2011,18 +2236,20 @@ class AlbumBrowserView(QWidget):
             album_mod.invalidate_folder_stats(path)
             if same_folders and self._mosaic is not None and self._search_results is None:
                 self._items = items
-                self._mosaic.set_items(self._display_items())
+                self._dims = dims
+                self._mosaic.set_items(self._display_items(), cached_dims=dims)
                 self._refresh_images_header()
                 self._update_count()
                 self._cache_current(path)
                 return
         with log.timed("album.render", path=path, cached=False,
                        folders=len(folders), images=len(items)):
-            self._apply_listing(path, folders, items, mtime, cached=False)
+            self._apply_listing(path, folders, items, mtime, dims, cached=False)
         log.info("album.open", path=path, cached=False,
                  folders=len(self._folders), images=len(self._items))
 
-    def _apply_listing(self, path: str, folders, items, mtime: int, *, cached: bool):
+    def _apply_listing(self, path: str, folders, items, mtime: int,
+                       dims: dict | None = None, *, cached: bool):
         """Render a listing. Recursive counts already computed by *any* earlier
         walk (including a parent's) fill in instantly; known-empty folders are
         dropped; only truly unknown ones stream in from the background."""
@@ -2038,6 +2265,7 @@ class AlbumBrowserView(QWidget):
                 f = Folder(path=f.path, name=f.name, image_count=-1, cover_path="")
             resolved.append(f)
         self._folders, self._items = resolved, items
+        self._dims = dims or {}
         self._listing_mtime = mtime
         self._rendered_path = path
         self._was_cached = cached
@@ -2077,7 +2305,7 @@ class AlbumBrowserView(QWidget):
         Placeholder counts are fine to cache now: a cache-hit render re-resolves
         them from the shared stat cache and restarts walkers for the rest."""
         _cache_put(path, list(self._folders), list(self._items),
-                   getattr(self, "_listing_mtime", -1))
+                   getattr(self, "_listing_mtime", -1), getattr(self, "_dims", None))
 
     def _start_folder_stats(self, path: str):
         """Walk each placeholder subfolder in the background for its real count +
@@ -2222,12 +2450,16 @@ class AlbumBrowserView(QWidget):
         self._kick_mosaic_width()
 
     def _toggle_search_scope(self):
-        self._search_scope = "library" if self._search_scope == "folder" else "folder"
-        self._scope_btn.setText("Whole library" if self._search_scope == "library"
-                                else "This folder")
+        self._set_search_scope("library" if self._search_scope == "folder" else "folder")
+
+    def _set_search_scope(self, scope: str):
+        if scope == self._search_scope:
+            return
+        self._search_scope = scope
+        self._scope.set_value(scope)
+        library = scope == "library"
         self._search.setPlaceholderText(
-            "Search the whole library… (Enter)" if self._search_scope == "library"
-            else "Filter this folder…")
+            "Search the library, then Enter" if library else "Filter this folder")
         self._search_results = None
         if self._is_searching():
             if self._search_scope == "library":
@@ -2238,15 +2470,143 @@ class AlbumBrowserView(QWidget):
                 self._kick_mosaic_width()
 
     def focus_search(self):
+        self._open_search()
         self._search.setFocus()
         self._search.selectAll()
 
-    def clear_search(self) -> bool:
-        """Returns True if a search was actually cleared."""
+    def _open_search(self):
+        if self._search_box.isVisible():
+            return
+        self._search_btn.hide()
+        self._search_box.show()
+        full = self._search_box.sizeHint().width()
+        ms = motion_mod.dur(motion_mod.SHORT)
+        if ms > 0:
+            self._search_anim.stop()
+            self._search_anim.setDuration(ms)
+            self._search_anim.setStartValue(34)
+            self._search_anim.setEndValue(full)
+            self._search_box.setMaximumWidth(34)
+            self._search_anim.start()
+
+    def _close_search(self):
+        if not self._search_box.isVisible():
+            return
+        self._search_anim.stop()
+        self._search_box.setMaximumWidth(16777215)
+        self._search_box.hide()
+        self._search_btn.show()
+
+    def _maybe_close_search(self):
+        """Folds back to the magnifier when focus leaves an empty search."""
+        fw = QApplication.focusWidget()
+        if fw is not None and self._search_box.isAncestorOf(fw):
+            return
         if not self._is_searching() and self._search_results is None:
-            return False
-        self._search.clear()          # triggers _on_search_text
-        return True
+            self._close_search()
+
+    def eventFilter(self, obj, ev):
+        if obj is getattr(self, "_search", None) and ev.type() == QEvent.Type.FocusOut:
+            QTimer.singleShot(0, self._maybe_close_search)
+        elif obj is getattr(self, "_top_bar", None) and ev.type() in (
+                QEvent.Type.Resize, QEvent.Type.LayoutRequest, QEvent.Type.Show):
+            QTimer.singleShot(0, self._place_title)
+        return super().eventFilter(obj, ev)
+
+    def _place_title(self):
+        """Centre the album name on the bar; if the buttons leave too little
+        room for true centring, sit it in the gap between them instead."""
+        bar = getattr(self, "_top_bar", None)
+        if bar is None:
+            return
+        lab = self._breadcrumb
+        pad = 12
+        left = self._back_btn.geometry().right() + pad
+        right_edges = [w.geometry().left() for w in (
+            self._search_btn, self._search_box, self._rescan_btn, self._sort_btn,
+            self._timeline_btn) if w.isVisible()]
+        right = (min(right_edges) if right_edges else bar.width()) - pad
+        want = lab.sizeHint().width()
+        half = max(0, min(bar.width() // 2 - left, right - bar.width() // 2))
+        h = bar.height()
+        if want <= 2 * half:
+            w = want
+            x = (bar.width() - w) // 2
+        else:
+            w = max(0, right - left)
+            x = left
+        lab.setGeometry(x, 0, w, h)
+        lab.raise_()
+
+    def clear_search(self) -> bool:
+        """Esc: clear the search (and fold it away). True if Esc was used."""
+        if self._is_searching() or self._search_results is not None:
+            self._search.clear()          # triggers _on_search_text
+            self._close_search()
+            self.focus_content()
+            return True
+        if self._search_box.isVisible():
+            self._close_search()
+            self.focus_content()
+            return True
+        return False
+
+    def _search_glyph(self):
+        from PyQt6.QtGui import QIcon, QPixmap
+        pm = QPixmap(32, 32)
+        pm.fill(Qt.GlobalColor.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        inst.draw_icon(p, "search", QRectF(6, 6, 20, 20), _qc("muted"), 2.2)
+        p.end()
+        return QIcon(pm)
+
+    # ── Timeline scrollbar ────────────────────────────────────────────────────
+
+    def _set_timeline(self, on: bool):
+        self._timeline_on = bool(on)
+        settings_mod.set_value("timeline_scroll", self._timeline_on)
+        self._apply_timeline_visibility()
+
+    def _apply_timeline_visibility(self):
+        on = self._timeline_on
+        self._scroll.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff if on else Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._rail.setVisible(on)
+        if on:
+            self._times_key = None
+            self._queue_timeline()
+        else:
+            self._times.cancel()
+
+    def _queue_timeline(self):
+        if self._timeline_on:
+            self._timeline_timer.start()
+
+    def _sync_timeline(self):
+        """Hand the rail one mark per mosaic row: where the row is, and when its
+        first photo was taken. Capture times are fetched per item list."""
+        m = self._mosaic
+        if not self._timeline_on:
+            return
+        if m is None or not m.items() or not m._row_starts:
+            self._rail.set_marks([])
+            return
+        items = m.items()
+        key = (id(m), len(items), items[0].path, items[-1].path)
+        if key != self._times_key:
+            self._times_key = key
+            firsts = [items[s] for s in m._row_starts if s < len(items)]
+            self._times.request(self.current_path, list(items), firsts)
+        base = m.y()
+        marks = []
+        get = self._times.get
+        for top, start in zip(m._row_tops, m._row_starts):
+            if start < len(items):
+                ts = get(items[start].path)
+                if ts is not None:
+                    marks.append((base + top, ts))
+        self._rail.set_marks(marks)
 
     # ── Bulk-action bar ───────────────────────────────────────────────────────
 
@@ -2313,6 +2673,13 @@ class AlbumBrowserView(QWidget):
         self._refresh_images_header()
         self._update_count()
 
+    def theme_changed(self):
+        """Mode switch: repaint the pieces that carry colour in rich text."""
+        self._update_breadcrumb()
+        self._update_count()
+        if getattr(self, "_search_icon", None) is not None:
+            self._search_icon.setIcon(self._search_glyph())
+
     def _update_breadcrumb(self):
         # Source / sub1 / sub2 / current  — segments are clickable links.
         segs: list[tuple[str, str]] = []  # (label, full_path)
@@ -2329,16 +2696,19 @@ class AlbumBrowserView(QWidget):
             for part in rel.split(os.sep):
                 cur = os.path.join(cur, part)
                 segs.append((part, cur))
-        sep = ' <span style="color:#666">›</span> '
+        sep = f' <span style="color:{theme_mod.hexc("faint")}">/</span> '
+        link = theme_mod.hexc("muted")
+        here = theme_mod.hexc("fg")
         html_parts = []
         for i, (label, path) in enumerate(segs):
             if i < len(segs) - 1:
                 html_parts.append(
-                    f'<a href="nav:{i}" style="color:#9bb6e0; text-decoration:none;">{label}</a>'
-                )
+                    f'<a href="nav:{i}" style="color:{link}; text-decoration:none;">'
+                    f'{html.escape(label)}</a>')
             else:
-                html_parts.append(f'<span>{label}</span>')
+                html_parts.append(f'<span style="color:{here}; font-weight:600">{html.escape(label)}</span>')
         self._breadcrumb.setText(sep.join(html_parts))
+        QTimer.singleShot(0, self._place_title)
         self._breadcrumb.setProperty("segments", segs)
 
     def _on_breadcrumb_clicked(self, link: str):
@@ -2370,22 +2740,22 @@ class AlbumBrowserView(QWidget):
         self._scan_and_render()
 
     def _update_count(self):
+        """Drive the readout. It reports what is in front of you and nothing
+        decorative: counts, and whether they came from memory or the disk."""
         if self._is_searching():
             n = len(self._display_items())
-            where = "library" if self._search_scope == "library" else "folder"
-            self._count_label.setText(f"{n:,} result{'s' if n != 1 else ''} in {where}")
+            where = "LIBRARY" if self._search_scope == "library" else "FOLDER"
+            self._screen.set_fields([("RESULTS", f"{n:,}")], f"IN {where}")
             return
         nf = len(self._folders)
         ni = len(self._items)
-        parts = []
+        fields = []
         if nf:
-            parts.append(f"{nf:,} folder{'s' if nf != 1 else ''}")
-        if ni:
-            parts.append(f"{ni:,} image{'s' if ni != 1 else ''}")
-        text = "  ·  ".join(parts) if parts else "empty"
-        if self._was_cached:
-            text += "  ·  cached"
-        self._count_label.setText(text)
+            fields.append(("FOLDERS", f"{nf:,}"))
+        fields.append(("PHOTOS", f"{ni:,}" if ni else "—"))
+        pending = any(f.image_count < 0 for f in self._folders)
+        note = "Counting…" if pending else ("In memory" if self._was_cached else "From disk")
+        self._screen.set_fields(fields, note)
 
     def _render_grid(self):
         # Clear grid + tear down any previous mosaic widget.
@@ -2419,22 +2789,33 @@ class AlbumBrowserView(QWidget):
         # Empty placeholder
         if not self._folders and not items:
             if searching:
-                msg = (f"No matches for “{self._filter_text}”.\n\n"
-                       "Try a different word, or switch the scope to Whole library.")
+                head, body = ("NO MATCHES",
+                              f"Nothing here is called “{self._filter_text}”. "
+                              "Try another word, or switch the scope key to WHOLE LIBRARY.")
             else:
-                msg = ("No photos or subfolders here.\n\n"
-                       "Drop images or a folder in, or press Esc to go back.")
-            empty = QLabel(msg)
-            empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            empty.setStyleSheet(
-                f"color: {_css_color('muted')}; font-size: 14px; padding: 40px; line-height: 150%;"
-            )
-            self._grid.addWidget(empty, 0, 0)
+                head, body = ("EMPTY FOLDER",
+                              "No photos or subfolders here. Drop images or a folder in, "
+                              "or press ESC to go up a level.")
+            panel = QWidget()
+            panel.setObjectName("emptyDeck")
+            theme_mod.bind(panel, lambda: inst.deck_qss("emptyDeck"))
+            el = QVBoxLayout(panel)
+            el.setContentsMargins(26, 24, 26, 24)
+            el.setSpacing(8)
+            title = QLabel(head)
+            title.setFont(theme_mod.legend_font(11, tracking=2.0))
+            theme_mod.bind(title, lambda: f"color: {theme_mod.hexc('fg')}; background: transparent;")
+            el.addWidget(title)
+            sub = QLabel(body)
+            sub.setWordWrap(True)
+            theme_mod.bind(sub, lambda: f"color: {theme_mod.hexc('muted')}; font-size: 13px; background: transparent;")
+            el.addWidget(sub)
+            self._grid.addWidget(panel, 0, 0)
             return
 
         # Section: Folders (hidden while searching — results are images)
         if self._folders and not searching:
-            header = self._make_section_header(f"FOLDERS ({len(self._folders)})")
+            header = self._make_section_header(f"FOLDERS · {len(self._folders)}")
             self._grid.addWidget(header, row, 0, 1, cols)
             row += 1
             for f in self._folders:
@@ -2455,13 +2836,21 @@ class AlbumBrowserView(QWidget):
 
         # Section: Images (justified mosaic — variable widths, no crop)
         if items:
-            label = (f"RESULTS ({len(items):,})" if searching
-                     else f"IMAGES ({len(items):,})")
+            label = (f"RESULTS · {len(items):,}" if searching
+                     else f"PHOTOS · {len(items):,}")
             header = self._make_section_header(label)
             self._images_header = header
+            # A folder of only photos needs no "PHOTOS" heading — the photos
+            # start at the top edge. It stays for mixed folders and results.
+            header.setVisible(bool(searching or (self._folders and not searching)))
             self._grid.addWidget(header, row, 0, 1, cols)
             row += 1
-            self._mosaic = _ImageMosaic(items, self._source, parent=self._grid_host)
+            self._mosaic = _ImageMosaic(items, self._source, parent=self._grid_host,
+                                        cached_dims=getattr(self, "_dims", None),
+                                        row_height=self._tile_size)
+            self._mosaic.row_height_changed.connect(self._on_mosaic_zoom)
+            self._mosaic.layout_changed.connect(self._queue_timeline)
+            self._rail.set_scrub_target(self._mosaic.set_scrubbing)
             self._mosaic.clicked.connect(self._on_image_clicked)
             self._mosaic.removed.connect(self._on_items_removed)
             self._mosaic.reload_requested.connect(self._force_rescan)
@@ -2543,7 +2932,7 @@ class AlbumBrowserView(QWidget):
             self._scan_bar.hide()
             self._scan_strip.hide()
             return
-        self._scan_label.setText(f"Loading photos   {done} / {total}")
+        self._scan_label.setText(f"Reading {done} / {total}")
         self._scan_bar.setRange(0, total)
         self._scan_bar.setValue(done)
         self._scan_bar.show()
@@ -2572,10 +2961,9 @@ class AlbumBrowserView(QWidget):
 
     def _make_section_header(self, text: str) -> QLabel:
         lbl = QLabel(text)
-        lbl.setStyleSheet(
-            "color: #8b9cb4; font-size: 11px; font-weight: 700;"
-            " letter-spacing: 1.4px; padding: 14px 4px 4px 4px;"
-        )
+        lbl.setFont(theme_mod.legend_font(9, tracking=1.8))
+        theme_mod.bind(lbl, lambda: f"color: {theme_mod.hexc('canvas_fg')}; background: transparent;"
+            f" padding: 8px 8px 4px 8px;")
         return lbl
 
     def _columns(self) -> int:

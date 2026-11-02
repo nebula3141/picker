@@ -1,6 +1,6 @@
 # Hard requirements — without these the app won't start.
 PyQt6>=6.5,<7
-Pillow>=10.0
+Pillow>=10.3  # >=10.3: CVE-2023-4863 (libwebp), CVE-2024-28219 fixed
 numpy>=1.24
 
 # Soft requirement — RAW decode is disabled gracefully if missing.
